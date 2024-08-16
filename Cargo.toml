@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "src/test",
+    "src/vfs",
+    "src/meta"
+, "src/object"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+homepage = "https://github.com/thexiay/juicefs-rs"
+keywords = ["filesystem", "cloud-storage", "object-storage"]
+license = "Apache-2.0"
+repository = "https://github.com/thexiay/juicefs-rs"
+
+[workspace.dependencies]
+libc = "0.2"
