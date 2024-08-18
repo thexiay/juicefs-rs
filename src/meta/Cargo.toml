@@ -1,11 +1,14 @@
 [package]
 name = "juice-meta"
-version.workspace = true
-edition.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-license.workspace = true
-repository.workspace = true
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
 
 [dependencies]
-libc ={ workspace = true }
+snafu = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+redis = { workspace = true }

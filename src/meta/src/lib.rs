@@ -1,14 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod config;
+pub mod error;
+pub mod api;
+pub mod quota;
+pub mod acl;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub(crate) mod rds;
+pub(crate) mod utils;
+pub(crate) mod base;
+pub(crate) mod openfile;

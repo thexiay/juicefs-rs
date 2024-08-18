@@ -1,0 +1,174 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::IpAddr;
+use std::sync::atomic::AtomicU64;
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+
+use crate::base::{PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan};
+use crate::config::Format;
+use crate::error::Result;
+use crate::quota::Quota;
+use crate::utils::{FLockItem, PLockItem, PlockRecord};
+
+pub type Ino = u64;
+
+// Slice is a slice of a chunk.
+// Multiple slices could be combined together as a chunk.
+pub struct Slice {
+    pub id: u64,
+    pub size: u32,
+    pub off: u32,
+    pub len: u32,
+}
+
+pub struct SessionInfo {
+    pub version: String,
+    pub host_name: String,
+    pub ip_addrs: Vec<IpAddr>,
+    pub mount_point: String,
+    pub mount_time: SystemTime,
+    pub process_id: isize,
+}
+
+pub struct Flock {
+    pub inode: Ino,
+    pub owner: u64,
+    pub l_type: String,
+}
+
+pub struct Plock {
+    pub inode: Ino,
+    pub owner: u64,
+    pub records: Vec<PlockRecord>,
+}
+
+pub struct Session {
+    pub sid: u64,
+    pub expire: SystemTime,
+    pub session_info: SessionInfo,
+    pub sustained: Option<Vec<Ino>>,
+    pub flocks: Option<Vec<Flock>>,
+    pub plocks: Option<Vec<Plock>>,
+}
+
+// Attr represents attributes of a node.
+pub struct Attr {
+    pub flags: u8,         // flags
+    pub typ: u8,           // type of a node
+    pub mode: u16,         // permission mode
+    pub uid: u32,          // owner id
+    pub gid: u32,          // group id of owner
+    pub rdev: u32,         // device number
+    pub atime: i64,        // last access time
+    pub mtime: i64,        // last modified time
+    pub ctime: i64,        // last change time for meta
+    pub atimensec: u32,    // nanosecond part of atime
+    pub mtimensec: u32,    // nanosecond part of mtime
+    pub ctimensec: u32,    // nanosecond part of ctime
+    pub nlink: u32,        // number of links (sub-directories or hardlinks)
+    pub length: u64,       // length of regular file
+    pub parent: Ino,       // inode of parent; 0 means tracked by parentKey (for hardlinks)
+    pub full: bool,        // the attributes are completed or not
+    pub keep_cache: bool,  // whether to keep the cached page or not
+    pub access_acl: u32,   // access ACL id (identical ACL rules share the same access ACL ID.)
+    pub default_acl: u32,  // default ACL id (default ACL and the access ACL share the same cache and store)
+}
+
+#[async_trait]
+pub trait BaseMeta {
+
+}
+
+// Meta is a interface for a meta service for file system.
+#[async_trait]
+pub trait Meta: BaseMeta {
+    // Name of database
+    fn name() -> String;
+
+    // Init is used to initialize a meta service.
+    async fn init(format: &Format, force: bool) -> Result<()>;
+
+    // Shutdown close current database connections.
+    async fn shutdown() -> Result<()>;
+
+    // Reset cleans up all metadata, VERY DANGEROUS!
+    async fn reset() -> Result<()>;
+
+    // Load loads the existing setting of a formatted volume from meta service.
+    async fn load(check_version: bool) -> Result<Format>;
+
+    // NewSession creates or update client session.
+    async fn new_session(record: bool) -> Result<()>;
+
+    // CloseSession does cleanup and close the session.
+    async fn close_session() -> Result<()>;
+
+    // GetSession retrieves information of session with sid
+    async fn get_session(sid: u64, detail: bool) -> Result<Session>;
+
+    // ListSessions returns all client sessions.
+    async fn list_sessions() -> Result<Vec<Session>>;
+
+    // ScanDeletedObject scan deleted objects by customized scanner.
+    async fn scan_deleted_object(
+        trash_slice_scan: TrashSliceScan,
+        pending_slice_scan: PendingSliceScan,
+        trash_file_scan: TrashFileScan,
+        pending_file_scan: PendingFileScan,
+    ) -> Result<()>;
+
+    // ListLocks returns all locks of a inode.
+    async fn list_locks(inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)>;
+
+    // CleanStaleSessions cleans up sessions not active for more than 5 minutes
+    async fn clean_stale_sessions(edge: SystemTime, incre_process: Box<dyn Fn(isize)>);
+
+    // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
+    async fn cleanup_detached_nodes_before(edge: SystemTime, incre_process: Box<dyn Fn(isize)>);
+
+    // GetPaths returns all paths of an inode
+    async fn get_paths(inode: Ino) -> Vec<String>;
+
+    // Check integrity of an absolute path and repair it if asked
+    async fn check(fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()>;
+
+    // Get a copy of the current format
+    async fn get_format() -> Format;
+
+    // OnMsg add a callback for the given message type.
+    /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
+    
+    // OnReload register a callback for any change founded after reloaded.
+    async fn on_reload(cb: Box<dyn Fn(Format)>);
+
+    async fn handle_quota(
+        cmd: u8,
+        dpath: String,
+        quotas: HashMap<String, Quota>,
+        strict: bool,
+        repair: bool,
+    ) -> Result<()>;
+
+    // Dump the tree under root, which may be modified by checkRoot
+    async fn dump_meta(
+        w: Box<dyn Write>,
+        root: Ino,
+        threads: isize,
+        keep_secret: bool,
+        fast: bool,
+        skip_trash: bool,
+    ) -> Result<()>;
+    async fn load_meta(r: Box<dyn Read>) -> Result<()>;
+
+    // ---------------------------------------- sys call -----------------------------------------------------------
+    // StatFS returns summary statistics of a volume.
+    async fn stat_fs(
+        inode: Ino,
+        totalspace: AtomicU64,
+        availspace: AtomicU64,
+        iused: AtomicU64,
+        iavail: AtomicU64,
+    ) -> Result<()>;
+}
