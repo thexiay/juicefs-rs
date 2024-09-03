@@ -9,3 +9,5 @@ repository = { workspace = true }
 
 [dependencies]
 libc ={ workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }

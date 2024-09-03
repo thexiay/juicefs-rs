@@ -1,19 +1,25 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
+use sysinfo::{get_current_pid, PidExt};
+use tracing::warn;
 use std::collections::HashMap;
-use std::ops::Add;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::acl::{Entry, Rule};
-use crate::api::{Attr, BaseMeta, Ino, Session, Slice};
-use crate::config::Format;
+use crate::api::{Attr, Ino, Session, SessionInfo, Slice};
+use crate::config::{Config, Format};
 use crate::error::Result;
 use crate::openfile::OpenFile;
 use crate::quota::Quota;
 use crate::utils::{Bar, FreeID};
 
+pub const INODE_BATCH: isize = 1 << 10;
+pub const SLICE_ID_BATCH: isize = 1 << 10;
+pub const N_LOCK: usize = 1 << 10;
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
 // (id, size) -> clean
@@ -29,13 +35,30 @@ pub struct Cchunk {
     slices: isize,
 }
 
+impl Cchunk {
+    pub fn new(inode: Ino, indx: u32, slices: isize) -> Self {
+        Self {
+            inode,
+            indx,
+            slices,
+        }
+    }
+}
+
 // fsStat aligned for atomic operations
 // nolint:structcheck
 pub struct FsStat {
-    new_space: i64,
-    new_inodes: i64,
-    used_space: i64,
-    used_inodes: i64,
+    new_space: AtomicI64,
+    new_inodes: AtomicI64,
+    used_space: AtomicI64,
+    used_inodes: AtomicI64,
+}
+
+impl FsStat {
+    pub fn update_stats(&self, space: i64, inodes: i64) {
+        self.new_space.fetch_add(space, Ordering::SeqCst);
+        self.used_inodes.fetch_add(inodes, Ordering::SeqCst);
+    } 
 }
 
 pub struct DirStat {
@@ -45,24 +68,26 @@ pub struct DirStat {
 }
 
 #[async_trait]
-pub trait Engine: 'static {
+pub trait Engine {
     // Get the value of counter name.
-    async fn get_counter(&self, name: String) -> Result<i64>;
+    async fn get_counter(&self, name: &str) -> Result<i64>;
     // Increase counter name by value. Do not use this if value is 0, use getCounter instead.
-    async fn incr_counter(&self, name: String, value: i64) -> Result<i64>;
+    async fn incr_counter(&self, name: &str, value: i64) -> Result<i64>;
     // Set counter name to value if old <= value - diff.
-    async fn set_if_small(&self, name: String, value: i64, diff: i64) -> Result<bool>;
+    async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool>;
     async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
-    async fn do_load(&self) -> Result<Vec<u8>>;
-    async fn do_new_session(&self, sinfo: &[u8], update: bool) -> Result<()>;
+    async fn do_load(&self) -> Result<Option<Vec<u8>>>;
+    async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()>;
     async fn do_refresh_session(&self) -> Result<()>;
-    async fn do_find_stale_sessions(&self, limit: i32) -> Result<Vec<u64>>;
+
+    /// find stale session
+    async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>>;
     async fn do_clean_stale_session(&self, sid: u64) -> Result<()>;
-    async fn do_init(&self, format: &Format, force: bool) -> Result<()>;
+    async fn do_init(&self, format: Format, force: bool) -> Result<()>;
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()>;
     async fn do_delete_sustained_inode(&self, sid: u64, inode: Ino) -> Result<()>;
-    async fn do_find_deleted_files(&self, ts: i64, limit: i32) -> Result<HashMap<Ino, u64>>;
+    async fn do_find_deleted_files(&self, ts: i64, limit: isize) -> Result<HashMap<Ino, u64>>;
     async fn do_delete_file_data(&self, inode: Ino, length: u64);
     async fn do_cleanup_slices(&self);
     async fn do_cleanup_delayed_slices(&self, edge: i64) -> Result<i32>;
@@ -188,35 +213,69 @@ pub struct InternalNode {
 	name: String,
 }
 
-pub struct CommonMeta<T> {
-    pub addr: String,
-    pub conf: Format,
-    pub fmt: Format,
-    pub root: Ino,
-    pub sub_trash: InternalNode,
-    pub sid: u64,
+pub struct SessionState {
+    pub conf: Config,
+    pub fmt: RwLock<Format>,
+    pub sid: AtomicU64,
     pub open_file: OpenFile,
-    pub removed_files: HashMap<Ino, bool>,
-    pub compacting: HashMap<u64, bool>,
-    pub max_deleting: Sender<()>,
-    pub dslices: Sender<Slice>,  // slices to delete
-    pub symlinks: HashMap<Ino, String>,
-    pub reload_cb: Vec<Box<dyn Fn(&Format)>>,
-    pub umounting: bool,
-    pub ses_mu: Mutex<()>,
-    pub dir_stats_lock: Mutex<()>,
-    pub dir_stats: HashMap<Ino, DirStat>,
     pub fs_stat: FsStat,
-    pub parent_mu: Mutex<()>,
-    pub quota_mu: RwLock<()>,  // protect dirParents
-    pub dir_parents: HashMap<Ino, Ino>,  // protect dirQuotas
-    pub dir_quotas: HashMap<Ino, Quota>,  // directory inode -> parent inode
-    pub free_mu: Mutex<()>,  // directory inode -> quota
-    pub free_inodes: FreeID,
-    pub free_slices: FreeID,
-    pub en: Arc<T>,
+    // TODO: encapsulation it into Segmented Lock
+    // Pessimistic locks to reduce conflicts
+    pub txn_locks: [Mutex<()>; N_LOCK],  
+    pub canceled: AtomicBool,
 }
 
-impl <T: AsRef<CommonMeta<T>>> BaseMeta for T {
+impl SessionState {
+    pub fn new_session_info(&self) -> String {
+        let host = match hostname::get() {
+            Ok(host) => host.to_string_lossy().to_string(),
+            Err(err) => {
+                warn!("Failed to get hostname: {}", err);
+                "localhost".to_string()
+            }
+        };
+        let ips = match get_if_addrs::get_if_addrs() {
+            Ok(ips) => ips.iter().map(|i| i.ip()).collect(),
+            Err(err) => {
+                warn!("Failed to get local IP: {}", err);
+                Vec::new()
+            }
+        };
+        let session_info = SessionInfo {
+            version: "0.1".to_string(),  // TODO: get it in runtime
+            host_name: host,
+            ip_addrs: ips,
+            mount_point: self.conf.mount_point.clone(),
+            mount_time: SystemTime::now(),
+            process_id: get_current_pid().unwrap().as_u32(),
+        };
+        serde_json::to_string(&session_info).expect("session info serialization should never failed")
+    }
     
+}
+
+pub struct CommonMeta<T> {
+    engine: T,
+    session_state: Arc<SessionState>,
+    addr: String,
+    root: Ino,
+    sub_trash: InternalNode,
+    removed_files: HashMap<Ino, bool>,
+    compacting: HashMap<u64, bool>,
+    max_deleting: Sender<()>,
+    dslices: Sender<Slice>,  // slices to delete
+    symlinks: HashMap<Ino, String>,
+    reload_cb: Vec<Box<dyn Fn(&Format)>>,
+    umounting: bool,
+    ses_mu: Mutex<()>,
+    dir_stats_lock: Mutex<()>,
+    dir_stats: HashMap<Ino, DirStat>,
+    fs_stat: FsStat,
+    parent_mu: Mutex<()>,
+    quota_mu: RwLock<()>,  // protect dirParents
+    dir_parents: HashMap<Ino, Ino>,  // protect dirQuotas
+    dir_quotas: HashMap<Ino, Quota>,  // directory inode -> parent inode
+    free_mu: Mutex<()>,  // directory inode -> quota
+    free_inodes: FreeID,
+    free_slices: FreeID,
 }

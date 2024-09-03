@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::base::{PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan};
 use crate::config::Format;
@@ -12,10 +13,28 @@ use crate::error::Result;
 use crate::quota::Quota;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
+pub const ROOT_INODE: Ino = 1;
+pub const TRASH_INODE: Ino = 0x7FFFFFFF10000000; // larger than vfs.minInternalNode
+	// ChunkSize is size of a chunk
+pub const CHUNK_SIZE: u64 = 1 << 26; // 64M
+
 pub type Ino = u64;
+
+#[derive(Default, Serialize, Deserialize)]
+pub enum INodeType {
+    #[default]
+    TypeFile      = 1,  // type for regular file
+	TypeDirectory = 2,  // type for directory
+	TypeSymlink   = 3,  // type for symlink
+	TypeFIFO      = 4,  // type for FIFO node
+	TypeBlockDev  = 5,  // type for block device
+	TypeCharDev   = 6,  // type for character device
+	TypeSocket    = 7,  // type for socket
+}
 
 // Slice is a slice of a chunk.
 // Multiple slices could be combined together as a chunk.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Slice {
     pub id: u64,
     pub size: u32,
@@ -23,13 +42,16 @@ pub struct Slice {
     pub len: u32,
 }
 
+pub struct Slices(pub Vec<Slice>);
+
+#[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
     pub version: String,
     pub host_name: String,
     pub ip_addrs: Vec<IpAddr>,
     pub mount_point: String,
     pub mount_time: SystemTime,
-    pub process_id: isize,
+    pub process_id: u32,
 }
 
 pub struct Flock {
@@ -54,19 +76,20 @@ pub struct Session {
 }
 
 // Attr represents attributes of a node.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Attr {
     pub flags: u8,         // flags
-    pub typ: u8,           // type of a node
+    pub typ: INodeType,    // type of a node
     pub mode: u16,         // permission mode
     pub uid: u32,          // owner id
     pub gid: u32,          // group id of owner
     pub rdev: u32,         // device number
-    pub atime: i64,        // last access time
-    pub mtime: i64,        // last modified time
-    pub ctime: i64,        // last change time for meta
-    pub atimensec: u32,    // nanosecond part of atime
-    pub mtimensec: u32,    // nanosecond part of mtime
-    pub ctimensec: u32,    // nanosecond part of ctime
+    pub atime: u64,        // last access time
+    pub mtime: u64,        // last modified time
+    pub ctime: u64,        // last change time for meta
+    pub atime_nsec: u32,   // nanosecond part of atime
+    pub mtime_nsec: u32,   // nanosecond part of mtime
+    pub ctime_nsec: u32,   // nanosecond part of ctime
     pub nlink: u32,        // number of links (sub-directories or hardlinks)
     pub length: u64,       // length of regular file
     pub parent: Ino,       // inode of parent; 0 means tracked by parentKey (for hardlinks)
@@ -76,14 +99,9 @@ pub struct Attr {
     pub default_acl: u32,  // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
-#[async_trait]
-pub trait BaseMeta {
-
-}
-
 // Meta is a interface for a meta service for file system.
 #[async_trait]
-pub trait Meta: BaseMeta {
+pub trait Meta {
     // Name of database
     fn name() -> String;
 

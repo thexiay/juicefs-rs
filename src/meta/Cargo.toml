@@ -9,6 +9,18 @@ repository = { workspace = true }
 
 [dependencies]
 snafu = { workspace = true }
+tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 redis = { workspace = true }
+r2d2 = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+hostname = { workspace = true }
+get_if_addrs = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+bincode = { workspace = true }
+regex = { workspace = true }

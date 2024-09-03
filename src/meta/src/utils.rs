@@ -31,3 +31,10 @@ pub struct FLockItem {
 	pub owner_key: OwnerKey,
 	pub r#type: String,
 }
+
+pub fn align_4k(length: u64) -> u64 {
+	if length == 0 {
+		return 1 << 12;
+	}
+	((length - 1) >> 12 + 1) << 12
+}
