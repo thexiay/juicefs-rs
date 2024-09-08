@@ -5,11 +5,6 @@ pub struct FreeID {
 	maxid: u64,
 }
 
-pub struct Bar {
-	total: i64,
-	// todo: *mpb.Bar
-}
-
 pub struct PlockRecord {
 	pub r#type: u32,
 	pub pid: u32,

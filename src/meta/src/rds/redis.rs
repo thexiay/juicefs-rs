@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use juice_utils::process::Bar;
 use r2d2::{Pool, PooledConnection};
 use redis::{
     Client as RedisClient, Commands, Connection, ConnectionLike, Pipeline, RedisError, RedisResult,
@@ -15,15 +16,15 @@ use std::sync::Arc;
 use tokio::time::{self, sleep, Instant};
 use tracing::{debug, error, warn};
 
-use crate::acl::{Entry, Rule};
-use crate::api::{Attr, INodeType, Ino, Meta, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE};
+use crate::acl::Rule;
+use crate::api::{Attr, Entry, INodeType, Ino, Meta, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE};
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, PendingFileScan, PendingSliceScan, SessionState, TrashSliceScan, N_LOCK
 };
 use crate::config::Format;
 use crate::error::{ConnectionSnafu, EmptyKeySnafu, MyError, RedisDetailSnafu, Result, SysSnafu};
 use crate::quota::Quota;
-use crate::utils::{self, Bar};
+use crate::utils;
 use std::collections::HashMap;
 
 use std::time::{Duration, SystemTime};

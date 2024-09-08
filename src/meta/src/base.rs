@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{Write, Read};
@@ -10,13 +11,13 @@ use std::time::SystemTime;
 use sysinfo::{get_current_pid, PidExt};
 use tracing::warn;
 
-use crate::acl::{Entry, Rule};
-use crate::api::{Attr, Ino, Meta, Session, SessionInfo, Slice};
+use crate::acl::Rule;
+use crate::api::{Attr, Entry, Ino, Meta, Session, SessionInfo, Slice, Summary, TreeSummary};
 use crate::config::{Config, Format};
 use crate::error::Result;
 use crate::openfile::OpenFile;
 use crate::quota::Quota;
-use crate::utils::{Bar, FLockItem, FreeID, PLockItem};
+use crate::utils::{FLockItem, FreeID, PLockItem};
 
 pub const INODE_BATCH: isize = 1 << 10;
 pub const SLICE_ID_BATCH: isize = 1 << 10;
@@ -446,6 +447,349 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
         iused: AtomicU64,
         iavail: AtomicU64,
     ) -> Result<()> {
+        todo!()
+    }
+
+    // Access checks the access permission on given inode.
+    async fn access(&self, inode: Ino, mode_mask: u8, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // Lookup returns the inode and attributes for the given entry in a directory.
+    async fn lookup(
+        &self,
+        parent: Ino,
+        name: String,
+        inode: &Ino,
+        attr: &Attr,
+        check_perm: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+    // Resolve fetches the inode and attributes for an entry identified by the given path.
+    // ENOTSUP will be returned if there's no natural implementation for this operation or
+    // if there are any symlink following involved.
+    async fn resolve(&self, parent: Ino, path: String, inode: &Ino, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // GetAttr returns the attributes for given node.
+    async fn get_attr(&self, inode: Ino, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // SetAttr updates the attributes for given node.
+    async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
+        -> Result<()> {
+        todo!()
+    }
+
+    // Check setting attr is allowed or not
+    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // Truncate changes the length for given file.
+    async fn truncate(
+        &self,
+        inode: Ino,
+        flags: u8,
+        attr_length: u64,
+        attr: &Attr,
+        skip_perm_check: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Fallocate preallocate given space for given file.
+    async fn fallocate(
+        &self,
+        inode: Ino,
+        mode: u8,
+        off: u64,
+        size: u64,
+        length: &u64,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // ReadLink returns the target of a symlink.
+    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> Result<()> {
+        todo!()
+    }
+
+    // Symlink creates a symlink in a directory with given name.
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: String,
+        path: String,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Mknod creates a node in a directory with given name, type and permissions.
+    async fn mknod(
+        &self,
+        parent: Ino,
+        name: String,
+        r#type: u8,
+        mode: u16,
+        cumask: u16,
+        rdev: u32,
+        path: String,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Mkdir creates a sub-directory with given name and mode.
+    async fn mkdir(
+        &self,
+        parent: Ino,
+        name: String,
+        mode: u16,
+        cumask: u16,
+        copysgid: u8,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Unlink removes a file entry from a directory.
+    // The file will be deleted if it's not linked by any entries and not open by any sessions.
+    async fn unlink(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()> {
+        todo!()
+    }
+
+    // Rmdir removes an empty sub-directory.
+    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()> {
+        todo!()
+    }
+
+    // Rename move an entry from a source directory to another with given name.
+    // The targeted entry will be overwrited if it's a file or empty directory.
+    // For Hadoop, the target should not be overwritten.
+    async fn rename(
+        &self,
+        parent_src: Ino,
+        name_src: String,
+        parent_dst: Ino,
+        name_dst: String,
+        flags: u32,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Link creates an entry for node.
+    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // Readdir returns all entries for given directory, which include attributes if plus is true.
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &Vec<Entry>) -> Result<()> {
+        todo!()
+    }
+
+    // Create creates a file in a directory with given name.
+    async fn create(
+        &self,
+        parent: Ino,
+        name: String,
+        mode: u16,
+        cumask: u16,
+        flags: u32,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Open checks permission on a node and track it as open.
+    async fn open(&self, inode: Ino, flags: u32, attr: &Attr) -> Result<()> {
+        todo!()
+    }
+
+    // Close a file.
+    async fn close(&self, inode: Ino) -> Result<()> {
+        todo!()
+    }
+
+    // Read returns the list of slices on the given chunk.
+    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()> {
+        todo!()
+    }
+
+    // NewSlice returns an id for new slice.
+    async fn new_slice(&self, id: &u64) -> Result<()> {
+        todo!()
+    }
+
+    // Write put a slice of data on top of the given chunk.
+    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: &Slice, mtime: u64)
+        -> Result<()> {
+        todo!()
+    }
+
+    // InvalidateChunkCache invalidate chunk cache
+    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()> {
+        todo!()
+    }
+
+    // CopyFileRange copies part of a file to another one.
+    async fn copy_file_range(
+        &self,
+        fin: Ino,
+        off_in: u64,
+        fout: Ino,
+        off_out: u64,
+        size: u64,
+        flags: u32,
+        copied: &u64,
+        out_length: &u64,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // GetParents returns a map of node parents (> 1 parents if hardlinked)
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize> {
+        todo!()
+    }
+
+    // GetDirStat returns the space and inodes usage of a directory.
+    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat> {
+        todo!()
+    }
+
+    // GetXattr returns the value of extended attribute for given name.
+    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()> {
+        todo!()
+    }
+
+    // ListXattr returns all extended attributes of a node.
+    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()> {
+        todo!()
+    }
+
+    // SetXattr update the extended attribute of a node.
+    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()> {
+        todo!()
+    }
+
+    // RemoveXattr removes the extended attribute of a node.
+    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()> {
+        todo!()
+    }
+
+    // Flock tries to put a lock on given file.
+    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()> {
+        todo!()
+    }
+
+    // Getlk returns the current lock owner for a range on a file.
+    async fn getlk(
+        &self,
+        inode: Ino,
+        owner: u64,
+        ltype: &u32,
+        start: &u64,
+        end: &u64,
+        pid: &u32,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Setlk sets a file range lock on given file.
+    async fn setlk(
+        &self,
+        inode: Ino,
+        owner: u64,
+        block: bool,
+        ltype: u32,
+        start: u64,
+        end: u64,
+        pid: u32,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Compact all the chunks by merge small slices together
+    async fn compact_all(&self, threads: isize, bar: juice_utils::process::Bar) -> Result<()> {
+        todo!()
+    }
+
+    // Compact chunks for specified path
+    async fn compact(
+        &self,
+        inode: Ino,
+        concurrency: isize,
+        pre_func: Box<dyn Fn() + Send>,
+        post_func: Box<dyn Fn() + Send>,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // ListSlices returns all slices used by all files.
+    async fn list_slices(
+        &self,
+        slices: &HashMap<Ino, Vec<Slice>>,
+        delete: bool,
+        show_progress: Box<dyn Fn() + Send>,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Remove all files and directories recursively.
+    // count represents the number of attempted deletions of entries (even if failed).
+    async fn remove(&self, parent: Ino, name: String, count: &u64) -> Result<()> {
+        todo!()
+    }
+
+    // Get summary of a node; for a directory it will accumulate all its child nodes
+    async fn get_summary(
+        &self,
+        inode: Ino,
+        summary: &Summary,
+        recursive: bool,
+        strict: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // GetTreeSummary returns a summary in tree structure
+    async fn get_tree_summary(
+        &self,
+        root: &TreeSummary,
+        depth: u8,
+        topn: u8,
+        strict: bool,
+        update_progress: Box<dyn Fn(u64, u64) + Send>,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Clone a file or directory
+    async fn clone(
+        &self,
+        src_ino: Ino,
+        dst_parent_ino: Ino,
+        dst_name: String,
+        cmode: u8,
+        cumask: u16,
+        count: &u64,
+        total: &u64,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Change root to a directory specified by subdir
+    async fn chroot(&self, subdir: String) -> Result<()> {
         todo!()
     }
 }

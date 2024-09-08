@@ -5,9 +5,12 @@ use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{CommonMeta, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan};
+use crate::base::{
+    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
+};
 use crate::config::{Config, Format};
 use crate::error::Result;
 use crate::quota::Quota;
@@ -16,7 +19,7 @@ use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
 pub const ROOT_INODE: Ino = 1;
 pub const TRASH_INODE: Ino = 0x7FFFFFFF10000000; // larger than vfs.minInternalNode
-	// ChunkSize is size of a chunk
+                                                 // ChunkSize is size of a chunk
 pub const CHUNK_SIZE: u64 = 1 << 26; // 64M
 
 pub type Ino = u64;
@@ -24,13 +27,20 @@ pub type Ino = u64;
 #[derive(Default, Serialize, Deserialize)]
 pub enum INodeType {
     #[default]
-    TypeFile      = 1,  // type for regular file
-	TypeDirectory = 2,  // type for directory
-	TypeSymlink   = 3,  // type for symlink
-	TypeFIFO      = 4,  // type for FIFO node
-	TypeBlockDev  = 5,  // type for block device
-	TypeCharDev   = 6,  // type for character device
-	TypeSocket    = 7,  // type for socket
+    TypeFile = 1, // type for regular file
+    TypeDirectory = 2, // type for directory
+    TypeSymlink = 3,   // type for symlink
+    TypeFIFO = 4,      // type for FIFO node
+    TypeBlockDev = 5,  // type for block device
+    TypeCharDev = 6,   // type for character device
+    TypeSocket = 7,    // type for socket
+}
+
+// Entry is an entry inside a directory.
+pub struct Entry {
+    pub inode: Ino,
+    pub name: Vec<u8>,
+    pub attr: Attr,
 }
 
 // Slice is a slice of a chunk.
@@ -44,6 +54,27 @@ pub struct Slice {
 }
 
 pub struct Slices(pub Vec<Slice>);
+
+#[derive(Serialize, Deserialize)]
+// Summary represents the total number of files/directories and
+// total length of all files inside a directory.
+pub struct Summary {
+    pub length: u64,
+    pub size: u64,
+    pub files: u64,
+    pub dirs: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TreeSummary {
+    pub inode: Ino,
+    pub path: String,
+    pub r#type: u8,
+    pub size: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub children: Option<Vec<TreeSummary>>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -79,25 +110,25 @@ pub struct Session {
 // Attr represents attributes of a node.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Attr {
-    pub flags: u8,         // flags
-    pub typ: INodeType,    // type of a node
-    pub mode: u16,         // permission mode
-    pub uid: u32,          // owner id
-    pub gid: u32,          // group id of owner
-    pub rdev: u32,         // device number
-    pub atime: u64,        // last access time
-    pub mtime: u64,        // last modified time
-    pub ctime: u64,        // last change time for meta
-    pub atime_nsec: u32,   // nanosecond part of atime
-    pub mtime_nsec: u32,   // nanosecond part of mtime
-    pub ctime_nsec: u32,   // nanosecond part of ctime
-    pub nlink: u32,        // number of links (sub-directories or hardlinks)
-    pub length: u64,       // length of regular file
-    pub parent: Ino,       // inode of parent; 0 means tracked by parentKey (for hardlinks)
-    pub full: bool,        // the attributes are completed or not
-    pub keep_cache: bool,  // whether to keep the cached page or not
-    pub access_acl: u32,   // access ACL id (identical ACL rules share the same access ACL ID.)
-    pub default_acl: u32,  // default ACL id (default ACL and the access ACL share the same cache and store)
+    pub flags: u8,        // flags
+    pub typ: INodeType,   // type of a node
+    pub mode: u16,        // permission mode
+    pub uid: u32,         // owner id
+    pub gid: u32,         // group id of owner
+    pub rdev: u32,        // device number
+    pub atime: u64,       // last access time
+    pub mtime: u64,       // last modified time
+    pub ctime: u64,       // last change time for meta
+    pub atime_nsec: u32,  // nanosecond part of atime
+    pub mtime_nsec: u32,  // nanosecond part of mtime
+    pub ctime_nsec: u32,  // nanosecond part of ctime
+    pub nlink: u32,       // number of links (sub-directories or hardlinks)
+    pub length: u64,      // length of regular file
+    pub parent: Ino,      // inode of parent; 0 means tracked by parentKey (for hardlinks)
+    pub full: bool,       // the attributes are completed or not
+    pub keep_cache: bool, // whether to keep the cached page or not
+    pub access_acl: u32,  // access ACL id (identical ACL rules share the same access ACL ID.)
+    pub default_acl: u32, // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
 // Meta is a interface for a meta service for file system.
@@ -143,28 +174,42 @@ pub trait Meta: Send + Sync + 'static {
     async fn list_locks(&self, inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)>;
 
     // CleanStaleSessions cleans up sessions not active for more than 5 minutes
-    async fn clean_stale_sessions(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>);
+    async fn clean_stale_sessions(
+        &self,
+        edge: SystemTime,
+        incre_process: Box<dyn Fn(isize) + Send>,
+    );
 
     // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
-    async fn cleanup_detached_nodes_before(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>);
+    async fn cleanup_detached_nodes_before(
+        &self,
+        edge: SystemTime,
+        incre_process: Box<dyn Fn(isize) + Send>,
+    );
 
     // GetPaths returns all paths of an inode
     async fn get_paths(&self, inode: Ino) -> Vec<String>;
 
     // Check integrity of an absolute path and repair it if asked
-    async fn check(&self, fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()>;
+    async fn check(
+        &self,
+        fpath: String,
+        repair: bool,
+        recursive: bool,
+        stat_all: bool,
+    ) -> Result<()>;
 
     // Get a copy of the current format
     async fn get_format(&self) -> Format;
 
     // OnMsg add a callback for the given message type.
     /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
-    
+
     // OnReload register a callback for any change founded after reloaded.
     async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>);
 
     async fn handle_quota(
-        &self, 
+        &self,
         cmd: u8,
         dpath: String,
         quotas: HashMap<String, Quota>,
@@ -174,7 +219,7 @@ pub trait Meta: Send + Sync + 'static {
 
     // Dump the tree under root, which may be modified by checkRoot
     async fn dump_meta(
-        &self, 
+        &self,
         w: Box<dyn Write + Send>,
         root: Ino,
         threads: isize,
@@ -193,6 +238,265 @@ pub trait Meta: Send + Sync + 'static {
         iused: AtomicU64,
         iavail: AtomicU64,
     ) -> Result<()>;
+
+    // Access checks the access permission on given inode.
+    async fn access(&self, inode: Ino, mode_mask: u8, attr: &Attr) -> Result<()>;
+
+    // Lookup returns the inode and attributes for the given entry in a directory.
+    async fn lookup(
+        &self,
+        parent: Ino,
+        name: String,
+        inode: &Ino,
+        attr: &Attr,
+        check_perm: bool,
+    ) -> Result<()>;
+    // Resolve fetches the inode and attributes for an entry identified by the given path.
+    // ENOTSUP will be returned if there's no natural implementation for this operation or
+    // if there are any symlink following involved.
+    async fn resolve(&self, parent: Ino, path: String, inode: &Ino, attr: &Attr) -> Result<()>;
+
+    // GetAttr returns the attributes for given node.
+    async fn get_attr(&self, inode: Ino, attr: &Attr) -> Result<()>;
+
+    // SetAttr updates the attributes for given node.
+    async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
+        -> Result<()>;
+
+    // Check setting attr is allowed or not
+    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()>;
+
+    // Truncate changes the length for given file.
+    async fn truncate(
+        &self,
+        inode: Ino,
+        flags: u8,
+        attr_length: u64,
+        attr: &Attr,
+        skip_perm_check: bool,
+    ) -> Result<()>;
+
+    // Fallocate preallocate given space for given file.
+    async fn fallocate(
+        &self,
+        inode: Ino,
+        mode: u8,
+        off: u64,
+        size: u64,
+        length: &u64,
+    ) -> Result<()>;
+
+    // ReadLink returns the target of a symlink.
+    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> Result<()>;
+
+    // Symlink creates a symlink in a directory with given name.
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: String,
+        path: String,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()>;
+
+    // Mknod creates a node in a directory with given name, type and permissions.
+    async fn mknod(
+        &self,
+        parent: Ino,
+        name: String,
+        r#type: u8,
+        mode: u16,
+        cumask: u16,
+        rdev: u32,
+        path: String,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()>;
+
+    // Mkdir creates a sub-directory with given name and mode.
+    async fn mkdir(
+        &self,
+        parent: Ino,
+        name: String,
+        mode: u16,
+        cumask: u16,
+        copysgid: u8,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()>;
+
+    // Unlink removes a file entry from a directory.
+    // The file will be deleted if it's not linked by any entries and not open by any sessions.
+    async fn unlink(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()>;
+
+    // Rmdir removes an empty sub-directory.
+    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()>;
+
+    // Rename move an entry from a source directory to another with given name.
+    // The targeted entry will be overwrited if it's a file or empty directory.
+    // For Hadoop, the target should not be overwritten.
+    async fn rename(
+        &self,
+        parent_src: Ino,
+        name_src: String,
+        parent_dst: Ino,
+        name_dst: String,
+        flags: u32,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()>;
+
+    // Link creates an entry for node.
+    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()>;
+
+    // Readdir returns all entries for given directory, which include attributes if plus is true.
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &Vec<Entry>) -> Result<()>;
+
+    // Create creates a file in a directory with given name.
+    async fn create(
+        &self,
+        parent: Ino,
+        name: String,
+        mode: u16,
+        cumask: u16,
+        flags: u32,
+        inode: &Ino,
+        attr: &Attr,
+    ) -> Result<()>;
+
+    // Open checks permission on a node and track it as open.
+    async fn open(&self, inode: Ino, flags: u32, attr: &Attr) -> Result<()>;
+
+    // Close a file.
+    async fn close(&self, inode: Ino) -> Result<()>;
+
+    // Read returns the list of slices on the given chunk.
+    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()>;
+
+    // NewSlice returns an id for new slice.
+    async fn new_slice(&self, id: &u64) -> Result<()>;
+
+    // Write put a slice of data on top of the given chunk.
+    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: &Slice, mtime: u64)
+        -> Result<()>;
+
+    // InvalidateChunkCache invalidate chunk cache
+    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()>;
+
+    // CopyFileRange copies part of a file to another one.
+    async fn copy_file_range(
+        &self,
+        fin: Ino,
+        off_in: u64,
+        fout: Ino,
+        off_out: u64,
+        size: u64,
+        flags: u32,
+        copied: &u64,
+        out_length: &u64,
+    ) -> Result<()>;
+
+    // GetParents returns a map of node parents (> 1 parents if hardlinked)
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize>;
+
+    // GetDirStat returns the space and inodes usage of a directory.
+    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
+
+    // GetXattr returns the value of extended attribute for given name.
+    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()>;
+
+    // ListXattr returns all extended attributes of a node.
+    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()>;
+
+    // SetXattr update the extended attribute of a node.
+    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()>;
+
+    // RemoveXattr removes the extended attribute of a node.
+    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
+
+    // Flock tries to put a lock on given file.
+    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()>;
+
+    // Getlk returns the current lock owner for a range on a file.
+    async fn getlk(
+        &self,
+        inode: Ino,
+        owner: u64,
+        ltype: &u32,
+        start: &u64,
+        end: &u64,
+        pid: &u32,
+    ) -> Result<()>;
+
+    // Setlk sets a file range lock on given file.
+    async fn setlk(
+        &self,
+        inode: Ino,
+        owner: u64,
+        block: bool,
+        ltype: u32,
+        start: u64,
+        end: u64,
+        pid: u32,
+    ) -> Result<()>;
+
+    // Compact all the chunks by merge small slices together
+    async fn compact_all(&self, threads: isize, bar: Bar) -> Result<()>;
+
+    // Compact chunks for specified path
+    async fn compact(
+        &self,
+        inode: Ino,
+        concurrency: isize,
+        pre_func: Box<dyn Fn() + Send>,
+        post_func: Box<dyn Fn() + Send>,
+    ) -> Result<()>;
+
+    // ListSlices returns all slices used by all files.
+    async fn list_slices(
+        &self,
+        slices: &HashMap<Ino, Vec<Slice>>,
+        delete: bool,
+        show_progress: Box<dyn Fn() + Send>,
+    ) -> Result<()>;
+
+    // Remove all files and directories recursively.
+    // count represents the number of attempted deletions of entries (even if failed).
+    async fn remove(&self, parent: Ino, name: String, count: &u64) -> Result<()>;
+
+    // Get summary of a node; for a directory it will accumulate all its child nodes
+    async fn get_summary(
+        &self,
+        inode: Ino,
+        summary: &Summary,
+        recursive: bool,
+        strict: bool,
+    ) -> Result<()>;
+
+    // GetTreeSummary returns a summary in tree structure
+    async fn get_tree_summary(
+        &self,
+        root: &TreeSummary,
+        depth: u8,
+        topn: u8,
+        strict: bool,
+        update_progress: Box<dyn Fn(u64, u64) + Send>,
+    ) -> Result<()>;
+
+    // Clone a file or directory
+    async fn clone(
+        &self,
+        src_ino: Ino,
+        dst_parent_ino: Ino,
+        dst_name: String,
+        cmode: u8,
+        cumask: u16,
+        count: &u64,
+        total: &u64,
+    ) -> Result<()>;
+
+    // Change root to a directory specified by subdir
+    async fn chroot(&self, subdir: String) -> Result<()>;
 }
 
 // NewClient creates a Meta client for given uri.
@@ -207,9 +511,7 @@ pub fn new_client(uri: String, conf: Config) -> Option<Box<dyn Meta>> {
         None => return None,
     };
     match driver {
-        "redis" => {
-            Some(Box::new(CommonMeta::new(RedisEngine::new())))
-        },
+        "redis" => Some(Box::new(CommonMeta::new(RedisEngine::new()))),
         _ => None,
     }
 }

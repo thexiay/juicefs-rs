@@ -2,8 +2,10 @@
 members = [
     "src/test",
     "src/vfs",
-    "src/meta"
-, "src/object"]
+    "src/meta", 
+    "src/object",
+    "src/utils",
+]
 resolver = "2"
 
 [workspace.package]
@@ -31,3 +33,4 @@ serde = { version = "1", features = ["derive", "rc"] }
 sysinfo = "0.23"
 bincode = "1"
 regex = "1.10"
+juice-utils = { path = "./src/utils" }

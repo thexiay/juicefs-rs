@@ -807,6 +807,7 @@ dependencies = [
  "ctor",
  "get_if_addrs",
  "hostname",
+ "juice-utils",
  "libc",
  "parking_lot",
  "proptest",
@@ -834,6 +835,10 @@ dependencies = [
  "redis",
  "tokio",
 ]
+
+[[package]]
+name = "juice-utils"
+version = "0.1.0"
 
 [[package]]
 name = "juice-vfs"
