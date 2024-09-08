@@ -16,10 +16,9 @@ use tokio::time::{self, sleep, Instant};
 use tracing::{debug, error, warn};
 
 use crate::acl::{Entry, Rule};
-use crate::api::{Attr, INodeType, Ino, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE};
+use crate::api::{Attr, INodeType, Ino, Meta, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE};
 use crate::base::{
-    Cchunk, DirStat, Engine, PendingFileScan, PendingSliceScan, SessionState, TrashSliceScan,
-    N_LOCK,
+    Cchunk, CommonMeta, DirStat, Engine, PendingFileScan, PendingSliceScan, SessionState, TrashSliceScan, N_LOCK
 };
 use crate::config::Format;
 use crate::error::{ConnectionSnafu, EmptyKeySnafu, MyError, RedisDetailSnafu, Result, SysSnafu};
@@ -82,6 +81,12 @@ pub struct RedisEngine {
     lookup_script: Script,  // lookup lua script
     resolve_script: Script, // reslove lua script
     state: Arc<SessionState>,
+}
+
+impl RedisEngine {
+    pub fn new() -> Self {
+        todo!()
+    }
 }
 
 impl RedisEngine {
@@ -220,16 +225,10 @@ impl RedisEngine {
     }
 
     fn expire_time(&self) -> u64 {
-        match self.state.conf.heartbeat {
-            Some(heartbeat) => (SystemTime::now() + heartbeat * 5)
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs(),
-            None => SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs(),
-        }
+        (SystemTime::now() + self.state.conf.heartbeat * 5)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs()
     }
 
     // For now only deleted files
@@ -1002,4 +1001,12 @@ impl Engine for RedisEngine {
     async fn cache_acls(&self) -> Result<()> {
         unimplemented!()
     }
+}
+
+fn check_trait<M: Meta>(item: M) {
+    
+}
+
+fn a(comm: CommonMeta<RedisEngine>) {
+    check_trait(comm);
 }

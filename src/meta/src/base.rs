@@ -1,21 +1,22 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use sysinfo::{get_current_pid, PidExt};
-use tracing::warn;
 use std::collections::HashMap;
+use std::io::{Write, Read};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::SystemTime;
+use sysinfo::{get_current_pid, PidExt};
+use tracing::warn;
 
 use crate::acl::{Entry, Rule};
-use crate::api::{Attr, Ino, Session, SessionInfo, Slice};
+use crate::api::{Attr, Ino, Meta, Session, SessionInfo, Slice};
 use crate::config::{Config, Format};
 use crate::error::Result;
 use crate::openfile::OpenFile;
 use crate::quota::Quota;
-use crate::utils::{Bar, FreeID};
+use crate::utils::{Bar, FLockItem, FreeID, PLockItem};
 
 pub const INODE_BATCH: isize = 1 << 10;
 pub const SLICE_ID_BATCH: isize = 1 << 10;
@@ -58,13 +59,13 @@ impl FsStat {
     pub fn update_stats(&self, space: i64, inodes: i64) {
         self.new_space.fetch_add(space, Ordering::SeqCst);
         self.used_inodes.fetch_add(inodes, Ordering::SeqCst);
-    } 
+    }
 }
 
 pub struct DirStat {
-	length: i64,
-	space: i64,
-	inodes:i64,
+    length: i64,
+    space: i64,
+    inodes: i64,
 }
 
 #[async_trait]
@@ -111,10 +112,16 @@ pub trait Engine {
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
     async fn do_flush_quotas(&self, quotas: HashMap<Ino, Quota>) -> Result<()>;
     async fn do_get_attr(&self, inode: Ino, attr: &Attr) -> Result<()>;
-    async fn do_set_attr(&self, inode: Ino, set: u16, sugidclearmode: u8, attr: &Attr) -> Result<()>;
+    async fn do_set_attr(
+        &self,
+        inode: Ino,
+        set: u16,
+        sugidclearmode: u8,
+        attr: &Attr,
+    ) -> Result<()>;
     async fn do_lookup(&self, parent: Ino, name: &str, inode: &Ino, attr: &Attr) -> Result<()>;
     async fn do_mknod(
-        &self, 
+        &self,
         parent: Ino,
         name: &str,
         _type: u8,
@@ -125,12 +132,30 @@ pub trait Engine {
         attr: &Attr,
     ) -> Result<()>;
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
-    async fn do_unlink(&self, parent: Ino, name: &str, attr: &Attr, skip_check_trash: bool) -> Result<()>;
-    async fn do_rmdir(&self, parent: Ino, name: &str, inode: &Ino, skip_check_trash: bool) -> Result<()>;
+    async fn do_unlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        attr: &Attr,
+        skip_check_trash: bool,
+    ) -> Result<()>;
+    async fn do_rmdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        inode: &Ino,
+        skip_check_trash: bool,
+    ) -> Result<()>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
-    async fn do_readdir(&self, inode: Ino, plus: u8, entries: &mut Vec<Entry>, limit: i32) -> Result<()>;
+    async fn do_readdir(
+        &self,
+        inode: Ino,
+        plus: u8,
+        entries: &mut Vec<Entry>,
+        limit: i32,
+    ) -> Result<()>;
     async fn do_rename(
-        &self, 
+        &self,
         parent_src: Ino,
         name_src: String,
         parent_dst: Ino,
@@ -147,7 +172,7 @@ pub trait Engine {
     async fn do_touch_atime(&self, inode: Ino, attr: Attr, ts: SystemTime) -> Result<bool>;
     async fn do_read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
     async fn do_write(
-        &self, 
+        &self,
         inode: Ino,
         indx: u32,
         off: u32,
@@ -159,7 +184,7 @@ pub trait Engine {
     ) -> Result<()>;
 
     async fn do_truncate(
-        &self, 
+        &self,
         inode: Ino,
         flags: u8,
         length: u64,
@@ -169,7 +194,7 @@ pub trait Engine {
     ) -> Result<()>;
 
     async fn do_fallocate(
-        &self, 
+        &self,
         inode: Ino,
         mode: u8,
         off: u64,
@@ -179,7 +204,7 @@ pub trait Engine {
     ) -> Result<()>;
 
     async fn do_compact_chunk(
-        &self, 
+        &self,
         inode: Ino,
         indx: u32,
         origin: &[u8],
@@ -209,8 +234,8 @@ pub trait Engine {
 }
 
 pub struct InternalNode {
-	inode: Ino,
-	name: String,
+    inode: Ino,
+    name: String,
 }
 
 pub struct SessionState {
@@ -221,7 +246,7 @@ pub struct SessionState {
     pub fs_stat: FsStat,
     // TODO: encapsulation it into Segmented Lock
     // Pessimistic locks to reduce conflicts
-    pub txn_locks: [Mutex<()>; N_LOCK],  
+    pub txn_locks: [Mutex<()>; N_LOCK],
     pub canceled: AtomicBool,
 }
 
@@ -242,20 +267,20 @@ impl SessionState {
             }
         };
         let session_info = SessionInfo {
-            version: "0.1".to_string(),  // TODO: get it in runtime
+            version: "0.1".to_string(), // TODO: get it in runtime
             host_name: host,
             ip_addrs: ips,
             mount_point: self.conf.mount_point.clone(),
             mount_time: SystemTime::now(),
             process_id: get_current_pid().unwrap().as_u32(),
         };
-        serde_json::to_string(&session_info).expect("session info serialization should never failed")
+        serde_json::to_string(&session_info)
+            .expect("session info serialization should never failed")
     }
-    
 }
 
-pub struct CommonMeta<T> {
-    engine: T,
+pub struct CommonMeta<E> {
+    engine: E,
     session_state: Arc<SessionState>,
     addr: String,
     root: Ino,
@@ -263,19 +288,164 @@ pub struct CommonMeta<T> {
     removed_files: HashMap<Ino, bool>,
     compacting: HashMap<u64, bool>,
     max_deleting: Sender<()>,
-    dslices: Sender<Slice>,  // slices to delete
+    dslices: Sender<Slice>, // slices to delete
     symlinks: HashMap<Ino, String>,
-    reload_cb: Vec<Box<dyn Fn(&Format)>>,
     umounting: bool,
     ses_mu: Mutex<()>,
     dir_stats_lock: Mutex<()>,
     dir_stats: HashMap<Ino, DirStat>,
     fs_stat: FsStat,
     parent_mu: Mutex<()>,
-    quota_mu: RwLock<()>,  // protect dirParents
+    quota_mu: RwLock<()>,            // protect dirParents
     dir_parents: HashMap<Ino, Ino>,  // protect dirQuotas
-    dir_quotas: HashMap<Ino, Quota>,  // directory inode -> parent inode
-    free_mu: Mutex<()>,  // directory inode -> quota
+    dir_quotas: HashMap<Ino, Quota>, // directory inode -> parent inode
+    free_mu: Mutex<()>,              // directory inode -> quota
     free_inodes: FreeID,
     free_slices: FreeID,
+}
+
+impl<E: Send + Sync + 'static + Engine> CommonMeta<E> {
+    pub fn new(e: E) -> Self {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
+
+{
+    // Name of database
+    fn name(&self) -> String {
+        todo!()
+    }
+
+    // Init is used to initialize a meta service.
+    async fn init(&self, format: &Format, force: bool) -> Result<()> {
+        todo!()
+    }
+
+    // Shutdown close current database connections.
+    async fn shutdown(&self) -> Result<()> {
+        todo!()
+    }
+
+    // Reset cleans up all metadata, VERY DANGEROUS!
+    async fn reset(&self) -> Result<()> {
+        todo!()
+    }
+
+    // Load loads the existing setting of a formatted volume from meta service.
+    async fn load(&self, check_version: bool) -> Result<Format> {
+        todo!()
+    }
+
+    // NewSession creates or update client session.
+    async fn new_session(&self, record: bool) -> Result<()> {
+        todo!()
+    }
+
+    // CloseSession does cleanup and close the session.
+    async fn close_session(&self) -> Result<()> {
+        todo!()
+    }
+
+    // GetSession retrieves information of session with sid
+    async fn get_session(&self, sid: u64, detail: bool) -> Result<Session> {
+        todo!()
+    }
+
+    // ListSessions returns all client sessions.
+    async fn list_sessions(&self) -> Result<Vec<Session>> {
+        todo!()
+    }
+
+    // ScanDeletedObject scan deleted objects by customized scanner.
+    async fn scan_deleted_object(
+        &self,
+        trash_slice_scan: TrashSliceScan,
+        pending_slice_scan: PendingSliceScan,
+        trash_file_scan: TrashFileScan,
+        pending_file_scan: PendingFileScan,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // ListLocks returns all locks of a inode.
+    async fn list_locks(&self, inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)> {
+        todo!()
+    }
+
+    // CleanStaleSessions cleans up sessions not active for more than 5 minutes
+    async fn clean_stale_sessions(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>) {
+        todo!()
+    }
+
+    // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
+    async fn cleanup_detached_nodes_before(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>) {
+        todo!()
+    }
+
+    // GetPaths returns all paths of an inode
+    async fn get_paths(&self, inode: Ino) -> Vec<String> {
+        todo!()
+    }
+
+    // Check integrity of an absolute path and repair it if asked
+    async fn check(&self, fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()> {
+        todo!()
+    }
+
+    // Get a copy of the current format
+    async fn get_format(&self) -> Format {
+        todo!()
+    }
+
+    // OnMsg add a callback for the given message type.
+    /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
+    
+    // OnReload register a callback for any change founded after reloaded.
+    async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>) {
+        todo!()
+    }
+
+    async fn handle_quota(
+        &self, 
+        cmd: u8,
+        dpath: String,
+        quotas: HashMap<String, Quota>,
+        strict: bool,
+        repair: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    // Dump the tree under root, which may be modified by checkRoot
+    async fn dump_meta(
+        &self, 
+        w: Box<dyn Write + Send>,
+        root: Ino,
+        threads: isize,
+        keep_secret: bool,
+        fast: bool,
+        skip_trash: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    async fn load_meta(&self, r: Box<dyn Read + Send>) -> Result<()> {
+        todo!()
+    }
+
+    // ---------------------------------------- sys call -----------------------------------------------------------
+    // StatFS returns summary statistics of a volume.
+    async fn stat_fs(
+        &self,
+        inode: Ino,
+        totalspace: AtomicU64,
+        availspace: AtomicU64,
+        iused: AtomicU64,
+        iavail: AtomicU64,
+    ) -> Result<()> {
+        todo!()
+    }
 }

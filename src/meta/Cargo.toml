@@ -24,3 +24,8 @@ serde = { workspace = true }
 sysinfo = { workspace = true }
 bincode = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5"
+ctor = "0.2.8"
+testcontainers = "0.22"

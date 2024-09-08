@@ -7,10 +7,11 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan};
-use crate::config::Format;
+use crate::base::{CommonMeta, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan};
+use crate::config::{Config, Format};
 use crate::error::Result;
 use crate::quota::Quota;
+use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
 pub const ROOT_INODE: Ino = 1;
@@ -101,36 +102,37 @@ pub struct Attr {
 
 // Meta is a interface for a meta service for file system.
 #[async_trait]
-pub trait Meta {
+pub trait Meta: Send + Sync + 'static {
     // Name of database
-    fn name() -> String;
+    fn name(&self) -> String;
 
     // Init is used to initialize a meta service.
-    async fn init(format: &Format, force: bool) -> Result<()>;
+    async fn init(&self, format: &Format, force: bool) -> Result<()>;
 
     // Shutdown close current database connections.
-    async fn shutdown() -> Result<()>;
+    async fn shutdown(&self) -> Result<()>;
 
     // Reset cleans up all metadata, VERY DANGEROUS!
-    async fn reset() -> Result<()>;
+    async fn reset(&self) -> Result<()>;
 
     // Load loads the existing setting of a formatted volume from meta service.
-    async fn load(check_version: bool) -> Result<Format>;
+    async fn load(&self, check_version: bool) -> Result<Format>;
 
     // NewSession creates or update client session.
-    async fn new_session(record: bool) -> Result<()>;
+    async fn new_session(&self, record: bool) -> Result<()>;
 
     // CloseSession does cleanup and close the session.
-    async fn close_session() -> Result<()>;
+    async fn close_session(&self) -> Result<()>;
 
     // GetSession retrieves information of session with sid
-    async fn get_session(sid: u64, detail: bool) -> Result<Session>;
+    async fn get_session(&self, sid: u64, detail: bool) -> Result<Session>;
 
     // ListSessions returns all client sessions.
-    async fn list_sessions() -> Result<Vec<Session>>;
+    async fn list_sessions(&self) -> Result<Vec<Session>>;
 
     // ScanDeletedObject scan deleted objects by customized scanner.
     async fn scan_deleted_object(
+        &self,
         trash_slice_scan: TrashSliceScan,
         pending_slice_scan: PendingSliceScan,
         trash_file_scan: TrashFileScan,
@@ -138,30 +140,31 @@ pub trait Meta {
     ) -> Result<()>;
 
     // ListLocks returns all locks of a inode.
-    async fn list_locks(inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)>;
+    async fn list_locks(&self, inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)>;
 
     // CleanStaleSessions cleans up sessions not active for more than 5 minutes
-    async fn clean_stale_sessions(edge: SystemTime, incre_process: Box<dyn Fn(isize)>);
+    async fn clean_stale_sessions(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>);
 
     // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
-    async fn cleanup_detached_nodes_before(edge: SystemTime, incre_process: Box<dyn Fn(isize)>);
+    async fn cleanup_detached_nodes_before(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>);
 
     // GetPaths returns all paths of an inode
-    async fn get_paths(inode: Ino) -> Vec<String>;
+    async fn get_paths(&self, inode: Ino) -> Vec<String>;
 
     // Check integrity of an absolute path and repair it if asked
-    async fn check(fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()>;
+    async fn check(&self, fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()>;
 
     // Get a copy of the current format
-    async fn get_format() -> Format;
+    async fn get_format(&self) -> Format;
 
     // OnMsg add a callback for the given message type.
     /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
     
     // OnReload register a callback for any change founded after reloaded.
-    async fn on_reload(cb: Box<dyn Fn(Format)>);
+    async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>);
 
     async fn handle_quota(
+        &self, 
         cmd: u8,
         dpath: String,
         quotas: HashMap<String, Quota>,
@@ -171,22 +174,42 @@ pub trait Meta {
 
     // Dump the tree under root, which may be modified by checkRoot
     async fn dump_meta(
-        w: Box<dyn Write>,
+        &self, 
+        w: Box<dyn Write + Send>,
         root: Ino,
         threads: isize,
         keep_secret: bool,
         fast: bool,
         skip_trash: bool,
     ) -> Result<()>;
-    async fn load_meta(r: Box<dyn Read>) -> Result<()>;
-
+    async fn load_meta(&self, r: Box<dyn Read + Send>) -> Result<()>;
     // ---------------------------------------- sys call -----------------------------------------------------------
     // StatFS returns summary statistics of a volume.
     async fn stat_fs(
+        &self,
         inode: Ino,
         totalspace: AtomicU64,
         availspace: AtomicU64,
         iused: AtomicU64,
         iavail: AtomicU64,
     ) -> Result<()>;
+}
+
+// NewClient creates a Meta client for given uri.
+pub fn new_client(uri: String, conf: Config) -> Option<Box<dyn Meta>> {
+    let uri = if !uri.contains("://") {
+        format!("redis://{}", uri)
+    } else {
+        uri
+    };
+    let driver = match uri.find("://") {
+        Some(p) => &uri[..p],
+        None => return None,
+    };
+    match driver {
+        "redis" => {
+            Some(Box::new(CommonMeta::new(RedisEngine::new())))
+        },
+        _ => None,
+    }
 }
