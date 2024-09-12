@@ -1,27 +1,55 @@
-use std::{collections::HashMap, hash::{DefaultHasher, Hasher}, sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock}, thread::sleep, time::Duration};
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hasher},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
+    time::Duration,
+};
 
+use base_test::test_format;
 use ctor::{ctor, dtor};
-use juice_meta::{api::{new_client, Meta}, config::Config};
+use juice_meta::{
+    api::{new_client, Meta},
+    config::Config,
+};
+use parking_lot::RwLock;
+use tokio::time::sleep;
+use tracing::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod base_test;
 
 // TODO: init redis environment in docker container
 
-static REDIS_DB_HOLDER: LazyLock<RedisDbOffer> =  LazyLock::new(|| {
-    RedisDbOffer::new(16)
-});
+#[ctor]
+fn before_all() {
+    let mut guard = REDIS_DB_HOLDER.write();
+    *guard = Some(RedisDbOffer::new(16));
+    tracing_subscriber::registry().with(fmt::layer()).init();
+}
+
+#[dtor]
+fn after_all() {}
+
+static REDIS_DB_HOLDER: RwLock<Option<RedisDbOffer>> = RwLock::new(None);
 
 struct RedisDbOffer {
     redis_url: String,
     db_nums: u32,
-    db_used: HashMap<u32, Arc<AtomicBool>>,
+    // db_id -> (refs, inited)
+    db_used: HashMap<u32, (Arc<AtomicBool>, AtomicBool)>,
 }
 
 impl RedisDbOffer {
     fn new(num: u32) -> Self {
         let mut db_used = HashMap::new();
         for i in 0..num {
-            db_used.insert(i, Arc::new(AtomicBool::new(false)));
+            db_used.insert(
+                i,
+                (Arc::new(AtomicBool::new(false)), AtomicBool::new(false)),
+            );
         }
         RedisDbOffer {
             redis_url: "redis://localhost:6379".to_string(),
@@ -29,15 +57,32 @@ impl RedisDbOffer {
             db_used,
         }
     }
-    
-    fn take(&self) -> (RedisDbHodler, String) {
+
+    async fn take(&self, config: Config) -> (Box<dyn Meta>, RedisDbHodler) {
         loop {
             for i in 0..self.db_nums {
-                if self.db_used[&i].compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                    return (RedisDbHodler(self.db_used[&i].clone()), format!("{}/{}", self.redis_url, i));
+                let redis_url = format!("{}/{}", self.redis_url, i);
+                let client = new_client(redis_url.clone(), config.clone());
+                let (refs, inited) = &self.db_used[&i];
+                if inited
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    // only init once
+                    info!("Init redis db: {redis_url}");
+                    client.init(test_format(), true).await.unwrap();
+                }
+
+                if refs
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    info!("Use redis db: {redis_url}");
+                    client.load(true).await.unwrap();
+                    return (client, RedisDbHodler(refs.clone()));
                 }
             }
-            sleep(Duration::from_secs(10));
+            sleep(Duration::from_secs(10)).await;
         }
     }
 }
@@ -50,67 +95,62 @@ impl Drop for RedisDbHodler {
     }
 }
 
-fn new_redis_client() -> (Box<dyn Meta>, RedisDbHodler) {
-    let db_offer = LazyLock::force(&REDIS_DB_HOLDER);
-    let (db_holder, redis_url) = db_offer.take();
-    (new_client(redis_url, Config::default()).unwrap(), db_holder)
-}
-
 #[tokio::test]
 async fn test_meta_client() {
-    let (meta, _) = new_redis_client();
+    let guard = REDIS_DB_HOLDER.read();
+    let (meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
     base_test::test_meta_client(meta).await;
 }
 
-async fn test_truncate_and_delete(meta: Box<dyn Meta>) {}
+async fn test_truncate_and_delete() {}
 
-async fn test_trash(meta: Box<dyn Meta>) {}
+async fn test_trash() {}
 
-async fn test_parents(meta: Box<dyn Meta>) {}
+async fn test_parents() {}
 
-async fn test_remove(meta: Box<dyn Meta>) {
-    let (meta, _) = new_redis_client();
+#[tokio::test]
+async fn test_remove() {
+    let guard = REDIS_DB_HOLDER.read();
+    let (meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
     base_test::test_remove(meta).await;
 }
 
-async fn test_resolve(meta: Box<dyn Meta>) {
+async fn test_resolve() {}
 
-}
+async fn test_sticky_bit() {}
 
-async fn test_sticky_bit(meta: Box<dyn Meta>) {}
+async fn test_locks() {}
 
-async fn test_locks(meta: Box<dyn Meta>) {}
+async fn test_list_locks() {}
 
-async fn test_list_locks(meta: Box<dyn Meta>) {}
-
-async fn test_concurrent_write(meta: Box<dyn Meta>) {}
+async fn test_concurrent_write() {}
 
 async fn test_compaction<M: Meta>(meta: M, flag: bool) {}
 
-async fn test_copy_file_range(meta: Box<dyn Meta>) {}
+async fn test_copy_file_range() {}
 
-async fn test_close_session(meta: Box<dyn Meta>) {}
+async fn test_close_session() {}
 
-async fn test_concurrent_dir(meta: Box<dyn Meta>) {}
+async fn test_concurrent_dir() {}
 
-async fn test_attr_flags(meta: Box<dyn Meta>) {}
+async fn test_attr_flags() {}
 
-async fn test_quota(meta: Box<dyn Meta>) {}
+async fn test_quota() {}
 
-async fn test_atime(meta: Box<dyn Meta>) {}
+async fn test_atime() {}
 
-async fn test_access(meta: Box<dyn Meta>) {}
+async fn test_access() {}
 
-async fn test_open_cache(meta: Box<dyn Meta>) {}
+async fn test_open_cache() {}
 
-async fn test_case_incensi(meta: Box<dyn Meta>) {}
+async fn test_case_incensi() {}
 
-async fn test_check_and_repair(meta: Box<dyn Meta>) {}
+async fn test_check_and_repair() {}
 
-async fn test_dir_stat(meta: Box<dyn Meta>) {}
+async fn test_dir_stat() {}
 
-async fn test_clone(meta: Box<dyn Meta>) {}
+async fn test_clone() {}
 
-async fn test_acl(meta: Box<dyn Meta>) {}
+async fn test_acl() {}
 
-async fn test_read_only(meta: Box<dyn Meta>) {}
+async fn test_read_only() {}

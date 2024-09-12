@@ -3,10 +3,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::error::Result;
+use crate::{api::MAX_VERSION, error::{NotIncompatibleClientSnafu, Result}};
 
 // Config for clients.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Config {
 	pub strict: bool,  // update ctime
 	pub retries: isize, // number of retries
@@ -42,7 +42,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Format {
     pub name: String,
     pub uuid: String,
@@ -56,15 +56,15 @@ pub struct Format {
     pub compression: Option<String>,
     pub shards: Option<i32>,
     pub hash_prefix: Option<bool>,
-    pub capacity: Option<u64>,
-    pub inodes: Option<u64>,
+    pub capacity: u64,
+    pub inodes: u64,
     pub encrypt_key: Option<String>,
     pub encrypt_algo: Option<String>,
     pub key_encrypted: Option<bool>,
     pub upload_limit: Option<i64>, // Mbps
     pub download_limit: Option<i64>, // Mbps
     pub trash_days: i32,
-    pub meta_version: Option<i32>,
+    pub meta_version: i32,
     pub min_client_version: Option<String>,
     pub max_client_version: Option<String>,
     pub dir_stats: bool,
@@ -74,6 +74,17 @@ pub struct Format {
 impl Format {
     /// check format can be update or not
     pub fn check_ugrade(&self, old: &Format, force: bool) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn check_version(&self) -> Result<()> {
+        if self.meta_version > MAX_VERSION {
+            return NotIncompatibleClientSnafu{ 
+                version: self.meta_version 
+            }.fail();
+        }
+    
+        // TODO: check client version
         Ok(())
     }
 }

@@ -3,31 +3,36 @@ use bytes::Bytes;
 use juice_utils::process::Bar;
 use r2d2::{Pool, PooledConnection};
 use redis::{
-    Client as RedisClient, Commands, Connection, ConnectionLike, Pipeline, RedisError, RedisResult,
-    ScanOptions, Script, ToRedisArgs,
+    Client as RedisClient, Commands, Connection, ConnectionLike, InfoDict, IntoConnectionInfo,
+    Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
 use std::hash::{DefaultHasher, Hasher};
-use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::result::Result as StdResult;
 use tokio::time::{self, sleep, Instant};
 use tracing::{debug, error, warn};
 
 use crate::acl::Rule;
-use crate::api::{Attr, Entry, INodeType, Ino, Meta, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE};
-use crate::base::{
-    Cchunk, CommonMeta, DirStat, Engine, PendingFileScan, PendingSliceScan, SessionState, TrashSliceScan, N_LOCK
+use crate::api::{
+    Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE
 };
-use crate::config::Format;
+use crate::base::{
+    Cchunk, CommonMeta, DirStat, Engine, MetaState, PendingFileScan, PendingSliceScan,
+    TrashSliceScan, N_LOCK,
+};
+use crate::config::{Config, Format};
 use crate::error::{ConnectionSnafu, EmptyKeySnafu, MyError, RedisDetailSnafu, Result, SysSnafu};
 use crate::quota::Quota;
 use crate::utils;
 use std::collections::HashMap;
 
 use std::time::{Duration, SystemTime};
+
+use super::check::RedisInfo;
 
 pub const TXN_RETRY_LIMIT: u32 = 50;
 pub const LOOKUP_SCRIPT_CODE: &str = r#"
@@ -42,6 +47,79 @@ pub const LOOKUP_SCRIPT_CODE: &str = r#"
     end
     return {ino, redis.call('GET', "i" .. string.format("%.f", ino))}
 "#;
+pub const RESOLVE_SCRIPT_CODE: &str = r#"
+local function unpack_attr(buf)
+    local x = {}
+    x.flags, x.mode, x.uid, x.gid = struct.unpack(">BHI4I4", string.sub(buf, 0, 11))
+    x.type = math.floor(x.mode / 4096) % 8
+    x.mode = x.mode % 4096
+    return x
+end
+
+local function get_attr(ino)
+    local encoded_attr = redis.call('GET', "i" .. string.format("%.f", ino))
+    if not encoded_attr then
+        error("ENOENT")
+    end
+    return unpack_attr(encoded_attr)
+end
+
+local function lookup(parent, name)
+    local buf = redis.call('HGET', "d" .. string.format("%.f", parent), name)
+    if not buf then
+        error("ENOENT")
+    end
+    return struct.unpack(">BI8", buf)
+end
+
+local function has_value(tab, val)
+    for index, value in ipairs(tab) do
+        if value == val then
+            return true
+        end
+    end
+    return false
+end
+
+local function can_access(ino, uid, gids)
+    if uid == 0 then
+        return true
+    end
+
+    local attr = get_attr(ino)
+    local mode = 0
+    if attr.uid == uid then
+        mode = math.floor(attr.mode / 64) % 8
+    elseif has_value(gids, tostring(attr.gid)) then
+        mode = math.floor(attr.mode / 8) % 8
+    else
+        mode = attr.mode % 8
+    end
+    return mode % 2 == 1
+end
+
+local function resolve(parent, path, uid, gids)
+    local _maxIno = 4503599627370495
+    local _type = 2
+    for name in string.gmatch(path, "[^/]+") do
+        if _type == 3 or parent > _maxIno then
+            error("ENOTSUP")
+        elseif _type ~= 2 then
+            error("ENOTDIR")
+        elseif parent > 1 and not can_access(parent, uid, gids) then 
+            error("EACCESS")
+        end
+        _type, parent = lookup(parent, name)
+    end
+    if parent > _maxIno then
+        error("ENOTSUP")
+    end
+    return {parent, redis.call('GET', "i" .. string.format("%.f", parent))}
+end
+
+return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
+"#;
+
 /*
     Key and Value map:
     Parent:     p$inode -> {parent -> count} // for hard links
@@ -73,21 +151,19 @@ pub const LOOKUP_SCRIPT_CODE: &str = r#"
       Scan: 2.8+
 
     Redis Action:
-        
+
 */
 // TODO: make conn async
 pub struct RedisEngine {
-    rdb: Pool<RedisClient>, // TODO: single connection or multiple connections?
+    // TODO: single connection or multiple connections?
+    /// Redis Sentinel mode
+    /// Redis Cluster mode
+    /// Redis normal mode
+    rdb: Pool<RedisClient>,
     prefix: String,
     lookup_script: Script,  // lookup lua script
     resolve_script: Script, // reslove lua script
-    state: Arc<SessionState>,
-}
-
-impl RedisEngine {
-    pub fn new() -> Self {
-        todo!()
-    }
+    meta: CommonMeta,
 }
 
 impl RedisEngine {
@@ -129,42 +205,42 @@ impl RedisEngine {
         format!("{}{}", self.prefix, "delfiles")
     }
 
-	/// detached nodes: detachedNodes -> [$inode -> seconds]
+    /// detached nodes: detachedNodes -> [$inode -> seconds]
     fn detached_nodes(&self) -> String {
         format!("{}{}", self.prefix, "detachedNodes")
     }
 
-	/// Slices refs: k$sliceId_$size -> refcount
+    /// Slices refs: k$sliceId_$size -> refcount
     fn slice_refs(&self) -> String {
         format!("{}{}", self.prefix, "sliceRefs")
     }
 
-	/// Dir data length:   dirDataLength -> { $inode -> length }
+    /// Dir data length:   dirDataLength -> { $inode -> length }
     fn dir_data_length_key(&self) -> String {
         format!("{}{}", self.prefix, "dirDataLength")
     }
 
-	/// Dir used space:    dirUsedSpace -> { $inode -> usedSpace }
+    /// Dir used space:    dirUsedSpace -> { $inode -> usedSpace }
     fn dir_used_space_key(&self) -> String {
         format!("{}{}", self.prefix, "dirUsedSpace")
     }
 
-	/// Dir used inodes:   dirUsedInodes -> { $inode -> usedInodes }
+    /// Dir used inodes:   dirUsedInodes -> { $inode -> usedInodes }
     fn dir_used_inodes_key(&self) -> String {
         format!("{}{}", self.prefix, "dirUsedInodes")
     }
 
-	/// Quota:             dirQuota -> { $inode -> {maxSpace, maxInodes} }
+    /// Quota:             dirQuota -> { $inode -> {maxSpace, maxInodes} }
     fn dir_quota_key(&self) -> String {
         format!("{}{}", self.prefix, "dirQuota")
     }
 
-	/// Quota used space:  dirQuotaUsedSpace -> { $inode -> usedSpace }
+    /// Quota used space:  dirQuotaUsedSpace -> { $inode -> usedSpace }
     fn dir_quota_used_space_key(&self) -> String {
         format!("{}{}", self.prefix, "dirQuotaUsedSpace")
     }
 
-	/// Quota used inodes: dirQuotaUsedInodes -> { $inode -> usedInodes }
+    /// Quota used inodes: dirQuotaUsedInodes -> { $inode -> usedInodes }
     fn dir_quota_used_inodes_key(&self) -> String {
         format!("{}{}", self.prefix, "dirQuotaUsedInodes")
     }
@@ -178,7 +254,7 @@ impl RedisEngine {
     fn dir_key(&self, inode: Ino) -> String {
         format!("{}d{}", self.prefix, inode)
     }
-    
+
     /// Parent:     p$inode -> {parent -> count} // for hard links
     fn parent_key(&self, inode: Ino) -> String {
         format!("{}p{}", self.prefix, inode)
@@ -188,7 +264,7 @@ impl RedisEngine {
     fn chunk_key(&self, inode: u64, indx: u64) -> String {
         format!("{}c{}_{}", self.prefix, inode, indx)
     }
-   
+
     /// Symlink:    s$inode -> target
     fn sym_key(&self, inode: Ino) -> String {
         format!("{}s{}", self.prefix, inode)
@@ -226,7 +302,7 @@ impl RedisEngine {
     }
 
     fn expire_time(&self) -> u64 {
-        (SystemTime::now() + self.state.conf.heartbeat * 5)
+        (SystemTime::now() + self.meta.conf.heartbeat * 5)
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs()
@@ -237,6 +313,69 @@ impl RedisEngine {
 }
 
 impl RedisEngine {
+    /// redis URL:
+    /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
+    pub fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
+        // TODO: parse addr myself
+        let url = format!("{}://{}", driver, addr);
+        let client = RedisClient::open(url)?;
+        let prefix = client.get_connection_info().redis.db.to_string();
+        let rdb = r2d2::Pool::builder().max_size(15).build(client).unwrap();
+        let meta = CommonMeta::new(addr, conf);
+        let engine = RedisEngine {
+            rdb,
+            prefix,
+            lookup_script: Script::new(LOOKUP_SCRIPT_CODE),
+            resolve_script: Script::new(RESOLVE_SCRIPT_CODE),
+            meta,
+        };
+
+        engine.check_server_config()?;
+        Ok(Box::new(engine))
+    }
+
+    fn check_server_config(&self) -> Result<()> {
+        let mut conn = self.pool_conn()?;
+        let info: InfoDict = redis::cmd("INFO")
+            .query(&mut conn)
+            .context(RedisDetailSnafu {
+                detail: "prase redis info".to_string(),
+            })?;
+        let redis_info = RedisInfo::new(info);
+        
+        Ok(())
+        /*
+                rawInfo, err := m.rdb.Info(Background).Result()
+        if err != nil {
+            logger.Warnf("parse info: %s", err)
+            return
+        }
+        rInfo, err := checkRedisInfo(rawInfo)
+        if err != nil {
+            logger.Warnf("parse info: %s", err)
+        }
+        if rInfo.storageProvider == "" && rInfo.maxMemoryPolicy != "" && rInfo.maxMemoryPolicy != "noeviction" {
+            logger.Warnf("maxmemory_policy is %q,  we will try to reconfigure it to 'noeviction'.", rInfo.maxMemoryPolicy)
+            if _, err := m.rdb.ConfigSet(Background, "maxmemory-policy", "noeviction").Result(); err != nil {
+                logger.Errorf("try to reconfigure maxmemory-policy to 'noeviction' failed: %s", err)
+            } else if result, err := m.rdb.ConfigGet(Background, "maxmemory-policy").Result(); err != nil {
+                logger.Warnf("get config maxmemory-policy failed: %s", err)
+            } else if len(result) == 1 && result["maxmemory-policy"] != "noeviction" {
+                logger.Warnf("reconfigured maxmemory-policy to 'noeviction', but it's still %s", result["maxmemory-policy"])
+            } else {
+                logger.Infof("set maxmemory-policy to 'noeviction' successfully")
+            }
+        }
+        start := time.Now()
+        _, err = m.rdb.Ping(Background).Result()
+        if err != nil {
+            logger.Errorf("Ping redis: %s", err.Error())
+            return
+        }
+        logger.Infof("Ping redis latency: %s", time.Since(start))
+             */
+    }
+
     async fn txn_with_retry<
         C: ConnectionLike,
         K: ToRedisArgs,
@@ -248,7 +387,7 @@ impl RedisEngine {
         keys: &[K],
         func: &mut F,
     ) -> Result<T> {
-        ensure!(!self.state.conf.read_only, SysSnafu { code: libc::EROFS });
+        ensure!(!self.meta.conf.read_only, SysSnafu { code: libc::EROFS });
         ensure!(!keys.is_empty(), EmptyKeySnafu);
 
         for key in keys {
@@ -268,12 +407,12 @@ impl RedisEngine {
             .iter()
             .for_each(|arg| hasher.write(arg));
         let hash = hasher.finish();
-        let _ = self.state.txn_locks[(hash % N_LOCK as u64) as usize].lock();
+        let _ = self.meta.txn_locks[(hash % N_LOCK as u64) as usize].lock();
 
         let mut last_err = None;
         for i in 0..TXN_RETRY_LIMIT {
             ensure!(
-                !self.state.canceled.load(Ordering::Relaxed),
+                !self.meta.canceled.load(Ordering::Relaxed),
                 SysSnafu { code: libc::EINTR }
             );
             match redis::transaction(conn, keys, &mut *func) {
@@ -325,7 +464,7 @@ impl RedisEngine {
                 return;
             }
         };
-        
+
         let mut indx = 0;
         let mut p = redis::pipe();
         while indx * CHUNK_SIZE < length {
@@ -347,33 +486,37 @@ impl RedisEngine {
                 }
             };
             for (i, cmd) in cmds.iter().enumerate() {
-                if let Some(val) = cmd && *val != 0 {
+                if let Some(val) = cmd
+                    && *val != 0
+                {
                     let idx = keys[i]
                         .split('_')
                         .last()
                         .expect("error split")
                         .parse::<u64>()
                         .expect("error parse");
-                    self.delete_chunk(inode, idx).await
+                    self.delete_chunk(inode, idx)
+                        .await
                         .unwrap_or_else(|err| error!("Failed to delete chunk: {}", err));
                 }
             }
         }
         if tracking.is_empty() {
             let tracking = format!("{}:{}", inode, length);
-            let () = conn.zrem(self.del_files(), tracking)
+            let () = conn
+                .zrem(self.del_files(), tracking)
                 .unwrap_or_else(|err| error!("Failed to remove tracking: {}", err));
         }
     }
-    
+
     async fn delete_chunk(&self, inode: Ino, indx: u64) -> Result<()> {
         let mut conn = self.pool_conn()?;
         let key = self.chunk_key(inode, indx);
         match redis::transaction(&mut conn, &[&key], |c, pipe| {
-            let mut todel: Vec<Slice> = Vec::new(); 
+            let mut todel: Vec<Slice> = Vec::new();
             // if not exists, ignore it
             let vals: Vec<String> = c.lrange(&key, 0, -1)?;
-            
+
             let slices = match TryInto::<Slices>::try_into(vals) {
                 Ok(Slices(slices)) => slices,
                 Err(e) => {
@@ -391,22 +534,29 @@ impl RedisEngine {
         }) {
             Ok((todel, rs)) => {
                 assert!(rs.len() == todel.len());
-                todel.iter().zip(rs.iter()).filter(|(_, r)| **r < 0).for_each(|(s, _)| {
-                    self.delete_slice(s.id, s.size);
-                });
+                todel
+                    .iter()
+                    .zip(rs.iter())
+                    .filter(|(_, r)| **r < 0)
+                    .for_each(|(s, _)| {
+                        self.delete_slice(s.id, s.size);
+                    });
                 Ok(())
-            },
+            }
             Err(e) => {
                 error!("Delete slice from chunk {} fail: {}, retry later", key, e);
                 Err(e.into())
-            },
+            }
         }
     }
 
-    fn delete_slice(&self, id: u64, size: u32) {
+    fn delete_slice(&self, id: u64, size: u32) {}
+}
 
+impl AsRef<CommonMeta> for RedisEngine {
+    fn as_ref(&self) -> &CommonMeta {
+        &self.meta
     }
-  
 }
 
 #[async_trait]
@@ -419,7 +569,7 @@ impl Engine for RedisEngine {
     }
 
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64> {
-        ensure!(!self.state.conf.read_only, SysSnafu { code: libc::EROFS });
+        ensure!(!self.meta.conf.read_only, SysSnafu { code: libc::EROFS });
         let mut conn = self.pool_conn()?;
         let name_lower = name.to_lowercase();
         if name_lower.eq("nextinode") || name.eq("nextchunk") {
@@ -449,19 +599,23 @@ impl Engine for RedisEngine {
     }
 
     async fn update_stats(&self, space: i64, inodes: i64) {
-        self.state.fs_stat.update_stats(space, inodes);
+        self.meta.fs_stat.update_stats(space, inodes);
     }
 
     async fn flush_stats(&self) {}
 
-    async fn do_load(&self) -> Result<Option<Vec<u8>>> {
+    async fn do_load(&self) -> Result<Option<Format>> {
         let mut conn = self.pool_conn()?;
-        Ok(conn.get(self.settings())?)
+        let format_body: Option<Vec<u8>> = conn.get(self.settings())?;
+        match format_body {
+            Some(body) => Ok(Some(serde_json::from_slice(&body)?)),
+            None => Ok(None),
+        }
     }
 
     async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()> {
         let mut conn = self.pool_conn()?;
-        let sid = self.state.sid.load(Ordering::SeqCst).to_string();
+        let sid = self.meta.current_sid.load(Ordering::SeqCst).to_string();
         conn.zadd(self.all_sessions(), &sid, self.expire_time())
             .context(RedisDetailSnafu {
                 detail: format!("set session id {sid}"),
@@ -484,7 +638,7 @@ impl Engine for RedisEngine {
                 detail: "load scriptResolve",
             })?;
 
-        if !self.state.conf.no_bg_job {
+        if !self.meta.conf.no_bg_job {
             tokio::spawn(async move {
                 self.clean_legacies().await;
             });
@@ -494,12 +648,12 @@ impl Engine for RedisEngine {
 
     async fn do_refresh_session(&self) -> Result<()> {
         let mut conn = self.pool_conn()?;
-        let ssid = self.state.sid.load(Ordering::SeqCst);
+        let ssid = self.meta.current_sid.load(Ordering::SeqCst);
         // we have to check sessionInfo here because the operations are not within a transaction
         match conn.hexists(self.session_infos(), &ssid) {
             Ok(false) => {
                 warn!("Session 0x{ssid:16x} was stale and cleaned up, but now it comes back again");
-                conn.hset(self.session_infos(), &ssid, self.state.new_session_info())?;
+                conn.hset(self.session_infos(), &ssid, self.meta.new_session_info())?;
             }
             Err(e) => return Err(e.into()),
             _ => (),
@@ -595,10 +749,10 @@ impl Engine for RedisEngine {
 
     async fn do_init(&self, format: Format, force: bool) -> Result<()> {
         let mut conn = self.pool_conn()?;
-        let body: Option<String> = conn.get(self.settings())?;
+        let body: Option<Vec<u8>> = conn.get(self.settings())?;
         if let Some(ref body) = body {
             // if old exist, check if it can be update
-            let old: Format = serde_json::from_str(body)?;
+            let old: Format = serde_json::from_slice(body)?;
             if !old.dir_stats && format.dir_stats {
                 // remove dir stats as they are outdated
                 conn.del(&[self.dir_used_inodes_key(), self.dir_used_space_key()])
@@ -628,9 +782,9 @@ impl Engine for RedisEngine {
             conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)?;
         }
 
-        conn.set(self.settings(), serde_json::to_string(&format)?)?;
-        let mut lock = self.state.fmt.write();
-        *lock = format;
+        conn.set(self.settings(), serde_json::to_vec(&format)?)?;
+        let mut lock = self.meta.fmt.write();
+        *lock = Arc::new(format);
         match body {
             Some(_) => Ok(()),
             None => {
@@ -738,7 +892,7 @@ impl Engine for RedisEngine {
             }
             let inode = ps[0].parse::<Ino>().expect("error parse");
             let length = ps[1].parse::<u64>().expect("error parse");
-            files.insert(inode, length); 
+            files.insert(inode, length);
         }
         Ok(files)
     }
@@ -827,10 +981,170 @@ impl Engine for RedisEngine {
         mode: u16,
         cumask: u16,
         path: &str,
-        inode: &Ino,
-        attr: &Attr,
     ) -> Result<()> {
+        let mut conn = self.pool_conn()?;
+        self.txn_with_retry(&mut conn, &[self.inode_key(parent), self.dir_key(parent)], 
+        &mut |c, conn| {
+            let attr_bytes: Vec<u8> = c.get(self.inode_key(parent))?;
+            let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
+                RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
+            })?;
+            if attr.typ != INodeType::TypeDirectory {
+                return Err((
+                    redis::ErrorKind::TypeError,
+                    "type error",
+                    "not a directory".to_string(),
+                ).into());
+            }
+            if attr.parent > TRASH_INODE {
+                return Err((redis::ErrorKind::TypeError, "type error", "not a directory".to_string()).into());
+            }
+            self.access(parent, ModeMask::WRITE, &attr).await?;
+            
+            Ok(Some(()))
+        }).await?;
         unimplemented!()
+        /*
+        	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+            var pattr Attr
+            a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
+            if err != nil {
+                return err
+            }
+            m.parseAttr(a, &pattr)
+            if pattr.Typ != TypeDirectory {
+                return syscall.ENOTDIR
+            }
+            if pattr.Parent > TrashInode {
+                return syscall.ENOENT
+            }
+            if st := m.Access(ctx, parent, MODE_MASK_W, &pattr); st != 0 {
+                return st
+            }
+            if (pattr.Flags & FlagImmutable) != 0 {
+                return syscall.EPERM
+            }
+
+            buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
+            if err != nil && err != redis.Nil {
+                return err
+            }
+            var foundIno Ino
+            var foundType uint8
+            if err == nil {
+                foundType, foundIno = m.parseEntry(buf)
+            } else if m.conf.CaseInsensi { // err == redis.Nil
+                if entry := m.resolveCase(ctx, parent, name); entry != nil {
+                    foundType, foundIno = entry.Attr.Typ, entry.Inode
+                }
+            }
+            if foundIno != 0 {
+                if _type == TypeFile || _type == TypeDirectory { // file for create, directory for subTrash
+                    a, err = tx.Get(ctx, m.inodeKey(foundIno)).Bytes()
+                    if err == nil {
+                        m.parseAttr(a, attr)
+                    } else if err == redis.Nil {
+                        *attr = Attr{Typ: foundType, Parent: parent} // corrupt entry
+                    } else {
+                        return err
+                    }
+                    *inode = foundIno
+                }
+                return syscall.EEXIST
+            }
+
+            mode &= 07777
+            if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
+                // inherit default acl
+                if _type == TypeDirectory {
+                    attr.DefaultACL = pattr.DefaultACL
+                }
+
+                // set access acl by parent's default acl
+                rule, err := m.getACL(ctx, tx, pattr.DefaultACL)
+                if err != nil {
+                    return err
+                }
+
+                if rule.IsMinimal() {
+                    // simple acl as default
+                    attr.Mode = mode & (0xFE00 | rule.GetMode())
+                } else {
+                    cRule := rule.ChildAccessACL(mode)
+                    id, err := m.insertACL(ctx, tx, cRule)
+                    if err != nil {
+                        return err
+                    }
+
+                    attr.AccessACL = id
+                    attr.Mode = (mode & 0xFE00) | cRule.GetMode()
+                }
+            } else {
+                attr.Mode = mode & ^cumask
+            }
+
+            var updateParent bool
+            now := time.Now()
+            if parent != TrashInode {
+                if _type == TypeDirectory {
+                    pattr.Nlink++
+                    updateParent = true
+                }
+                if updateParent || now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime {
+                    pattr.Mtime = now.Unix()
+                    pattr.Mtimensec = uint32(now.Nanosecond())
+                    pattr.Ctime = now.Unix()
+                    pattr.Ctimensec = uint32(now.Nanosecond())
+                    updateParent = true
+                }
+            }
+            attr.Atime = now.Unix()
+            attr.Atimensec = uint32(now.Nanosecond())
+            attr.Mtime = now.Unix()
+            attr.Mtimensec = uint32(now.Nanosecond())
+            attr.Ctime = now.Unix()
+            attr.Ctimensec = uint32(now.Nanosecond())
+            if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+                attr.Gid = pattr.Gid
+            } else if runtime.GOOS == "linux" && pattr.Mode&02000 != 0 {
+                attr.Gid = pattr.Gid
+                if _type == TypeDirectory {
+                    attr.Mode |= 02000
+                } else if attr.Mode&02010 == 02010 && ctx.Uid() != 0 {
+                    var found bool
+                    for _, gid := range ctx.Gids() {
+                        if gid == pattr.Gid {
+                            found = true
+                        }
+                    }
+                    if !found {
+                        attr.Mode &= ^uint16(02000)
+                    }
+                }
+            }
+
+            _, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+                pipe.HSet(ctx, m.entryKey(parent), name, m.packEntry(_type, *inode))
+                if updateParent {
+                    pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
+                }
+                pipe.Set(ctx, m.inodeKey(*inode), m.marshal(attr), 0)
+                if _type == TypeSymlink {
+                    pipe.Set(ctx, m.symKey(*inode), path, 0)
+                }
+                if _type == TypeDirectory {
+                    field := (*inode).String()
+                    pipe.HSet(ctx, m.dirUsedInodesKey(), field, "0")
+                    pipe.HSet(ctx, m.dirDataLengthKey(), field, "0")
+                    pipe.HSet(ctx, m.dirUsedSpaceKey(), field, "0")
+                }
+                pipe.IncrBy(ctx, m.usedSpaceKey(), align4K(0))
+                pipe.Incr(ctx, m.totalInodesKey())
+                return nil
+            })
+            return err
+        }, m.inodeKey(parent), m.entryKey(parent))) 
+         */
     }
 
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()> {
@@ -1002,12 +1316,4 @@ impl Engine for RedisEngine {
     async fn cache_acls(&self) -> Result<()> {
         unimplemented!()
     }
-}
-
-fn check_trait<M: Meta>(item: M) {
-    
-}
-
-fn a(comm: CommonMeta<RedisEngine>) {
-    check_trait(comm);
 }

@@ -2,29 +2,50 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use bitflags::bitflags;
 use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
 use crate::base::{
-    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
+    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, MetaState, TrashFileScan,
+    TrashSliceScan,
 };
 use crate::config::{Config, Format};
-use crate::error::Result;
+use crate::error::{DriverSnafu, Result};
 use crate::quota::Quota;
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
+pub const RESERVED_INODE: Ino = 0;
 pub const ROOT_INODE: Ino = 1;
 pub const TRASH_INODE: Ino = 0x7FFFFFFF10000000; // larger than vfs.minInternalNode
-                                                 // ChunkSize is size of a chunk
-pub const CHUNK_SIZE: u64 = 1 << 26; // 64M
+pub const TRASH_NAME: &str = ".Trash";
+// ChunkSize is size of a chunk
+pub const CHUNK_SIZE: u64 = 1 << 26; // ChunkSize is size of a chunk, default 64M
+pub const MAX_VERSION: i32 = 1; // MaxVersion is the max of supported versions.
 
 pub type Ino = u64;
 
-#[derive(Default, Serialize, Deserialize)]
+// TODO: encapsulated code into Ino struct
+pub fn is_trash(ino: Ino) -> bool {
+    ino >= TRASH_INODE
+}
+
+// TODO: encapsulated uid, gid
+pub fn uid() -> u32 {
+    0
+}
+
+pub fn gid() -> u32 {
+    0
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum INodeType {
     #[default]
     TypeFile = 1, // type for regular file
@@ -107,8 +128,16 @@ pub struct Session {
     pub plocks: Option<Vec<Plock>>,
 }
 
+bitflags! {
+    pub struct ModeMask: u8 {
+        const READ    = 0b100;
+        const WRITE   = 0b010;
+        const EXECUTE = 0b001;
+    }
+}
+
 // Attr represents attributes of a node.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Attr {
     pub flags: u8,        // flags
     pub typ: INodeType,   // type of a node
@@ -137,8 +166,28 @@ pub trait Meta: Send + Sync + 'static {
     // Name of database
     fn name(&self) -> String;
 
-    // Init is used to initialize a meta service.
-    async fn init(&self, format: &Format, force: bool) -> Result<()>;
+    // Get a copy of the current format
+    fn get_format(&self) -> Arc<Format>;
+
+    /// Init init a formatted volumn for meta service.
+    /// This is used for juice filesystem initialization and for a totally empty meta.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use juice_meta::api::Meta;
+    /// use juice_meta::api::new_client;
+    /// use juice_meta::config::Config;
+    ///
+    /// let meta = new_client("redis://localhost:6379".to_string(), Config::default()).unwrap();
+    /// let format = Format::default();
+    /// meta.init(format, false).await;
+    /// ```
+    async fn init(&self, format: Format, force: bool) -> Result<()>;
+
+    /// Load loads the existing setting of a formatted volume from meta service.
+    /// This must call after this meta is initialized.E.g `juicefs format`
+    async fn load(&self, check_version: bool) -> Result<Arc<Format>>;
 
     // Shutdown close current database connections.
     async fn shutdown(&self) -> Result<()>;
@@ -146,11 +195,8 @@ pub trait Meta: Send + Sync + 'static {
     // Reset cleans up all metadata, VERY DANGEROUS!
     async fn reset(&self) -> Result<()>;
 
-    // Load loads the existing setting of a formatted volume from meta service.
-    async fn load(&self, check_version: bool) -> Result<Format>;
-
     // NewSession creates or update client session.
-    async fn new_session(&self, record: bool) -> Result<()>;
+    async fn new_session(&self, persist: bool) -> Result<()>;
 
     // CloseSession does cleanup and close the session.
     async fn close_session(&self) -> Result<()>;
@@ -199,9 +245,6 @@ pub trait Meta: Send + Sync + 'static {
         stat_all: bool,
     ) -> Result<()>;
 
-    // Get a copy of the current format
-    async fn get_format(&self) -> Format;
-
     // OnMsg add a callback for the given message type.
     /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
 
@@ -240,7 +283,7 @@ pub trait Meta: Send + Sync + 'static {
     ) -> Result<()>;
 
     // Access checks the access permission on given inode.
-    async fn access(&self, inode: Ino, mode_mask: u8, attr: &Attr) -> Result<()>;
+    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;
 
     // Lookup returns the inode and attributes for the given entry in a directory.
     async fn lookup(
@@ -257,7 +300,7 @@ pub trait Meta: Send + Sync + 'static {
     async fn resolve(&self, parent: Ino, path: String, inode: &Ino, attr: &Attr) -> Result<()>;
 
     // GetAttr returns the attributes for given node.
-    async fn get_attr(&self, inode: Ino, attr: &Attr) -> Result<()>;
+    async fn get_attr(&self, inode: Ino) -> Result<Attr>;
 
     // SetAttr updates the attributes for given node.
     async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
@@ -304,14 +347,12 @@ pub trait Meta: Send + Sync + 'static {
         &self,
         parent: Ino,
         name: String,
-        r#type: u8,
+        r#type: INodeType,
         mode: u16,
         cumask: u16,
         rdev: u32,
         path: String,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()>;
+    ) -> Result<(Ino, Attr)>;
 
     // Mkdir creates a sub-directory with given name and mode.
     async fn mkdir(
@@ -321,9 +362,7 @@ pub trait Meta: Send + Sync + 'static {
         mode: u16,
         cumask: u16,
         copysgid: u8,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()>;
+    ) -> Result<(Ino, Attr)>;
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
@@ -350,7 +389,7 @@ pub trait Meta: Send + Sync + 'static {
     async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()>;
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &Vec<Entry>) -> Result<()>;
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> Result<()>;
 
     // Create creates a file in a directory with given name.
     async fn create(
@@ -359,13 +398,11 @@ pub trait Meta: Send + Sync + 'static {
         name: String,
         mode: u16,
         cumask: u16,
-        flags: u32,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()>;
+        flags: i32,
+    ) -> Result<(Ino, Attr)>;
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: u32, attr: &Attr) -> Result<()>;
+    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> Result<()>;
 
     // Close a file.
     async fn close(&self, inode: Ino) -> Result<()>;
@@ -462,7 +499,7 @@ pub trait Meta: Send + Sync + 'static {
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: String, count: &u64) -> Result<()>;
+    async fn remove(&self, parent: Ino, name: String, count: &mut u64) -> Result<()>;
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(
@@ -500,18 +537,24 @@ pub trait Meta: Send + Sync + 'static {
 }
 
 // NewClient creates a Meta client for given uri.
-pub fn new_client(uri: String, conf: Config) -> Option<Box<dyn Meta>> {
+pub fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
         uri
     };
-    let driver = match uri.find("://") {
-        Some(p) => &uri[..p],
-        None => return None,
+    let (driver, addr) = match uri.find("://") {
+        Some(p) => (&uri[..p], &uri[p + 3..]),
+        None => panic!("invalid uri {}", uri),
     };
-    match driver {
-        "redis" => Some(Box::new(CommonMeta::new(RedisEngine::new()))),
-        _ => None,
-    }
+    let res: Result<Box<dyn Meta>> = match driver {
+        "redis" => {
+            RedisEngine::new(driver, addr, conf)
+        }
+        _ => DriverSnafu {
+            driver: driver.to_string(),
+        }
+        .fail(),
+    };
+    res.expect(&format!("Meta {uri} is not available."))
 }

@@ -3,25 +3,30 @@ use bytes::Bytes;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::io::{Write, Read};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::time::SystemTime;
 use sysinfo::{get_current_pid, PidExt};
-use tracing::warn;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
 
 use crate::acl::Rule;
-use crate::api::{Attr, Entry, Ino, Meta, Session, SessionInfo, Slice, Summary, TreeSummary};
+use crate::api::{
+    gid, is_trash, uid, Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, SessionInfo, Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_NAME
+};
 use crate::config::{Config, Format};
-use crate::error::Result;
-use crate::openfile::OpenFile;
+use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
+use crate::openfile::{OpenFile, OpenFiles};
 use crate::quota::Quota;
-use crate::utils::{FLockItem, FreeID, PLockItem};
+use crate::utils::{align_4k, FLockItem, FreeID, PLockItem};
 
-pub const INODE_BATCH: isize = 1 << 10;
-pub const SLICE_ID_BATCH: isize = 1 << 10;
+pub const INODE_BATCH: i64 = 1 << 10;
+pub const SLICE_ID_BATCH: i64 = 1 << 10;
 pub const N_LOCK: usize = 1 << 10;
+pub const CHANNEL_BUFFER: usize = 1024;
+const SEGMENT_LOCK: Mutex<()> = Mutex::new(());
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
 // (id, size) -> clean
@@ -47,8 +52,12 @@ impl Cchunk {
     }
 }
 
-// fsStat aligned for atomic operations
-// nolint:structcheck
+/// fsStat aligned for atomic operations
+/// nolint:structcheck
+///
+/// new: ?? useless for redis
+/// used: used resource
+#[derive(Default)]
 pub struct FsStat {
     new_space: AtomicI64,
     new_inodes: AtomicI64,
@@ -69,6 +78,11 @@ pub struct DirStat {
     inodes: i64,
 }
 
+pub struct InternalNode {
+    inode: Ino,
+    name: String,
+}
+
 #[async_trait]
 pub trait Engine {
     // Get the value of counter name.
@@ -79,7 +93,7 @@ pub trait Engine {
     async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool>;
     async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
-    async fn do_load(&self) -> Result<Option<Vec<u8>>>;
+    async fn do_load(&self) -> Result<Option<Format>>;
     async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()>;
     async fn do_refresh_session(&self) -> Result<()>;
 
@@ -129,8 +143,6 @@ pub trait Engine {
         mode: u16,
         cumask: u16,
         path: &str,
-        inode: &Ino,
-        attr: &Attr,
     ) -> Result<()>;
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
     async fn do_unlink(
@@ -234,16 +246,22 @@ pub trait Engine {
     async fn cache_acls(&self) -> Result<()>;
 }
 
-pub struct InternalNode {
-    inode: Ino,
-    name: String,
+
+#[async_trait]
+pub trait MetaOtherFunction {
+    async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
+    async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool;
+    async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
+    fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
+    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64) -> Result<()>;
+    async fn next_inode(&self) -> Result<Ino>;
 }
 
-pub struct SessionState {
+pub struct MetaState {
     pub conf: Config,
-    pub fmt: RwLock<Format>,
-    pub sid: AtomicU64,
-    pub open_file: OpenFile,
+    pub fmt: RwLock<Arc<Format>>,
+    pub current_sid: AtomicU64,
+    pub open_files: Arc<OpenFiles>,
     pub fs_stat: FsStat,
     // TODO: encapsulation it into Segmented Lock
     // Pessimistic locks to reduce conflicts
@@ -251,7 +269,102 @@ pub struct SessionState {
     pub canceled: AtomicBool,
 }
 
-impl SessionState {
+impl MetaState {
+    pub fn new(conf: Config) -> Self {
+        let current_sid = AtomicU64::new(conf.sid);
+        let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
+        Self {
+            conf,
+            fmt: RwLock::new(Arc::new(Format::default())),
+            current_sid,
+            open_files,
+            fs_stat: FsStat {
+                new_space: AtomicI64::new(0),
+                new_inodes: AtomicI64::new(0),
+                used_space: AtomicI64::new(0),
+                used_inodes: AtomicI64::new(0),
+            },
+            txn_locks: [SEGMENT_LOCK; N_LOCK],
+            canceled: AtomicBool::new(false),
+        }
+    }
+
+
+}
+
+pub struct CommonMeta {
+    pub addr: String,
+    pub root: Ino,
+    pub sub_trash: Option<InternalNode>,
+    pub removed_files: HashMap<Ino, bool>,
+    pub compacting: HashMap<u64, bool>,
+    pub max_deleting: Sender<()>,
+    pub dslices: Sender<Slice>, // slices to delete
+    pub symlinks: HashMap<Ino, String>,
+    pub umounting: bool,
+    pub ses_mu: Mutex<()>,
+    pub dir_stats_lock: Mutex<()>,
+    pub dir_stats: HashMap<Ino, DirStat>,
+    pub fs_stat: FsStat,
+    pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
+    pub dir_quotas: RwLock<HashMap<Ino, Arc<Quota>>>, // directory inode -> quota
+    pub free_inodes: AsyncMutex<FreeID>,
+    pub free_slices: AsyncMutex<FreeID>,
+    pub conf: Config,
+    pub fmt: RwLock<Arc<Format>>,
+    pub current_sid: AtomicU64,
+    pub open_files: Arc<OpenFiles>,
+    // TODO: encapsulation it into Segmented Lock
+    // Pessimistic locks to reduce conflicts
+    pub txn_locks: [Mutex<()>; N_LOCK],
+    pub canceled: AtomicBool,
+}
+
+impl CommonMeta {
+    pub fn new(addr: &str, conf: Config) -> Self {
+        let (max_deleting, receiver) = channel();
+        let (dslices, receiver) = channel::<Slice>();
+        let current_sid = AtomicU64::new(conf.sid);
+        let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
+        CommonMeta {
+            addr: addr.to_string(),
+            root: ROOT_INODE,
+            sub_trash: None,
+            removed_files: HashMap::new(),
+            compacting: HashMap::new(),
+            max_deleting,
+            dslices,
+            symlinks: HashMap::new(),
+            umounting: false,
+            ses_mu: Mutex::new(()),
+            dir_stats_lock: Mutex::new(()),
+            dir_stats: HashMap::new(),
+            fs_stat: FsStat::default(),
+            dir_parents: Mutex::new(HashMap::new()),
+            dir_quotas: RwLock::new(HashMap::new()),
+            free_inodes: AsyncMutex::new(FreeID::default()),
+            free_slices: AsyncMutex::new(FreeID::default()),
+            conf,
+            fmt: RwLock::new(Arc::new(Format::default())),
+            current_sid,
+            open_files,
+            txn_locks: [SEGMENT_LOCK; N_LOCK],
+            canceled: AtomicBool::new(false),
+        }
+    }
+
+    fn check_root(&self, ino: Ino) -> Ino {
+        match ino {
+            RESERVED_INODE => ROOT_INODE,
+            ROOT_INODE => self.root,
+            _ => ino,
+        }
+    }
+
+    fn get_format(&self) -> Arc<Format>{
+        self.fmt.read().clone()
+    }
+
     pub fn new_session_info(&self) -> String {
         let host = match hostname::get() {
             Ok(host) => host.to_string_lossy().to_string(),
@@ -280,49 +393,135 @@ impl SessionState {
     }
 }
 
-pub struct CommonMeta<E> {
-    engine: E,
-    session_state: Arc<SessionState>,
-    addr: String,
-    root: Ino,
-    sub_trash: InternalNode,
-    removed_files: HashMap<Ino, bool>,
-    compacting: HashMap<u64, bool>,
-    max_deleting: Sender<()>,
-    dslices: Sender<Slice>, // slices to delete
-    symlinks: HashMap<Ino, String>,
-    umounting: bool,
-    ses_mu: Mutex<()>,
-    dir_stats_lock: Mutex<()>,
-    dir_stats: HashMap<Ino, DirStat>,
-    fs_stat: FsStat,
-    parent_mu: Mutex<()>,
-    quota_mu: RwLock<()>,            // protect dirParents
-    dir_parents: HashMap<Ino, Ino>,  // protect dirQuotas
-    dir_quotas: HashMap<Ino, Quota>, // directory inode -> parent inode
-    free_mu: Mutex<()>,              // directory inode -> quota
-    free_inodes: FreeID,
-    free_slices: FreeID,
-}
+#[async_trait]
+impl<E> MetaOtherFunction for E
+where
+    E: Send + Sync + 'static + Engine + AsRef<CommonMeta> 
+{
+    async fn check_quota(&self,space:i64,inodes:i64,parents:Vec<Ino>) -> Result<()>  {
+        if space <= 0 && inodes <= 0 {
+            return Ok(());
+        }
+        let format = self.get_format();
+        let meta = self.as_ref();
+        if space > 0
+            && format.capacity > 0
+            && meta.fs_stat.used_space.load(Ordering::SeqCst)
+                + meta.fs_stat.new_space.load(Ordering::SeqCst)
+                + space
+                > (format.capacity as i64)
+        {
+            return SysSnafu { code: libc::ENOSPC }.fail();
+        }
+        if inodes > 0
+            && format.inodes > 0
+            && meta.fs_stat.used_inodes.load(Ordering::SeqCst)
+                + meta.fs_stat.new_inodes.load(Ordering::SeqCst)
+                + inodes
+                > (format.capacity as i64)
+        {
+            return SysSnafu { code: libc::ENOSPC }.fail();
+        }
+        if !format.dir_stats {
+            return Ok(());
+        }
+        for ino in parents {
+            if self.check_dir_quota(ino, space, inodes).await {
+                return SysSnafu { code: libc::EDQUOT }.fail();
+            }
+        }
+        Ok(())
+    }
 
-impl<E: Send + Sync + 'static + Engine> CommonMeta<E> {
-    pub fn new(e: E) -> Self {
+    async fn check_dir_quota(&self,ino:Ino,space:i64,inodes:i64) -> bool {
+        if !self.get_format().dir_stats {
+            return false;
+        }
+
+        let mut inode = ino;
+        loop {
+            let quota = {
+                let guard = self.as_ref().dir_quotas.read();
+                guard.get(&inode).map(|q| q.clone())
+            };
+            if let Some(quota) = quota
+                && quota.check(space, inodes)
+            {
+                return true;
+            }
+            if inode <= ROOT_INODE {
+                break;
+            }
+            let last_ino = inode;
+            match self.get_dir_parent(inode).await {
+                Ok(i) => inode = i,
+                Err(e) => {
+                    warn!("Get directory parent of inode {}: {}", last_ino, e);
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    async fn get_dir_parent(&self, inode:Ino) -> Result<Ino>  {
+        let parent = {
+            let guard = self.as_ref().dir_parents.lock();
+            guard.get(&inode).map(|p| *p)
+        };
+
+        if let Some(parent) = parent {
+            return Ok(parent);
+        }
+        debug!("Get directory parent of inode {}: cache miss", inode);
+        let st = self.get_attr(inode).await?;
+        Ok(st.parent)
+    }
+
+    fn update_dir_stats(&self,inode:Ino,length:i64,space:i64,inodes:i64) {
         todo!()
+    }
+
+    async fn update_dir_quota(&self,inode:Ino,space:i64,inodes:i64) -> Result<()>  {
+        todo!()
+    }
+
+    async fn next_inode(&self) -> Result<Ino>  {
+        let mut guard = self.as_ref().free_inodes.lock().await;
+        if guard.next >= guard.maxid {
+            let v = self.incr_counter("nextInode", INODE_BATCH).await?;
+            guard.next = (v - INODE_BATCH) as u64;
+            guard.maxid = v as u64;
+        }
+        let mut n = guard.next;
+        guard.next += 1;
+        // make sure inode >= 1
+        while n <= 1 {
+            n = guard.next;
+            guard.next += 1;
+        }
+        Ok(n)
     }
 }
 
 #[async_trait]
-impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
-
+impl<E> Meta for E
+where
+    E: Send + Sync + 'static + Engine + AsRef<CommonMeta>,
 {
     // Name of database
     fn name(&self) -> String {
         todo!()
     }
 
+    // Get a copy of the current format
+    fn get_format(&self) -> Arc<Format> {
+        self.as_ref().fmt.read().clone()
+    }
+
     // Init is used to initialize a meta service.
-    async fn init(&self, format: &Format, force: bool) -> Result<()> {
-        todo!()
+    async fn init(&self, format: Format, force: bool) -> Result<()> {
+        self.do_init(format, force).await
     }
 
     // Shutdown close current database connections.
@@ -336,12 +535,25 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // Load loads the existing setting of a formatted volume from meta service.
-    async fn load(&self, check_version: bool) -> Result<Format> {
-        todo!()
+    async fn load(&self, check_version: bool) -> Result<Arc<Format>> {
+        info!("Load format from meta service");
+        let fmt = match self.do_load().await {
+            Ok(None) => return NotInitializedSnafu.fail(),
+            Ok(Some(body)) => body,
+            Err(e) => return Err(e),
+        };
+
+        if check_version {
+            fmt.check_version()?;
+        }
+
+        let mut guard = self.as_ref().fmt.write();
+        *guard = Arc::new(fmt);
+        Ok(guard.clone())
     }
 
     // NewSession creates or update client session.
-    async fn new_session(&self, record: bool) -> Result<()> {
+    async fn new_session(&self, persist: bool) -> Result<()> {
         todo!()
     }
 
@@ -377,12 +589,20 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // CleanStaleSessions cleans up sessions not active for more than 5 minutes
-    async fn clean_stale_sessions(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>) {
+    async fn clean_stale_sessions(
+        &self,
+        edge: SystemTime,
+        incre_process: Box<dyn Fn(isize) + Send>,
+    ) {
         todo!()
     }
 
     // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
-    async fn cleanup_detached_nodes_before(&self, edge: SystemTime, incre_process: Box<dyn Fn(isize) + Send>) {
+    async fn cleanup_detached_nodes_before(
+        &self,
+        edge: SystemTime,
+        incre_process: Box<dyn Fn(isize) + Send>,
+    ) {
         todo!()
     }
 
@@ -392,25 +612,26 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // Check integrity of an absolute path and repair it if asked
-    async fn check(&self, fpath: String, repair: bool, recursive: bool, stat_all: bool) -> Result<()> {
-        todo!()
-    }
-
-    // Get a copy of the current format
-    async fn get_format(&self) -> Format {
+    async fn check(
+        &self,
+        fpath: String,
+        repair: bool,
+        recursive: bool,
+        stat_all: bool,
+    ) -> Result<()> {
         todo!()
     }
 
     // OnMsg add a callback for the given message type.
     /*async fn on_msg(mtype: u32, cb: MsgCallback);*/
-    
+
     // OnReload register a callback for any change founded after reloaded.
     async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>) {
         todo!()
     }
 
     async fn handle_quota(
-        &self, 
+        &self,
         cmd: u8,
         dpath: String,
         quotas: HashMap<String, Quota>,
@@ -422,7 +643,7 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
 
     // Dump the tree under root, which may be modified by checkRoot
     async fn dump_meta(
-        &self, 
+        &self,
         w: Box<dyn Write + Send>,
         root: Ino,
         threads: isize,
@@ -451,7 +672,7 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // Access checks the access permission on given inode.
-    async fn access(&self, inode: Ino, mode_mask: u8, attr: &Attr) -> Result<()> {
+    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()> {
         todo!()
     }
 
@@ -474,13 +695,18 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // GetAttr returns the attributes for given node.
-    async fn get_attr(&self, inode: Ino, attr: &Attr) -> Result<()> {
+    async fn get_attr(&self, inode: Ino) -> Result<Attr> {
         todo!()
     }
 
     // SetAttr updates the attributes for given node.
-    async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
-        -> Result<()> {
+    async fn set_attr(
+        &self,
+        inode: Ino,
+        set: u16,
+        sggid_clear_mode: u8,
+        attr: &Attr,
+    ) -> Result<()> {
         todo!()
     }
 
@@ -535,15 +761,63 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
         &self,
         parent: Ino,
         name: String,
-        r#type: u8,
+        r#type: INodeType,
         mode: u16,
         cumask: u16,
         rdev: u32,
         path: String,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()> {
-        todo!()
+    ) -> Result<(Ino, Attr)> {
+        if is_trash(parent) {
+            return SysSnafu { code: libc::EPERM }.fail();
+        }
+        if parent == ROOT_INODE && name == TRASH_NAME {
+            return SysSnafu { code: libc::EPERM }.fail();
+        }
+        if self.as_ref().conf.read_only {
+            return SysSnafu { code: libc::EROFS }.fail();
+        }
+        if name.is_empty() {
+            return SysSnafu { code: libc::ENOENT }.fail();
+        }
+
+        let parent = self.as_ref().check_root(parent);
+        let (space, inodes) = (align_4k(0), 1);
+        self.check_quota(space, inodes, [parent].into()).await?;
+
+        let ino = self.next_inode().await?;
+        let mut attr = Attr::default();
+        match r#type {
+            INodeType::TypeDirectory => {
+                attr.nlink = 2;
+                attr.length = 4 << 10;
+            }
+            INodeType::TypeSymlink => {
+                attr.nlink = 1;
+                attr.length = path.len() as u64;
+            }
+            _ => {
+                attr.nlink = 1;
+                attr.length = 0;
+                attr.rdev = rdev;
+            }
+        }
+        attr.typ = r#type.clone();
+        attr.uid = uid();
+        attr.gid = gid();
+        attr.parent = parent;
+        attr.full = true;
+        match self
+            .do_mknod(parent, &name, r#type as u8, mode, cumask, &path)
+            .await
+        {
+            Ok(()) => {
+                self.update_stats(space, inodes).await;
+                self.update_dir_stats(parent, 0, space, inodes);
+                self.update_dir_quota(parent, space, inodes).await;
+                Ok((ino, attr))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // Mkdir creates a sub-directory with given name and mode.
@@ -554,9 +828,7 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
         mode: u16,
         cumask: u16,
         copysgid: u8,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()> {
+    ) -> Result<(Ino, Attr)> {
         todo!()
     }
 
@@ -593,7 +865,7 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &Vec<Entry>) -> Result<()> {
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> Result<()> {
         todo!()
     }
 
@@ -604,15 +876,36 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
         name: String,
         mode: u16,
         cumask: u16,
-        flags: u32,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> Result<()> {
-        todo!()
+        flags: i32,
+    ) -> Result<(Ino, Attr)> {
+        match self
+            .mknod(
+                parent,
+                name,
+                INodeType::TypeFile,
+                mode,
+                cumask,
+                0,
+                "".to_string(),
+            )
+            .await
+        {
+            Ok((ino, mut attr)) => {
+                self.as_ref().open_files.open(ino, &mut attr);
+                Ok((ino, attr))
+            }
+            Err(MyError::FileExistError { ino, mut attr })
+                if (flags & libc::O_EXCL == 0 && attr.typ == INodeType::TypeFile) =>
+            {
+                self.as_ref().open_files.open(ino, &mut attr);
+                Ok((ino, attr))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: u32, attr: &Attr) -> Result<()> {
+    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> Result<()> {
         todo!()
     }
 
@@ -632,8 +925,14 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
     }
 
     // Write put a slice of data on top of the given chunk.
-    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: &Slice, mtime: u64)
-        -> Result<()> {
+    async fn write(
+        &self,
+        inode: Ino,
+        indx: u32,
+        off: u32,
+        slice: &Slice,
+        mtime: u64,
+    ) -> Result<()> {
         todo!()
     }
 
@@ -747,7 +1046,7 @@ impl<E: Send + Sync + 'static + Engine> Meta for CommonMeta<E>
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: String, count: &u64) -> Result<()> {
+    async fn remove(&self, parent: Ino, name: String, count: &mut u64) -> Result<()> {
         todo!()
     }
 

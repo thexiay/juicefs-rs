@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Mutex};
 
+#[derive(Default)]
 pub struct FreeID {
-	next: u64,
-	maxid: u64,
+	pub next: u64,
+	pub maxid: u64,
 }
 
 pub struct PlockRecord {
@@ -27,9 +28,9 @@ pub struct FLockItem {
 	pub r#type: String,
 }
 
-pub fn align_4k(length: u64) -> u64 {
+pub fn align_4k(length: u64) -> i64 {
 	if length == 0 {
 		return 1 << 12;
 	}
-	((length - 1) >> 12 + 1) << 12
+	(((length - 1) >> 12 + 1) << 12) as i64
 }

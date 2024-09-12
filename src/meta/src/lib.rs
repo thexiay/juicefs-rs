@@ -2,6 +2,7 @@
 #![feature(let_chains)]
 #![feature(associated_type_defaults)]
 #![feature(duration_constructors)]
+#![feature(async_fn_traits)]
 
 pub mod config;
 pub mod error;
