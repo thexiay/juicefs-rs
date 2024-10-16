@@ -27,6 +27,7 @@ sysinfo = { workspace = true }
 bincode = { workspace = true }
 regex = { workspace = true }
 bitflags = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

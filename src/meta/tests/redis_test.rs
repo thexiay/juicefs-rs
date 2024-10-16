@@ -62,7 +62,7 @@ impl RedisDbOffer {
         loop {
             for i in 0..self.db_nums {
                 let redis_url = format!("{}/{}", self.redis_url, i);
-                let client = new_client(redis_url.clone(), config.clone());
+                let client = new_client(redis_url.clone(), config.clone()).await;
                 let (refs, inited) = &self.db_used[&i];
                 if inited
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)

@@ -537,7 +537,7 @@ pub trait Meta: Send + Sync + 'static {
 }
 
 // NewClient creates a Meta client for given uri.
-pub fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
+pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
@@ -549,7 +549,7 @@ pub fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
     };
     let res: Result<Box<dyn Meta>> = match driver {
         "redis" => {
-            RedisEngine::new(driver, addr, conf)
+            RedisEngine::new(driver, addr, conf).await
         }
         _ => DriverSnafu {
             driver: driver.to_string(),

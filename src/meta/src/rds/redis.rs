@@ -1,15 +1,17 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use juice_utils::process::Bar;
 use r2d2::{Pool, PooledConnection};
 use redis::aio::ConnectionManager;
 use redis::{
-    cmd, pipe, Commands, Connection, ConnectionLike, InfoDict,
-    IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
+    cmd, pipe, AsyncCommands, Commands, Connection, ConnectionLike, InfoDict, IntoConnectionInfo,
+    Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
 use std::hash::{DefaultHasher, Hasher};
+use std::ops::DerefMut;
 use std::result::Result as StdResult;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
@@ -34,7 +36,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use super::check::RedisInfo;
-use super::conn::RedisClient;
+use super::conn::{ExclusiveConnection, RedisClient};
 
 pub const TXN_RETRY_LIMIT: u32 = 50;
 pub const LOOKUP_SCRIPT_CODE: &str = r#"
@@ -122,14 +124,22 @@ end
 return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
 "#;
 
+/**
+ * conn: ConnectionLike
+ * key: 
+ * body: Fn() -> Option<T>
+ */
 macro_rules! async_transaction {
     ($conn:expr, $keys:expr, $body:expr) => {
         loop {
             cmd("WATCH").arg($keys).query_async($conn).await?;
-
-            if let Some(response) = $body {
-                cmd("UNWATCH").query_async($conn).await?;
-                break response;
+            match $body {
+                Ok(Some(response)) => {
+                    cmd("UNWATCH").query_async($conn).await?;
+                    break Ok(response);
+                },
+                Ok(None) => continue,
+                Err(e) => break Err(e),
             }
         }
     };
@@ -361,15 +371,16 @@ impl RedisEngine {
     async fn check_server_config(&self) -> Result<()> {
         let mut pool_conn = self.exclusive_conn()?;
         let conn = pool_conn.deref_mut();
-        let info: InfoDict = redis::cmd("INFO")
-            .query_async(conn)
-            .await
-            .context(RedisDetailSnafu {
-                detail: "prase redis info".to_string(),
-            })?;
+        let info: InfoDict =
+            redis::cmd("INFO")
+                .query_async(conn)
+                .await
+                .context(RedisDetailSnafu {
+                    detail: "prase redis info".to_string(),
+                })?;
         let redis_info = RedisInfo::new(info);
 
-        // TODO: check    
+        // TODO: check
         Ok(())
         /*
                 rawInfo, err := m.rdb.Info(Background).Result()
@@ -467,30 +478,31 @@ impl RedisEngine {
         Err(last_err.unwrap().into())
     }
 
-    fn scan_batch<F: FnMut(redis::Iter<'_, String>) -> Result<()>>(
+    async fn scan_iter<'a>(
         &self,
+        conn: &'a mut ExclusiveConnection,
         pattern: String,
-        f: &mut F,
-    ) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+    ) -> Result<redis::AsyncIter<'a, String>> {
         // redis-rs will auto fetch all data batch
         let scan_options = ScanOptions::default()
             .with_pattern(&pattern)
             .with_count(10000);
-        let iter = conn.scan_options(scan_options).context(RedisDetailSnafu {
-            detail: format!("scan {}", &pattern),
-        })?;
-        f(iter)
+        conn.scan_options(scan_options)
+            .await
+            .context(RedisDetailSnafu {
+                detail: format!("scan {}", &pattern),
+            })
     }
 
     async fn do_delete_file_data_inner(&self, inode: Ino, length: u64, tracking: &str) {
-        let mut conn = match self.pool_conn() {
+        let mut pool_conn = match self.exclusive_conn() {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to get connection: {}", e);
                 return;
             }
         };
+        let conn = pool_conn.deref_mut();
 
         let mut indx = 0;
         let mut p = redis::pipe();
@@ -505,7 +517,7 @@ impl RedisEngine {
                 p.llen(key);
                 indx += 1;
             }
-            let cmds: Vec<Option<i64>> = match p.query(&mut conn) {
+            let cmds: Vec<Option<i64>> = match p.query_async(conn).await {
                 Ok(cmds) => cmds,
                 Err(e) => {
                     error!("Failed to query: {}", e);
@@ -532,17 +544,19 @@ impl RedisEngine {
             let tracking = format!("{}:{}", inode, length);
             let () = conn
                 .zrem(self.del_files(), tracking)
+                .await
                 .unwrap_or_else(|err| error!("Failed to remove tracking: {}", err));
         }
     }
 
     async fn delete_chunk(&self, inode: Ino, indx: u64) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let key = self.chunk_key(inode, indx);
-        match redis::transaction(&mut conn, &[&key], |c, pipe| {
+        match async_transaction!(conn, &[&key], {
             let mut todel: Vec<Slice> = Vec::new();
             // if not exists, ignore it
-            let vals: Vec<String> = c.lrange(&key, 0, -1)?;
+            let vals: Vec<String> = conn.lrange(&key, 0, -1).await?;
 
             let slices = match TryInto::<Slices>::try_into(vals) {
                 Ok(Slices(slices)) => slices,
@@ -551,12 +565,13 @@ impl RedisEngine {
                     Vec::new()
                 }
             };
-            pipe.del(&key).ignore();
+            let mut pipe = pipe();
+            pipe.atomic().del(&key).ignore();
             slices.into_iter().filter(|s| s.id > 0).for_each(|slice| {
                 pipe.hincr(self.slice_refs(), Self::slice_key(slice.id, slice.size), -1);
                 todel.push(slice);
             });
-            let rs: Vec<i64> = pipe.query(c)?;
+            let rs: Vec<i64> = pipe.query_async(conn).await?;
             Ok(Some((todel, rs)))
         }) {
             Ok((todel, rs)) => {
@@ -572,7 +587,7 @@ impl RedisEngine {
             }
             Err(e) => {
                 error!("Delete slice from chunk {} fail: {}, retry later", key, e);
-                Err(e.into())
+                Err(e)
             }
         }
     }
@@ -589,36 +604,39 @@ impl AsRef<CommonMeta> for RedisEngine {
 #[async_trait]
 impl Engine for RedisEngine {
     async fn get_counter(&self, name: &str) -> Result<i64> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let key = format!("{}{}", self.prefix, name);
-        let v = conn.get(key)?;
+        let v = conn.get(key).await?;
         Ok(v)
     }
 
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64> {
         ensure!(!self.meta.conf.read_only, SysSnafu { code: libc::EROFS });
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let name_lower = name.to_lowercase();
         if name_lower.eq("nextinode") || name.eq("nextchunk") {
             let key = format!("{}{}", self.prefix, name.to_lowercase());
-            let v: i64 = conn.incr(key, value)?;
+            let v: i64 = conn.incr(key, value).await?;
             Ok(v + 1)
         } else {
             let key = format!("{}{}", self.prefix, name.to_lowercase());
-            Ok(conn.incr(key, value)?)
+            Ok(conn.incr(key, value).await?)
         }
     }
 
     async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool> {
         let name = format!("{}{}", self.prefix, name);
-        let mut conn = self.pool_conn()?;
-        async_transaction!(&mut conn, &[&name], {
-            let old: Option<i64> = conn.get(&name)?;
-            let pipe = pipe().atomic();
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &[&name], {
+            let old: Option<i64> = conn.get(&name).await?;
+            let mut pipe = pipe();
             match old {
                 Some(old) if old > value - diff => Ok(Some(false)),
                 _ => {
-                    pipe.set(&name, value).query(&mut conn)?;
+                    pipe.atomic().set(&name, value).query_async(conn).await?;
                     Ok(Some(true))
                 }
             }
@@ -632,8 +650,9 @@ impl Engine for RedisEngine {
     async fn flush_stats(&self) {}
 
     async fn do_load(&self) -> Result<Option<Format>> {
-        let mut conn = self.pool_conn()?;
-        let format_body: Option<Vec<u8>> = conn.get(self.settings())?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        let format_body: Option<Vec<u8>> = conn.get(self.settings()).await?;
         match format_body {
             Some(body) => Ok(Some(serde_json::from_slice(&body)?)),
             None => Ok(None),
@@ -641,26 +660,31 @@ impl Engine for RedisEngine {
     }
 
     async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let sid = self.meta.current_sid.load(Ordering::SeqCst).to_string();
         conn.zadd(self.all_sessions(), &sid, self.expire_time())
+            .await
             .context(RedisDetailSnafu {
                 detail: format!("set session id {sid}"),
             })?;
         conn.hset(self.session_infos(), &sid, sinfo)
+            .await
             .context(RedisDetailSnafu {
                 detail: "set session info err",
             })?;
 
         self.lookup_script
             .prepare_invoke()
-            .load(&mut conn)
+            .load_async(conn)
+            .await
             .context(RedisDetailSnafu {
                 detail: "load scriptLookup",
             })?;
         self.resolve_script
             .prepare_invoke()
-            .load(&mut conn)
+            .load_async(conn)
+            .await
             .context(RedisDetailSnafu {
                 detail: "load scriptResolve",
             })?;
@@ -674,23 +698,25 @@ impl Engine for RedisEngine {
     }
 
     async fn do_refresh_session(&self) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let ssid = self.meta.current_sid.load(Ordering::SeqCst);
         // we have to check sessionInfo here because the operations are not within a transaction
-        match conn.hexists(self.session_infos(), &ssid) {
+        match conn.hexists(self.session_infos(), &ssid).await {
             Ok(false) => {
                 warn!("Session 0x{ssid:16x} was stale and cleaned up, but now it comes back again");
-                conn.hset(self.session_infos(), &ssid, self.meta.new_session_info())?;
+                conn.hset(self.session_infos(), &ssid, self.meta.new_session_info()).await?;
             }
             Err(e) => return Err(e.into()),
             _ => (),
         }
 
-        Ok(conn.zadd(self.all_sessions(), ssid, self.expire_time())?)
+        Ok(conn.zadd(self.all_sessions(), ssid, self.expire_time()).await?)
     }
 
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let range = (
             "-inf",
             SystemTime::now()
@@ -698,7 +724,7 @@ impl Engine for RedisEngine {
                 .expect("Time went backwards")
                 .as_secs(),
         );
-        Ok(conn.zrangebyscore_limit(self.all_sessions(), range.0, range.1, 0, limit)?)
+        Ok(conn.zrangebyscore_limit(self.all_sessions(), range.0, range.1, 0, limit).await?)
         // ignore go version before 1.0-beta3 as well, this version range is different
     }
 
@@ -775,14 +801,16 @@ impl Engine for RedisEngine {
     }
 
     async fn do_init(&self, format: Format, force: bool) -> Result<()> {
-        let mut conn = self.pool_conn()?;
-        let body: Option<Vec<u8>> = conn.get(self.settings())?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        let body: Option<Vec<u8>> = conn.get(self.settings()).await?;
         if let Some(ref body) = body {
             // if old exist, check if it can be update
             let old: Format = serde_json::from_slice(body)?;
             if !old.dir_stats && format.dir_stats {
                 // remove dir stats as they are outdated
                 conn.del(&[self.dir_used_inodes_key(), self.dir_used_space_key()])
+                    .await
                     .context(RedisDetailSnafu {
                         detail: "remove dir stats",
                     })?;
@@ -806,95 +834,103 @@ impl Engine for RedisEngine {
         };
         if format.trash_days > 0 {
             attr.mode = 0555;
-            conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)?;
+            conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)
+                .await?;
         }
 
-        conn.set(self.settings(), serde_json::to_vec(&format)?)?;
-        let mut lock = self.meta.fmt.write();
-        *lock = Arc::new(format);
+        conn.set(self.settings(), serde_json::to_vec(&format)?)
+            .await?;
+        {
+            let mut lock = self.meta.fmt.write();
+            *lock = Arc::new(format);
+        }
         match body {
             Some(_) => Ok(()),
             None => {
                 // root inode
                 attr.mode = 0777;
-                Ok(conn.set(self.inode_key(1), bincode::serialize(&attr)?)?)
+                Ok(conn
+                    .set(self.inode_key(1), bincode::serialize(&attr)?)
+                    .await?)
             }
         }
     }
 
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let mut pipe = redis::pipe();
         let re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &self.prefix)).expect("error regex");
-        let mut f = move |iter: redis::Iter<'_, String>| -> Result<()> {
-            let keys: Vec<String> = iter.collect();
-            for key in keys.iter() {
-                pipe.llen(key);
-            }
-            let cnt_cmds: Vec<Option<i64>> = pipe.query(&mut conn).context(RedisDetailSnafu {
+        let iter = self
+            .scan_iter(conn, format!("{}{}", self.prefix, "c*_*"))
+            .await?;
+        let keys: Vec<String> = iter.collect().await;
+        for key in keys.iter() {
+            pipe.llen(key);
+        }
+        let cnt_cmds: Vec<Option<i64>> =
+            pipe.query_async(conn).await.context(RedisDetailSnafu {
                 detail: "scan all chunks",
             })?;
-            assert!(cnt_cmds.len() == keys.len());
+        assert!(cnt_cmds.len() == keys.len());
 
-            for (key, cnt) in keys.iter().zip(cnt_cmds.iter()) {
-                match *cnt {
-                    Some(cnt) if cnt > 1 && matches!(re.captures(key), Some(caps)) => {
-                        let caps = re.captures(key).expect("error regex");
-                        let inode = caps
-                            .get(1)
-                            .unwrap()
-                            .as_str()
-                            .parse::<u64>()
-                            .expect("error parse");
-                        let indx = caps
-                            .get(2)
-                            .unwrap()
-                            .as_str()
-                            .parse::<u32>()
-                            .expect("error parse");
-                        ch.send(Cchunk::new(inode, indx, cnt as isize))
-                            .map_err(|_| MyError::SendError)?;
-                    }
-                    _ => error!("No way to happen for chunk key: {}", key),
+        for (key, cnt) in keys.iter().zip(cnt_cmds.iter()) {
+            match *cnt {
+                Some(cnt) if cnt > 1 && matches!(re.captures(key), Some(caps)) => {
+                    let caps = re.captures(key).expect("error regex");
+                    let inode = caps
+                        .get(1)
+                        .unwrap()
+                        .as_str()
+                        .parse::<u64>()
+                        .expect("error parse");
+                    let indx = caps
+                        .get(2)
+                        .unwrap()
+                        .as_str()
+                        .parse::<u32>()
+                        .expect("error parse");
+                    ch.send(Cchunk::new(inode, indx, cnt as isize))
+                        .map_err(|_| MyError::SendError)?;
                 }
+                _ => error!("No way to happen for chunk key: {}", key),
             }
-            Ok(())
-        };
-        self.scan_batch(format!("{}{}", self.prefix, "c*_*"), &mut f)
+        }
+        Ok(())
     }
 
     async fn do_delete_sustained_inode(&self, sid: u64, inode: Ino) -> Result<()> {
-        let mut conn = self.pool_conn()?;
-        match self
-            .txn_with_retry(&mut conn, &[self.inode_key(inode)], &mut |c, pipe| {
-                let inode_v: Option<Vec<u8>> = c.get(self.inode_key(inode))?;
-                match inode_v {
-                    Some(inode_v) => {
-                        let attr: Attr = bincode::deserialize(&inode_v).map_err(|e| {
-                            RedisError::from((redis::ErrorKind::ExtensionError, "", e.to_string()))
-                        })?;
-                        let delete_space = i64::try_from(utils::align_4k(attr.length))
-                            .ok()
-                            .map(i64::checked_neg)
-                            .expect("error convert")
-                            .expect("error convert");
-                        let ts = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .expect("Time went backwards")
-                            .as_secs();
-                        pipe.zadd(self.del_files(), Self::to_delete(inode, attr.length), ts);
-                        pipe.del(self.inode_key(inode));
-                        pipe.decr(self.used_space_key(), delete_space);
-                        pipe.decr(self.total_inodes_key(), 1);
-                        pipe.srem(self.sustained(sid), inode.to_string());
-                        pipe.query(c)?;
-                        Ok(Some(delete_space))
-                    }
-                    None => Ok(None),
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        match async_transaction!(conn, &[self.inode_key(inode)], {
+            let inode_v: Option<Vec<u8>> = conn.get(self.inode_key(inode)).await?;
+            match inode_v {
+                Some(inode_v) => {
+                    let attr: Attr = bincode::deserialize(&inode_v).map_err(|e| {
+                        RedisError::from((redis::ErrorKind::ExtensionError, "", e.to_string()))
+                    })?;
+                    let delete_space = i64::try_from(utils::align_4k(attr.length))
+                        .ok()
+                        .map(i64::checked_neg)
+                        .expect("error convert")
+                        .expect("error convert");
+                    let ts = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs();
+                    let mut pipe = pipe();
+                    pipe.atomic()
+                        .zadd(self.del_files(), Self::to_delete(inode, attr.length), ts)
+                        .del(self.inode_key(inode))
+                        .decr(self.used_space_key(), delete_space)
+                        .decr(self.total_inodes_key(), 1)
+                        .srem(self.sustained(sid), inode.to_string())
+                        .query_async(conn).await?;
+                    Ok(Some(delete_space))
                 }
-            })
-            .await
-        {
+                None => Ok(None),
+            }
+        }) {
             Ok(delete_space) if delete_space < 0 => {
                 self.update_stats(delete_space, -1).await;
                 /*
@@ -909,8 +945,11 @@ impl Engine for RedisEngine {
     }
 
     async fn do_find_deleted_files(&self, ts: i64, limit: isize) -> Result<HashMap<Ino, u64>> {
-        let mut conn = self.pool_conn()?;
-        let vals: Vec<String> = conn.zrangebyscore_limit(self.del_files(), "-inf", ts, 0, limit)?;
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        let vals: Vec<String> = conn
+            .zrangebyscore_limit(self.del_files(), "-inf", ts, 0, limit)
+            .await?;
         let mut files = HashMap::new();
         for val in vals {
             let ps: Vec<_> = val.split(':').collect();
@@ -1009,38 +1048,33 @@ impl Engine for RedisEngine {
         cumask: u16,
         path: &str,
     ) -> Result<()> {
-        let mut conn = self.pool_conn()?;
-        async_transaction!(
-            &mut conn,
-            &[self.inode_key(parent), self.dir_key(parent)],
-            {
-                let attr_bytes: Vec<u8> = conn.get(self.inode_key(parent))?;
-                let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
-                    RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
-                })?;
-                if attr.typ != INodeType::TypeDirectory {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "type error",
-                        "not a directory".to_string(),
-                    ))
-                    .into());
-                }
-                if attr.parent > TRASH_INODE {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "type error",
-                        "not a directory".to_string(),
-                    ))
-                    .into());
-                }
-                self.access(parent, ModeMask::WRITE, &attr).await?;
-
-                Ok(Some(()))
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
+            let attr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
+            let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
+                RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
+            })?;
+            if attr.typ != INodeType::TypeDirectory {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "type error",
+                    "not a directory".to_string(),
+                ))
+                .into());
             }
-        )
-        .await?;
-        unimplemented!()
+            if attr.parent > TRASH_INODE {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "type error",
+                    "not a directory".to_string(),
+                ))
+                .into());
+            }
+            self.access(parent, ModeMask::WRITE, &attr).await?;
+
+            Ok(Some(()))
+        })
         /*
             return errno(m.txn(ctx, func(tx *redis.Tx) error {
             var pattr Attr
