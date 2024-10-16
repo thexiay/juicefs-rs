@@ -2,23 +2,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use juice_utils::process::Bar;
 use r2d2::{Pool, PooledConnection};
+use redis::aio::ConnectionManager;
 use redis::{
-    Client as RedisClient, Commands, Connection, ConnectionLike, InfoDict, IntoConnectionInfo,
-    Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
+    cmd, pipe, Commands, Connection, ConnectionLike, InfoDict,
+    IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
 use std::hash::{DefaultHasher, Hasher};
+use std::result::Result as StdResult;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::result::Result as StdResult;
 use tokio::time::{self, sleep, Instant};
 use tracing::{debug, error, warn};
 
 use crate::acl::Rule;
 use crate::api::{
-    Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE
+    Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaState, PendingFileScan, PendingSliceScan,
@@ -33,6 +34,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use super::check::RedisInfo;
+use super::conn::RedisClient;
 
 pub const TXN_RETRY_LIMIT: u32 = 50;
 pub const LOOKUP_SCRIPT_CODE: &str = r#"
@@ -120,6 +122,19 @@ end
 return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
 "#;
 
+macro_rules! async_transaction {
+    ($conn:expr, $keys:expr, $body:expr) => {
+        loop {
+            cmd("WATCH").arg($keys).query_async($conn).await?;
+
+            if let Some(response) = $body {
+                cmd("UNWATCH").query_async($conn).await?;
+                break response;
+            }
+        }
+    };
+}
+
 /*
     Key and Value map:
     Parent:     p$inode -> {parent -> count} // for hard links
@@ -159,7 +174,8 @@ pub struct RedisEngine {
     /// Redis Sentinel mode
     /// Redis Cluster mode
     /// Redis normal mode
-    rdb: Pool<RedisClient>,
+    pool: Pool<RedisClient>,
+    conn: ConnectionManager,
     prefix: String,
     lookup_script: Script,  // lookup lua script
     resolve_script: Script, // reslove lua script
@@ -171,8 +187,12 @@ impl RedisEngine {
         !err.is_unrecoverable_error()
     }
 
-    fn pool_conn(&self) -> Result<PooledConnection<RedisClient>> {
-        self.rdb.get().context(ConnectionSnafu)
+    fn exclusive_conn(&self) -> Result<PooledConnection<RedisClient>> {
+        self.pool.get().context(ConnectionSnafu)
+    }
+
+    fn share_conn(&self) -> &ConnectionManager {
+        &self.conn
     }
 
     /// settings -> Option<String>
@@ -315,34 +335,41 @@ impl RedisEngine {
 impl RedisEngine {
     /// redis URL:
     /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
-    pub fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
+    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
         // TODO: parse addr myself
         let url = format!("{}://{}", driver, addr);
-        let client = RedisClient::open(url)?;
+        let client = redis::Client::open(url)?;
         let prefix = client.get_connection_info().redis.db.to_string();
-        let rdb = r2d2::Pool::builder().max_size(15).build(client).unwrap();
+        let rdb = RedisClient::new(client);
+        let conn = rdb.get_connection().await?;
+        let pool: Pool<RedisClient> = r2d2::Pool::builder().max_size(15).build(rdb).unwrap();
+
         let meta = CommonMeta::new(addr, conf);
         let engine = RedisEngine {
-            rdb,
+            pool,
+            conn,
             prefix,
             lookup_script: Script::new(LOOKUP_SCRIPT_CODE),
             resolve_script: Script::new(RESOLVE_SCRIPT_CODE),
             meta,
         };
 
-        engine.check_server_config()?;
+        engine.check_server_config().await?;
         Ok(Box::new(engine))
     }
 
-    fn check_server_config(&self) -> Result<()> {
-        let mut conn = self.pool_conn()?;
+    async fn check_server_config(&self) -> Result<()> {
+        let mut pool_conn = self.exclusive_conn()?;
+        let conn = pool_conn.deref_mut();
         let info: InfoDict = redis::cmd("INFO")
-            .query(&mut conn)
+            .query_async(conn)
+            .await
             .context(RedisDetailSnafu {
                 detail: "prase redis info".to_string(),
             })?;
         let redis_info = RedisInfo::new(info);
-        
+
+        // TODO: check    
         Ok(())
         /*
                 rawInfo, err := m.rdb.Info(Background).Result()
@@ -585,17 +612,17 @@ impl Engine for RedisEngine {
     async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool> {
         let name = format!("{}{}", self.prefix, name);
         let mut conn = self.pool_conn()?;
-        self.txn_with_retry(&mut conn, &[&name], &mut |c, pipeline| {
-            let old: Option<i64> = c.get(&name)?;
+        async_transaction!(&mut conn, &[&name], {
+            let old: Option<i64> = conn.get(&name)?;
+            let pipe = pipe().atomic();
             match old {
                 Some(old) if old > value - diff => Ok(Some(false)),
                 _ => {
-                    pipeline.set(&name, value).query(c)?;
+                    pipe.set(&name, value).query(&mut conn)?;
                     Ok(Some(true))
                 }
             }
         })
-        .await
     }
 
     async fn update_stats(&self, space: i64, inodes: i64) {
@@ -983,29 +1010,39 @@ impl Engine for RedisEngine {
         path: &str,
     ) -> Result<()> {
         let mut conn = self.pool_conn()?;
-        self.txn_with_retry(&mut conn, &[self.inode_key(parent), self.dir_key(parent)], 
-        &mut |c, conn| {
-            let attr_bytes: Vec<u8> = c.get(self.inode_key(parent))?;
-            let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
-                RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
-            })?;
-            if attr.typ != INodeType::TypeDirectory {
-                return Err((
-                    redis::ErrorKind::TypeError,
-                    "type error",
-                    "not a directory".to_string(),
-                ).into());
+        async_transaction!(
+            &mut conn,
+            &[self.inode_key(parent), self.dir_key(parent)],
+            {
+                let attr_bytes: Vec<u8> = conn.get(self.inode_key(parent))?;
+                let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
+                    RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
+                })?;
+                if attr.typ != INodeType::TypeDirectory {
+                    return Err(RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "type error",
+                        "not a directory".to_string(),
+                    ))
+                    .into());
+                }
+                if attr.parent > TRASH_INODE {
+                    return Err(RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "type error",
+                        "not a directory".to_string(),
+                    ))
+                    .into());
+                }
+                self.access(parent, ModeMask::WRITE, &attr).await?;
+
+                Ok(Some(()))
             }
-            if attr.parent > TRASH_INODE {
-                return Err((redis::ErrorKind::TypeError, "type error", "not a directory".to_string()).into());
-            }
-            self.access(parent, ModeMask::WRITE, &attr).await?;
-            
-            Ok(Some(()))
-        }).await?;
+        )
+        .await?;
         unimplemented!()
         /*
-        	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+            return errno(m.txn(ctx, func(tx *redis.Tx) error {
             var pattr Attr
             a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
             if err != nil {
@@ -1143,7 +1180,7 @@ impl Engine for RedisEngine {
                 return nil
             })
             return err
-        }, m.inodeKey(parent), m.entryKey(parent))) 
+        }, m.inodeKey(parent), m.entryKey(parent)))
          */
     }
 
