@@ -14,7 +14,6 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 redis = { workspace = true }
-r2d2 = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
@@ -28,6 +27,8 @@ bincode = { workspace = true }
 regex = { workspace = true }
 bitflags = { workspace = true }
 futures = { workspace = true }
+deadpool = { workspace = true }
+deadpool-redis = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

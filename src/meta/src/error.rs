@@ -1,3 +1,5 @@
+use deadpool::managed::PoolError;
+use redis::RedisError;
 use snafu::Snafu;
 
 use crate::api::{Attr, Ino};
@@ -11,7 +13,7 @@ pub enum MyError {
     },
     #[snafu(display("An connection error occurred: {:?}", source))]
     ConnectionError {
-        source: r2d2::Error,
+        source: PoolError<RedisError>,
     },
     #[snafu(display("An redis error occurred: {:?}", source), context(false))]
     RedisError {

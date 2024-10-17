@@ -1,19 +1,20 @@
-use r2d2::ManageConnection;
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+
+use deadpool::managed::{Manager, Object, RecycleError};
 use redis::{
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig}, cmd, Client, RedisError
 };
-use tokio::runtime::Handle;
 
 pub struct RedisClient {
     client: Client,
-    handle: Handle,
+    ping_number: AtomicUsize,
 }
 
 impl RedisClient {
     pub fn new(client: Client) -> Self {
         Self { 
             client, 
-            handle: tokio::runtime::Handle::current()
+            ping_number: AtomicUsize::new(0),
         }
     }
 
@@ -22,6 +23,38 @@ impl RedisClient {
     }
 }
 
+impl Manager for RedisClient {
+    type Type = ExclusiveConnection;
+    type Error = RedisError;
+    
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        self.get_connection().await.map(ExclusiveConnection)
+    }
+    
+    async fn recycle(
+        &self,
+        conn: &mut Self::Type,
+        _: &deadpool_redis::Metrics,
+    ) -> deadpool::managed::RecycleResult<Self::Error> {
+        let ping_number = self.ping_number.fetch_add(1, Ordering::Relaxed).to_string();
+        // Using pipeline to avoid roundtrip for UNWATCH
+        let (n,) = redis::Pipeline::with_capacity(2)
+            .cmd("UNWATCH")
+            .ignore()
+            .cmd("PING")
+            .arg(&ping_number)
+            .query_async::<(String,)>(conn)
+            .await?;
+        if n == ping_number {
+            Ok(())
+        } else {
+            Err(RecycleError::message("Invalid PING response"))
+        }
+    }
+}
+
+/// The difference between [`ConnectionManager`] and [`ExclusiveConnection`] is that ExclusiveConnection
+/// can't clone casual, it ensure it will not be abused between different threads.
 pub struct ExclusiveConnection(ConnectionManager);
 
 impl ConnectionLike for ExclusiveConnection {
@@ -40,31 +73,5 @@ impl ConnectionLike for ExclusiveConnection {
 
     fn get_db(&self) -> i64 {
         self.0.get_db()
-    }
-}
-
-
-/// [`ManageConnection::connect`] and [`ManageConnection::is_valid`] are all called in separate thread, so here we 
-/// can use tokio runtime to schedule async task
-impl ManageConnection for RedisClient {
-    type Connection = ExclusiveConnection;
-    type Error = RedisError;
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        self.handle.block_on(async {
-            let conn = self.get_connection().await?;
-            Ok(ExclusiveConnection(conn))
-        })
-    }
-    
-    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        self.handle.block_on(async move {
-            cmd("PING").query_async::<String>(&mut conn.0).await?;
-            Ok(())
-        })
-    }
-
-    /// notice if [`ConnectionManager`] is created, it will auto reconnect to server, so it's always not broken
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        false
     }
 }

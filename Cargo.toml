@@ -21,12 +21,13 @@ libc = "0.2"
 snafu = "0.8.4"
 async-trait = "0.1"
 bytes = "1.7"
-redis = { version = "0.26", features = ["r2d2", "script", "aio", "tokio-comp", "connection-manager"] }
-r2d2 = "0.8"
+redis = { version = "0.27", features = ["script", "aio", "tokio-comp", "connection-manager"] }
+deadpool = { version = "0.12", features = ["rt_tokio_1", "managed"] }
+deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.40", features = ["full"] }
 hostname = "0.3"
 get_if_addrs = "0.5"
 serde_json = "1"

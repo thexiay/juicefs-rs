@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use deadpool::managed::{Manager, Object, Pool};
 use futures::StreamExt;
 use juice_utils::process::Bar;
-use r2d2::{Pool, PooledConnection};
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{
-    cmd, pipe, AsyncCommands, Commands, Connection, ConnectionLike, InfoDict, IntoConnectionInfo,
+    cmd, pipe, AsyncCommands, Client, Commands, ConnectionLike, InfoDict, IntoConnectionInfo,
     Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
 };
 use regex::Regex;
@@ -126,7 +126,7 @@ return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
 
 /**
  * conn: ConnectionLike
- * key: 
+ * key:
  * body: Fn() -> Option<T>
  */
 macro_rules! async_transaction {
@@ -137,7 +137,7 @@ macro_rules! async_transaction {
                 Ok(Some(response)) => {
                     cmd("UNWATCH").query_async($conn).await?;
                     break Ok(response);
-                },
+                }
                 Ok(None) => continue,
                 Err(e) => break Err(e),
             }
@@ -178,14 +178,20 @@ macro_rules! async_transaction {
     Redis Action:
 
 */
-// TODO: make conn async
+/// Redis Client Engine
+///
+/// pool: A connection which want to exclusive, and it will be used in transaction.If use
+///       [`redis::aio::MultiplexedConnection`] to as pool conn, you cann't stop user clone it,
+///       it may break transaction. So we use [`ExclusiveConnection`] to as pool conn.
+///       [relational issue](https://github.com/redis-rs/redis-rs/issues/1257)
+/// shared_conn: A shared connection.It use [`redis::aio::MultiplexedConnection`]
 pub struct RedisEngine {
     // TODO: single connection or multiple connections?
     /// Redis Sentinel mode
     /// Redis Cluster mode
     /// Redis normal mode
     pool: Pool<RedisClient>,
-    conn: ConnectionManager,
+    shared_conn: ConnectionManager,
     prefix: String,
     lookup_script: Script,  // lookup lua script
     resolve_script: Script, // reslove lua script
@@ -197,12 +203,12 @@ impl RedisEngine {
         !err.is_unrecoverable_error()
     }
 
-    fn exclusive_conn(&self) -> Result<PooledConnection<RedisClient>> {
-        self.pool.get().context(ConnectionSnafu)
+    async fn exclusive_conn(&self) -> Result<Object<RedisClient>> {
+        self.pool.get().await.context(ConnectionSnafu)
     }
 
     fn share_conn(&self) -> &ConnectionManager {
-        &self.conn
+        &self.shared_conn
     }
 
     /// settings -> Option<String>
@@ -346,18 +352,18 @@ impl RedisEngine {
     /// redis URL:
     /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
     pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
-        // TODO: parse addr myself
         let url = format!("{}://{}", driver, addr);
-        let client = redis::Client::open(url)?;
-        let prefix = client.get_connection_info().redis.db.to_string();
-        let rdb = RedisClient::new(client);
-        let conn = rdb.get_connection().await?;
-        let pool: Pool<RedisClient> = r2d2::Pool::builder().max_size(15).build(rdb).unwrap();
+        let conn_info = url.into_connection_info()?;
+        let prefix = conn_info.redis.db.to_string();
+        // TODO: should merge conf into `ConnectionInfo`
+        let client = RedisClient::new(Client::open(conn_info.clone())?);
+        let conn = client.get_connection().await?;
+        let pool = Pool::builder(client).max_size(16).build().unwrap();
 
         let meta = CommonMeta::new(addr, conf);
         let engine = RedisEngine {
             pool,
-            conn,
+            shared_conn: conn,
             prefix,
             lookup_script: Script::new(LOOKUP_SCRIPT_CODE),
             resolve_script: Script::new(RESOLVE_SCRIPT_CODE),
@@ -369,7 +375,7 @@ impl RedisEngine {
     }
 
     async fn check_server_config(&self) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let info: InfoDict =
             redis::cmd("INFO")
@@ -495,7 +501,7 @@ impl RedisEngine {
     }
 
     async fn do_delete_file_data_inner(&self, inode: Ino, length: u64, tracking: &str) {
-        let mut pool_conn = match self.exclusive_conn() {
+        let mut pool_conn = match self.exclusive_conn().await {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to get connection: {}", e);
@@ -550,7 +556,7 @@ impl RedisEngine {
     }
 
     async fn delete_chunk(&self, inode: Ino, indx: u64) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let key = self.chunk_key(inode, indx);
         match async_transaction!(conn, &[&key], {
@@ -604,7 +610,7 @@ impl AsRef<CommonMeta> for RedisEngine {
 #[async_trait]
 impl Engine for RedisEngine {
     async fn get_counter(&self, name: &str) -> Result<i64> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let key = format!("{}{}", self.prefix, name);
         let v = conn.get(key).await?;
@@ -613,7 +619,7 @@ impl Engine for RedisEngine {
 
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64> {
         ensure!(!self.meta.conf.read_only, SysSnafu { code: libc::EROFS });
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let name_lower = name.to_lowercase();
         if name_lower.eq("nextinode") || name.eq("nextchunk") {
@@ -628,7 +634,7 @@ impl Engine for RedisEngine {
 
     async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool> {
         let name = format!("{}{}", self.prefix, name);
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[&name], {
             let old: Option<i64> = conn.get(&name).await?;
@@ -650,7 +656,7 @@ impl Engine for RedisEngine {
     async fn flush_stats(&self) {}
 
     async fn do_load(&self) -> Result<Option<Format>> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let format_body: Option<Vec<u8>> = conn.get(self.settings()).await?;
         match format_body {
@@ -660,7 +666,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let sid = self.meta.current_sid.load(Ordering::SeqCst).to_string();
         conn.zadd(self.all_sessions(), &sid, self.expire_time())
@@ -698,24 +704,27 @@ impl Engine for RedisEngine {
     }
 
     async fn do_refresh_session(&self) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let ssid = self.meta.current_sid.load(Ordering::SeqCst);
         // we have to check sessionInfo here because the operations are not within a transaction
         match conn.hexists(self.session_infos(), &ssid).await {
             Ok(false) => {
                 warn!("Session 0x{ssid:16x} was stale and cleaned up, but now it comes back again");
-                conn.hset(self.session_infos(), &ssid, self.meta.new_session_info()).await?;
+                conn.hset(self.session_infos(), &ssid, self.meta.new_session_info())
+                    .await?;
             }
             Err(e) => return Err(e.into()),
             _ => (),
         }
 
-        Ok(conn.zadd(self.all_sessions(), ssid, self.expire_time()).await?)
+        Ok(conn
+            .zadd(self.all_sessions(), ssid, self.expire_time())
+            .await?)
     }
 
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let range = (
             "-inf",
@@ -724,7 +733,9 @@ impl Engine for RedisEngine {
                 .expect("Time went backwards")
                 .as_secs(),
         );
-        Ok(conn.zrangebyscore_limit(self.all_sessions(), range.0, range.1, 0, limit).await?)
+        Ok(conn
+            .zrangebyscore_limit(self.all_sessions(), range.0, range.1, 0, limit)
+            .await?)
         // ignore go version before 1.0-beta3 as well, this version range is different
     }
 
@@ -801,7 +812,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_init(&self, format: Format, force: bool) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let body: Option<Vec<u8>> = conn.get(self.settings()).await?;
         if let Some(ref body) = body {
@@ -857,7 +868,7 @@ impl Engine for RedisEngine {
     }
 
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let mut pipe = redis::pipe();
         let re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &self.prefix)).expect("error regex");
@@ -900,7 +911,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_delete_sustained_inode(&self, sid: u64, inode: Ino) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         match async_transaction!(conn, &[self.inode_key(inode)], {
             let inode_v: Option<Vec<u8>> = conn.get(self.inode_key(inode)).await?;
@@ -925,7 +936,8 @@ impl Engine for RedisEngine {
                         .decr(self.used_space_key(), delete_space)
                         .decr(self.total_inodes_key(), 1)
                         .srem(self.sustained(sid), inode.to_string())
-                        .query_async(conn).await?;
+                        .query_async(conn)
+                        .await?;
                     Ok(Some(delete_space))
                 }
                 None => Ok(None),
@@ -945,7 +957,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_find_deleted_files(&self, ts: i64, limit: isize) -> Result<HashMap<Ino, u64>> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let vals: Vec<String> = conn
             .zrangebyscore_limit(self.del_files(), "-inf", ts, 0, limit)
@@ -1048,7 +1060,7 @@ impl Engine for RedisEngine {
         cumask: u16,
         path: &str,
     ) -> Result<()> {
-        let mut pool_conn = self.exclusive_conn()?;
+        let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
             let attr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;

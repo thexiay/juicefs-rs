@@ -29,6 +29,5 @@ fn main() {
 
 fn panic_fn() {
     let a = A {};
-    std::mem::replace
     panic!("0000000");
 }

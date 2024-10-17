@@ -35,6 +35,13 @@ fn after_all() {}
 
 static REDIS_DB_HOLDER: RwLock<Option<RedisDbOffer>> = RwLock::new(None);
 
+/// Because rust cargo will concurrent run test cases, so we need a clear environment to run our test cases.
+/// RedisDbOffer is a wrapper of redis db, [`RedisDbOffer::take`] will find a idle clear db for test.
+/// 
+/// Currently, start redis is manually, we can use docker to start redis in the future.E.G.
+/// ```shell
+/// docker run --name myredis --network host -d redis --requirepass "mypassword"
+/// ```
 struct RedisDbOffer {
     redis_url: String,
     db_nums: u32,
@@ -52,7 +59,7 @@ impl RedisDbOffer {
             );
         }
         RedisDbOffer {
-            redis_url: "redis://localhost:6379".to_string(),
+            redis_url: "redis://:mypassword@127.0.0.1:6379".to_string(),
             db_nums: num,
             db_used,
         }
