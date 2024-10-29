@@ -53,7 +53,7 @@ impl OpenFiles {
                 guard.get_mut(&ino).unwrap()
             }
         };
-        if attr.mtime == of.attr.mtime && attr.mtime_nsec == of.attr.mtime_nsec {
+        if attr.mtime == of.attr.mtime {
             attr.keep_cache = of.attr.keep_cache;
         } else {
             of.invalidate_chunk();

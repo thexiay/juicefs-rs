@@ -1,3 +1,5 @@
+use std::backtrace::Backtrace;
+
 use deadpool::managed::PoolError;
 use redis::RedisError;
 use snafu::Snafu;
@@ -31,10 +33,12 @@ pub enum MyError {
     #[snafu(context(false))]
     SerdeJsonError {
         source: serde_json::Error,
+        backtrace: Backtrace
     },
     #[snafu(context(false))]
     SerdeBincodeError {
         source: bincode::Error,
+        backtrace: Backtrace
     },
 
     // ----------------- logic error  -------------------

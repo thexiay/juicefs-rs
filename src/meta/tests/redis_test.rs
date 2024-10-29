@@ -75,8 +75,9 @@ impl RedisDbOffer {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
-                    // only init once
+                    // only init once, first reset it.
                     info!("Init redis db: {redis_url}");
+                    client.reset().await.expect("clean up db error");
                     client.init(test_format(), true).await.unwrap();
                 }
 
@@ -89,7 +90,9 @@ impl RedisDbOffer {
                     return (client, RedisDbHodler(refs.clone()));
                 }
             }
-            sleep(Duration::from_secs(10)).await;
+            info!("could not find avaiable db, wait 2 seconds");
+            sleep(Duration::from_secs(2)).await;
+            
         }
     }
 }

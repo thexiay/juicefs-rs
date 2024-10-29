@@ -36,4 +36,9 @@ impl Quota {
         }
         return false;
     }
+
+    pub fn update(&self, space: i64, inodes: i64) {
+        self.new_space.fetch_add(space, std::sync::atomic::Ordering::SeqCst);
+        self.new_inodes.fetch_add(inodes, std::sync::atomic::Ordering::SeqCst);
+    }
 }

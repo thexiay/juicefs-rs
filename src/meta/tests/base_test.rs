@@ -3,7 +3,7 @@ use juice_meta::{api::{Attr, Ino, Meta}, config::Format};
 pub fn test_format() -> Format {
     Format {
         name: "test".to_string(),
-        dir_stats: true,
+        enable_dir_stats: true,
         ..Format::default()
     }
 }

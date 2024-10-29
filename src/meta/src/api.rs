@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::ops::BitAnd;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -45,6 +46,10 @@ pub fn gid() -> u32 {
     0
 }
 
+pub fn gids() -> Vec<u32> {
+    vec![0]
+}
+
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum INodeType {
     #[default]
@@ -60,7 +65,7 @@ pub enum INodeType {
 // Entry is an entry inside a directory.
 pub struct Entry {
     pub inode: Ino,
-    pub name: Vec<u8>,
+    pub name: String,
     pub attr: Attr,
 }
 
@@ -133,6 +138,13 @@ bitflags! {
         const READ    = 0b100;
         const WRITE   = 0b010;
         const EXECUTE = 0b001;
+        const FULL    = Self::READ.bits | Self::WRITE.bits | Self::EXECUTE.bits;
+        // TODO: 特殊权限，文件类型
+    }
+
+    pub struct Flag: u8 {
+        const IMMUTABLE  = 0b001;
+        const APPEND     = 0b010;
     }
 }
 
@@ -145,12 +157,9 @@ pub struct Attr {
     pub uid: u32,         // owner id
     pub gid: u32,         // group id of owner
     pub rdev: u32,        // device number
-    pub atime: u64,       // last access time
-    pub mtime: u64,       // last modified time
-    pub ctime: u64,       // last change time for meta
-    pub atime_nsec: u32,  // nanosecond part of atime
-    pub mtime_nsec: u32,  // nanosecond part of mtime
-    pub ctime_nsec: u32,  // nanosecond part of ctime
+    pub atime: u128,      // last access time, nacos time
+    pub mtime: u128,      // last modified time, nacos time
+    pub ctime: u128,      // last change time for meta, nacos time
     pub nlink: u32,       // number of links (sub-directories or hardlinks)
     pub length: u64,      // length of regular file
     pub parent: Ino,      // inode of parent; 0 means tracked by parentKey (for hardlinks)

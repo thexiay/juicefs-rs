@@ -67,7 +67,7 @@ pub struct Format {
     pub meta_version: i32,
     pub min_client_version: Option<String>,
     pub max_client_version: Option<String>,
-    pub dir_stats: bool,
+    pub enable_dir_stats: bool,
     pub enable_acl: bool,
 }
 

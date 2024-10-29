@@ -3,10 +3,10 @@ use bytes::Bytes;
 use deadpool::managed::{Manager, Object, Pool};
 use futures::StreamExt;
 use juice_utils::process::Bar;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
 use redis::{
-    cmd, pipe, AsyncCommands, Client, Commands, ConnectionLike, InfoDict, IntoConnectionInfo,
-    Pipeline, RedisError, RedisResult, ScanOptions, Script, ToRedisArgs,
+    cmd, pipe, AsyncCommands, Client, Commands, InfoDict, IntoConnectionInfo, Pipeline, RedisError,
+    RedisResult, ScanOptions, Script, ToRedisArgs,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
@@ -19,16 +19,18 @@ use std::sync::Arc;
 use tokio::time::{self, sleep, Instant};
 use tracing::{debug, error, warn};
 
-use crate::acl::Rule;
+use crate::acl::{self, AclId, AclType, Rule};
 use crate::api::{
-    Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, TRASH_INODE,
+    gids, Attr, Entry, Flag, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, ROOT_INODE, TRASH_INODE
 };
 use crate::base::{
-    Cchunk, CommonMeta, DirStat, Engine, MetaState, PendingFileScan, PendingSliceScan,
-    TrashSliceScan, N_LOCK,
+    Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, MetaState, PendingFileScan,
+    PendingSliceScan, TrashSliceScan, N_LOCK,
 };
 use crate::config::{Config, Format};
-use crate::error::{ConnectionSnafu, EmptyKeySnafu, MyError, RedisDetailSnafu, Result, SysSnafu};
+use crate::error::{
+    ConnectionSnafu, EmptyKeySnafu, FileExistSnafu, MyError, RedisDetailSnafu, Result, SysSnafu,
+};
 use crate::quota::Quota;
 use crate::utils;
 use std::collections::HashMap;
@@ -207,8 +209,8 @@ impl RedisEngine {
         self.pool.get().await.context(ConnectionSnafu)
     }
 
-    fn share_conn(&self) -> &ConnectionManager {
-        &self.shared_conn
+    fn share_conn(&self) -> ConnectionManager {
+        self.shared_conn.clone()
     }
 
     /// settings -> Option<String>
@@ -286,7 +288,7 @@ impl RedisEngine {
         format!("{}i{}", self.prefix, inode)
     }
 
-    /// Dir: {prefix}d{inode} -> {name -> {inode,type}}
+    /// Dir: {prefix}d{inode} -> {name -> {type,inode}}
     fn dir_key(&self, inode: Ino) -> String {
         format!("{}d{}", self.prefix, inode)
     }
@@ -335,6 +337,10 @@ impl RedisEngine {
 
     fn slice_key(id: u64, size: u32) -> String {
         format!("k{}_{}", id, size)
+    }
+
+    fn acl_key(&self) -> String {
+        format!("{}acl", self.prefix)
     }
 
     fn expire_time(&self) -> u64 {
@@ -420,6 +426,7 @@ impl RedisEngine {
              */
     }
 
+    /*
     async fn txn_with_retry<
         C: ConnectionLike,
         K: ToRedisArgs,
@@ -483,10 +490,11 @@ impl RedisEngine {
         warn!("Already tried 50 times, returning: {last_err:?}");
         Err(last_err.unwrap().into())
     }
+    */
 
     async fn scan_iter<'a>(
         &self,
-        conn: &'a mut ExclusiveConnection,
+        conn: &'a mut impl AsyncCommands,
         pattern: String,
     ) -> Result<redis::AsyncIter<'a, String>> {
         // redis-rs will auto fetch all data batch
@@ -599,6 +607,85 @@ impl RedisEngine {
     }
 
     fn delete_slice(&self, id: u64, size: u32) {}
+
+    async fn get_acl(
+        &self,
+        pipe: &mut Pipeline,
+        conn: &mut impl ConnectionLike,
+        id: u32,
+    ) -> Result<Rule> {
+        // 这里必须拿到，拿不到就是有逻辑上的错误
+        let mut cache = self.meta.acl_cache.lock().await;
+        if let Some(rule) = cache.get(id) {
+            return Ok(rule);
+        }
+
+        let cmds: Option<Vec<u8>> = pipe.hget(self.acl_key(), id).query_async(conn).await?;
+        match cmds {
+            None => SysSnafu { code: libc::EIO }.fail(),
+            Some(cmds) => {
+                let rule: Rule = bincode::deserialize(&cmds)?;
+                cache.put(id, rule.clone());
+                Ok(rule)
+            }
+        }
+    }
+
+    async fn insert_acl(
+        &self,
+        pipe: &mut Pipeline,
+        conn: &mut impl ConnectionLike,
+        rule: Rule,
+    ) -> Result<AclId> {
+        if rule.is_empty() {
+            return Ok(acl::NONE);
+        }
+
+        self.load_miss_acls(pipe, conn)
+            .await
+            .map_err(|e| warn!("SetFacl: load miss acls error: {}", e));
+        // set acl
+        let mut cache = self.meta.acl_cache.lock().await;
+        match cache.get_id(&rule) {
+            Some(acl_id) => Ok(acl_id),
+            None => {
+                let new_id = self.incr_counter(acl::ACL_COUNTER, 1).await?;
+                pipe.hset_nx(self.acl_key(), new_id, bincode::serialize(&rule)?)
+                    .query_async::<()>(conn);
+                cache.put(new_id as u32, rule);
+                Ok(new_id as u32)
+            }
+        }
+    }
+
+    async fn load_miss_acls(
+        &self,
+        pipe: &mut Pipeline,
+        conn: &mut impl ConnectionLike,
+    ) -> Result<()> {
+        let mut cache = self.meta.acl_cache.lock().await;
+        let miss_ids = cache.get_miss_ids();
+        match miss_ids.is_empty() {
+            true => Ok(()),
+            false => {
+                let miss_keys: Vec<String> = miss_ids.iter().map(|id| id.to_string()).collect();
+                let vals: Vec<Option<Vec<u8>>> = pipe
+                    .hget(self.acl_key(), miss_keys)
+                    .query_async(conn)
+                    .await?;
+                for (i, data) in vals.iter().enumerate() {
+                    match data {
+                        Some(bytes) => {
+                            let rule: Rule = bincode::deserialize(bytes)?;
+                            cache.put(miss_ids[i], rule);
+                        }
+                        None => warn!("Missing acl id: {}", miss_ids[i]),
+                    };
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl AsRef<CommonMeta> for RedisEngine {
@@ -818,7 +905,7 @@ impl Engine for RedisEngine {
         if let Some(ref body) = body {
             // if old exist, check if it can be update
             let old: Format = serde_json::from_slice(body)?;
-            if !old.dir_stats && format.dir_stats {
+            if !old.enable_dir_stats && format.enable_dir_stats {
                 // remove dir stats as they are outdated
                 conn.del(&[self.dir_used_inodes_key(), self.dir_used_space_key()])
                     .await
@@ -832,7 +919,7 @@ impl Engine for RedisEngine {
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
-            .as_secs();
+            .as_nanos();
         let mut attr = Attr {
             typ: INodeType::TypeDirectory,
             atime: ts,
@@ -861,9 +948,25 @@ impl Engine for RedisEngine {
                 // root inode
                 attr.mode = 0777;
                 Ok(conn
-                    .set(self.inode_key(1), bincode::serialize(&attr)?)
+                    .set(self.inode_key(ROOT_INODE), bincode::serialize(&attr)?)
                     .await?)
             }
+        }
+    }
+
+    async fn do_reset(&self) -> Result<()> {
+        if !self.prefix.is_empty() {
+            let mut conn = self.share_conn();
+            let mut conn2 = conn.clone();
+            let mut iter = self.scan_iter(&mut conn, "*".to_string()).await?;
+            while let Some(key) = iter.next().await {
+                conn2.del(key).await?;
+            }
+            Ok(())
+        } else {
+            let _: () =  redis::cmd("FLUSHDB")
+                .query_async(&mut self.share_conn()).await?;
+            Ok(())
         }
     }
 
@@ -1055,19 +1158,19 @@ impl Engine for RedisEngine {
         &self,
         parent: Ino,
         name: &str,
-        _type: u8,
-        mode: u16,
+        ino_type: INodeType,
+        mut mode: u16,
         cumask: u16,
         path: &str,
-    ) -> Result<()> {
+        inode: Ino,
+        attr: Attr,
+    ) -> Result<Attr> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
-            let attr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
-            let attr: Attr = bincode::deserialize(&attr_bytes).map_err(|e| {
-                RedisError::from((redis::ErrorKind::TypeError, "type error", e.to_string()))
-            })?;
-            if attr.typ != INodeType::TypeDirectory {
+            let pattr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
+            let mut pattr: Attr = bincode::deserialize(&pattr_bytes)?;
+            if pattr.typ != INodeType::TypeDirectory {
                 return Err(RedisError::from((
                     redis::ErrorKind::TypeError,
                     "type error",
@@ -1075,7 +1178,7 @@ impl Engine for RedisEngine {
                 ))
                 .into());
             }
-            if attr.parent > TRASH_INODE {
+            if pattr.parent > TRASH_INODE {
                 return Err(RedisError::from((
                     redis::ErrorKind::TypeError,
                     "type error",
@@ -1083,151 +1186,137 @@ impl Engine for RedisEngine {
                 ))
                 .into());
             }
-            self.access(parent, ModeMask::WRITE, &attr).await?;
-
-            Ok(Some(()))
-        })
-        /*
-            return errno(m.txn(ctx, func(tx *redis.Tx) error {
-            var pattr Attr
-            a, err := tx.Get(ctx, m.inodeKey(parent)).Bytes()
-            if err != nil {
-                return err
-            }
-            m.parseAttr(a, &pattr)
-            if pattr.Typ != TypeDirectory {
-                return syscall.ENOTDIR
-            }
-            if pattr.Parent > TrashInode {
-                return syscall.ENOENT
-            }
-            if st := m.Access(ctx, parent, MODE_MASK_W, &pattr); st != 0 {
-                return st
-            }
-            if (pattr.Flags & FlagImmutable) != 0 {
-                return syscall.EPERM
+            self.access(parent, ModeMask::WRITE, &pattr).await?;
+            if !(Flag::IMMUTABLE & Flag::from_bits_truncate(pattr.flags)).is_empty() {
+                return SysSnafu { code: libc::EPERM }.fail();
             }
 
-            buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
-            if err != nil && err != redis.Nil {
-                return err
-            }
-            var foundIno Ino
-            var foundType uint8
-            if err == nil {
-                foundType, foundIno = m.parseEntry(buf)
-            } else if m.conf.CaseInsensi { // err == redis.Nil
-                if entry := m.resolveCase(ctx, parent, name); entry != nil {
-                    foundType, foundIno = entry.Attr.Typ, entry.Inode
+            // check exists
+            let mut new_attr = attr.clone();
+            let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+            let found_ino = match buf {
+                Some(buf) => {
+                    let (ino_type, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
+                    Some((ino_type, ino))
                 }
-            }
-            if foundIno != 0 {
-                if _type == TypeFile || _type == TypeDirectory { // file for create, directory for subTrash
-                    a, err = tx.Get(ctx, m.inodeKey(foundIno)).Bytes()
-                    if err == nil {
-                        m.parseAttr(a, attr)
-                    } else if err == redis.Nil {
-                        *attr = Attr{Typ: foundType, Parent: parent} // corrupt entry
-                    } else {
-                        return err
+                None if self.meta.conf.case_insensi => self
+                    .reslove_case(parent, name)
+                    .await?
+                    .map(|entry| (entry.attr.typ, entry.inode)),
+                None => None,
+            };
+            if let Some((found_type, found_ino)) = found_ino {
+                match found_type {
+                    // file for create, directory for subTrash
+                    INodeType::TypeFile | INodeType::TypeDirectory => {
+                        let attr_bytes: Option<Vec<u8>> =
+                            conn.get(self.inode_key(found_ino)).await?;
+                        match attr_bytes {
+                            Some(attr_bytes) => {
+                                new_attr = bincode::deserialize(&attr_bytes)?;
+                            }
+                            None => {
+                                // cirrupt entry
+                                new_attr = Attr {
+                                    typ: found_type,
+                                    parent: parent,
+                                    ..Default::default()
+                                };
+                            }
+                        }
                     }
-                    *inode = foundIno
+                    _ => (),
                 }
-                return syscall.EEXIST
-            }
+                return FileExistSnafu {
+                    ino: found_ino,
+                    attr: new_attr,
+                }
+                .fail();
+            };
 
-            mode &= 07777
-            if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
+            // acl mode search
+            mode &= 0o7777;
+            let mut pipe = pipe();
+            if pattr.default_acl != acl::NONE && ino_type != INodeType::TypeSymlink {
                 // inherit default acl
-                if _type == TypeDirectory {
-                    attr.DefaultACL = pattr.DefaultACL
+                if ino_type == INodeType::TypeDirectory {
+                    pattr.default_acl = pattr.default_acl;
                 }
 
                 // set access acl by parent's default acl
-                rule, err := m.getACL(ctx, tx, pattr.DefaultACL)
-                if err != nil {
-                    return err
-                }
-
-                if rule.IsMinimal() {
-                    // simple acl as default
-                    attr.Mode = mode & (0xFE00 | rule.GetMode())
+                let rule = self.get_acl(pipe.atomic(), conn, pattr.default_acl).await?;
+                if rule.is_minimal() {
+                    pattr.mode = mode & (0xFE00 | rule.get_mode());
                 } else {
-                    cRule := rule.ChildAccessACL(mode)
-                    id, err := m.insertACL(ctx, tx, cRule)
-                    if err != nil {
-                        return err
-                    }
-
-                    attr.AccessACL = id
-                    attr.Mode = (mode & 0xFE00) | cRule.GetMode()
+                    let c_rule = rule.child_access_acl(mode);
+                    let c_mode = c_rule.get_mode();
+                    let id = self.insert_acl(pipe.atomic(), conn, c_rule).await?;
+                    pattr.access_acl = id;
+                    pattr.mode = (mode & 0xFE00) | c_mode;
                 }
             } else {
-                attr.Mode = mode & ^cumask
+                pattr.mode = mode & !cumask;
             }
 
-            var updateParent bool
-            now := time.Now()
-            if parent != TrashInode {
-                if _type == TypeDirectory {
-                    pattr.Nlink++
-                    updateParent = true
+            // time set
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos();
+            let mut update_parent = false;
+            if parent != TRASH_INODE {
+                if ino_type == INodeType::TypeDirectory {
+                    pattr.nlink += 1;
+                    update_parent = true;
                 }
-                if updateParent || now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= m.conf.SkipDirMtime {
-                    pattr.Mtime = now.Unix()
-                    pattr.Mtimensec = uint32(now.Nanosecond())
-                    pattr.Ctime = now.Unix()
-                    pattr.Ctimensec = uint32(now.Nanosecond())
-                    updateParent = true
+                if update_parent || now - pattr.mtime >= self.meta.conf.skip_dir_mtime.as_nanos() {
+                    pattr.mtime = now;
+                    pattr.ctime = now;
+                    update_parent = true;
                 }
             }
-            attr.Atime = now.Unix()
-            attr.Atimensec = uint32(now.Nanosecond())
-            attr.Mtime = now.Unix()
-            attr.Mtimensec = uint32(now.Nanosecond())
-            attr.Ctime = now.Unix()
-            attr.Ctimensec = uint32(now.Nanosecond())
-            if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
-                attr.Gid = pattr.Gid
-            } else if runtime.GOOS == "linux" && pattr.Mode&02000 != 0 {
-                attr.Gid = pattr.Gid
-                if _type == TypeDirectory {
-                    attr.Mode |= 02000
-                } else if attr.Mode&02010 == 02010 && ctx.Uid() != 0 {
-                    var found bool
-                    for _, gid := range ctx.Gids() {
-                        if gid == pattr.Gid {
-                            found = true
-                        }
-                    }
-                    if !found {
-                        attr.Mode &= ^uint16(02000)
+            new_attr.atime = now;
+            new_attr.mtime = now;
+            new_attr.ctime = now;
+
+            // different os adapt
+            if cfg!(target_os = "macos") {
+                pattr.gid = pattr.gid;
+            } else if cfg!(target_os = "linux") && pattr.mode & 0o2000 != 0 {
+                pattr.gid = pattr.gid;
+                if ino_type == INodeType::TypeDirectory {
+                    pattr.mode |= 0o2000;
+                } else if pattr.mode & 0o2010 == 0o2010 && 0 != 0 {
+                    if let None = gids().iter().find(|gid| **gid == pattr.gid) {
+                        pattr.mode &= !0o2000;
                     }
                 }
             }
 
-            _, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-                pipe.HSet(ctx, m.entryKey(parent), name, m.packEntry(_type, *inode))
-                if updateParent {
-                    pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
-                }
-                pipe.Set(ctx, m.inodeKey(*inode), m.marshal(attr), 0)
-                if _type == TypeSymlink {
-                    pipe.Set(ctx, m.symKey(*inode), path, 0)
-                }
-                if _type == TypeDirectory {
-                    field := (*inode).String()
-                    pipe.HSet(ctx, m.dirUsedInodesKey(), field, "0")
-                    pipe.HSet(ctx, m.dirDataLengthKey(), field, "0")
-                    pipe.HSet(ctx, m.dirUsedSpaceKey(), field, "0")
-                }
-                pipe.IncrBy(ctx, m.usedSpaceKey(), align4K(0))
-                pipe.Incr(ctx, m.totalInodesKey())
-                return nil
-            })
-            return err
-        }, m.inodeKey(parent), m.entryKey(parent)))
-         */
+            // redis set kv
+            let pipe = pipe.atomic();
+            pipe.hset(
+                self.dir_key(parent),
+                name,
+                bincode::serialize(&(&ino_type, inode))?,
+            );
+            if update_parent {
+                pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
+            }
+            pipe.set(self.inode_key(inode), bincode::serialize(&attr)?);
+            if ino_type == INodeType::TypeSymlink {
+                pipe.set(self.sym_key(inode), path);
+            }
+            if ino_type == INodeType::TypeDirectory {
+                pipe.hset(self.dir_used_inodes_key(), inode, "0");
+                pipe.hset(self.dir_data_length_key(), inode, "0");
+                pipe.hset(self.dir_used_space_key(), inode, "0");
+            }
+            pipe.incr(self.used_space_key(), utils::align_4k(0));
+            pipe.incr(self.total_inodes_key(), 1);
+            pipe.query_async(conn).await?;
+            Ok(Some(new_attr))
+        })
     }
 
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()> {
@@ -1258,13 +1347,7 @@ impl Engine for RedisEngine {
         unimplemented!()
     }
 
-    async fn do_readdir(
-        &self,
-        inode: Ino,
-        plus: u8,
-        entries: &mut Vec<Entry>,
-        limit: i32,
-    ) -> Result<()> {
+    async fn do_readdir(&self, inode: Ino, plus: u8, limit: i32) -> Result<Option<Vec<Entry>>> {
         unimplemented!()
     }
 
@@ -1388,11 +1471,11 @@ impl Engine for RedisEngine {
         unimplemented!()
     }
 
-    async fn do_set_facl(&self, ino: Ino, acl_type: u8, rule: &Rule) -> Result<()> {
+    async fn do_set_facl(&self, ino: Ino, acl_type: AclType, rule: &Rule) -> Result<()> {
         unimplemented!()
     }
 
-    async fn do_get_facl(&self, ino: Ino, acl_type: u8, acl_id: u32, rule: &Rule) -> Result<()> {
+    async fn do_get_facl(&self, ino: Ino, acl_type: AclType, acl_id: AclId) -> Result<Rule> {
         unimplemented!()
     }
 

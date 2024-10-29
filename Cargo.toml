@@ -18,7 +18,7 @@ repository = "https://github.com/thexiay/juicefs-rs"
 
 [workspace.dependencies]
 libc = "0.2"
-snafu = "0.8.4"
+snafu = { version = "0.8.4", features = ["backtrace"]}
 async-trait = "0.1"
 bytes = "1.7"
 redis = { version = "0.27", features = ["script", "aio", "tokio-comp", "connection-manager"] }
@@ -38,3 +38,4 @@ regex = "1.10"
 juice-utils = { path = "./src/utils" }
 bitflags = "1.3"
 futures = "0.3"
+crc32fast = "1.4"

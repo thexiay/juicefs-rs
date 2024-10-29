@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
+use crate::api::{Attr, ModeMask};
+
 #[derive(Default)]
 pub struct FreeID {
 	pub next: u64,
@@ -33,4 +35,20 @@ pub fn align_4k(length: u64) -> i64 {
 		return 1 << 12;
 	}
 	(((length - 1) >> 12 + 1) << 12) as i64
+}
+
+pub fn access_mode(attr: &Attr, uid: u32, gids: Vec<u32>) -> ModeMask {
+	if uid == 0 {
+		return ModeMask::FULL;
+	}
+	let mode = attr.mode;
+	if uid == attr.uid {
+		return ModeMask::FULL & ModeMask::from_bits_truncate((mode >> 6) as u8);
+	}
+	for gid in gids {
+		if gid == attr.gid {
+			return ModeMask::FULL & ModeMask::from_bits_truncate((mode >> 3) as u8);
+		}
+	}
+	return ModeMask::FULL & ModeMask::from_bits_truncate(mode as u8);
 }

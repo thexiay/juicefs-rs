@@ -12,15 +12,16 @@ use sysinfo::{get_current_pid, PidExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-use crate::acl::Rule;
+use crate::acl::{self, AclCache, AclType, Rule};
 use crate::api::{
-    gid, is_trash, uid, Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, SessionInfo, Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_NAME
+    gid, gids, is_trash, uid, Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, SessionInfo,
+    Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFile, OpenFiles};
 use crate::quota::Quota;
-use crate::utils::{align_4k, FLockItem, FreeID, PLockItem};
+use crate::utils::{access_mode, align_4k, FLockItem, FreeID, PLockItem};
 
 pub const INODE_BATCH: i64 = 1 << 10;
 pub const SLICE_ID_BATCH: i64 = 1 << 10;
@@ -72,6 +73,7 @@ impl FsStat {
     }
 }
 
+#[derive(Default)]
 pub struct DirStat {
     length: i64,
     space: i64,
@@ -101,6 +103,7 @@ pub trait Engine {
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>>;
     async fn do_clean_stale_session(&self, sid: u64) -> Result<()>;
     async fn do_init(&self, format: Format, force: bool) -> Result<()>;
+    async fn do_reset(&self) -> Result<()>;
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()>;
     async fn do_delete_sustained_inode(&self, sid: u64, inode: Ino) -> Result<()>;
     async fn do_find_deleted_files(&self, ts: i64, limit: isize) -> Result<HashMap<Ino, u64>>;
@@ -122,10 +125,12 @@ pub trait Engine {
     async fn do_attach_dir_node(&self, parent: Ino, dst_ino: Ino, name: &str) -> Result<()>;
     async fn do_find_detached_nodes(&self, t: SystemTime) -> Vec<Ino>;
     async fn do_cleanup_detached_node(&self, detached_node: Ino) -> Result<()>;
+    // quota manage
     async fn do_get_quota(&self, inode: Ino) -> Result<Quota>;
     async fn do_del_quota(&self, inode: Ino) -> Result<()>;
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
     async fn do_flush_quotas(&self, quotas: HashMap<Ino, Quota>) -> Result<()>;
+    // meta functions
     async fn do_get_attr(&self, inode: Ino, attr: &Attr) -> Result<()>;
     async fn do_set_attr(
         &self,
@@ -139,11 +144,13 @@ pub trait Engine {
         &self,
         parent: Ino,
         name: &str,
-        _type: u8,
+        ino_type: INodeType,
         mode: u16,
         cumask: u16,
         path: &str,
-    ) -> Result<()>;
+        inode: Ino,
+        attr: Attr,
+    ) -> Result<Attr>;
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
     async fn do_unlink(
         &self,
@@ -160,13 +167,7 @@ pub trait Engine {
         skip_check_trash: bool,
     ) -> Result<()>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
-    async fn do_readdir(
-        &self,
-        inode: Ino,
-        plus: u8,
-        entries: &mut Vec<Entry>,
-        limit: i32,
-    ) -> Result<()>;
+    async fn do_readdir(&self, inode: Ino, plus: u8, limit: i32) -> Result<Option<Vec<Entry>>>;
     async fn do_rename(
         &self,
         parent_src: Ino,
@@ -241,20 +242,22 @@ pub trait Engine {
 
     async fn get_session(&self, sid: u64, detail: bool) -> Result<Session>;
 
-    async fn do_set_facl(&self, ino: Ino, acl_type: u8, rule: &Rule) -> Result<()>;
-    async fn do_get_facl(&self, ino: Ino, acl_type: u8, acl_id: u32, rule: &Rule) -> Result<()>;
+    async fn do_set_facl(&self, ino: Ino, acl_type: AclType, rule: &Rule) -> Result<()>;
+    async fn do_get_facl(&self, ino: Ino, acl_type: AclType, acl_id: u32) -> Result<Rule>;
     async fn cache_acls(&self) -> Result<()>;
 }
-
 
 #[async_trait]
 pub trait MetaOtherFunction {
     async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
     async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool;
+    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64) -> Result<()>;
+    async fn load_dir_quotas(&self) -> Result<()>;
+
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
-    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64) -> Result<()>;
     async fn next_inode(&self) -> Result<Ino>;
+    async fn reslove_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
 }
 
 pub struct MetaState {
@@ -288,8 +291,6 @@ impl MetaState {
             canceled: AtomicBool::new(false),
         }
     }
-
-
 }
 
 pub struct CommonMeta {
@@ -303,8 +304,8 @@ pub struct CommonMeta {
     pub symlinks: HashMap<Ino, String>,
     pub umounting: bool,
     pub ses_mu: Mutex<()>,
-    pub dir_stats_lock: Mutex<()>,
-    pub dir_stats: HashMap<Ino, DirStat>,
+    pub acl_cache: AsyncMutex<AclCache>,
+    pub dir_stats_lock: Mutex<HashMap<Ino, DirStat>>,
     pub fs_stat: FsStat,
     pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
     pub dir_quotas: RwLock<HashMap<Ino, Arc<Quota>>>, // directory inode -> quota
@@ -337,8 +338,8 @@ impl CommonMeta {
             symlinks: HashMap::new(),
             umounting: false,
             ses_mu: Mutex::new(()),
-            dir_stats_lock: Mutex::new(()),
-            dir_stats: HashMap::new(),
+            acl_cache: AsyncMutex::new(AclCache::default()),
+            dir_stats_lock: Mutex::new(HashMap::new()),
             fs_stat: FsStat::default(),
             dir_parents: Mutex::new(HashMap::new()),
             dir_quotas: RwLock::new(HashMap::new()),
@@ -361,7 +362,7 @@ impl CommonMeta {
         }
     }
 
-    fn get_format(&self) -> Arc<Format>{
+    fn get_format(&self) -> Arc<Format> {
         self.fmt.read().clone()
     }
 
@@ -396,9 +397,9 @@ impl CommonMeta {
 #[async_trait]
 impl<E> MetaOtherFunction for E
 where
-    E: Send + Sync + 'static + Engine + AsRef<CommonMeta> 
+    E: Send + Sync + 'static + Engine + AsRef<CommonMeta>,
 {
-    async fn check_quota(&self,space:i64,inodes:i64,parents:Vec<Ino>) -> Result<()>  {
+    async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()> {
         if space <= 0 && inodes <= 0 {
             return Ok(());
         }
@@ -422,7 +423,7 @@ where
         {
             return SysSnafu { code: libc::ENOSPC }.fail();
         }
-        if !format.dir_stats {
+        if !format.enable_dir_stats {
             return Ok(());
         }
         for ino in parents {
@@ -433,8 +434,8 @@ where
         Ok(())
     }
 
-    async fn check_dir_quota(&self,ino:Ino,space:i64,inodes:i64) -> bool {
-        if !self.get_format().dir_stats {
+    async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool {
+        if !self.get_format().enable_dir_stats {
             return false;
         }
 
@@ -464,7 +465,15 @@ where
         false
     }
 
-    async fn get_dir_parent(&self, inode:Ino) -> Result<Ino>  {
+    async fn load_dir_quotas(&self) -> Result<()> {
+        if !self.get_format().enable_dir_stats {
+            return Ok(());
+        }
+
+        unimplemented!()
+    }
+
+    async fn get_dir_parent(&self, inode: Ino) -> Result<Ino> {
         let parent = {
             let guard = self.as_ref().dir_parents.lock();
             guard.get(&inode).map(|p| *p)
@@ -478,15 +487,43 @@ where
         Ok(st.parent)
     }
 
-    fn update_dir_stats(&self,inode:Ino,length:i64,space:i64,inodes:i64) {
-        todo!()
+    fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64) {
+        if !self.get_format().enable_dir_stats {
+            return;
+        }
+
+        let mut dir_stats = self.as_ref().dir_stats_lock.lock();
+        let stats = dir_stats.entry(inode).or_insert(DirStat::default());
+        stats.length += length;
+        stats.space += space;
+        stats.inodes += inodes;
     }
 
-    async fn update_dir_quota(&self,inode:Ino,space:i64,inodes:i64) -> Result<()>  {
-        todo!()
+    async fn update_dir_quota(&self, mut inode: Ino, space: i64, inodes: i64) -> Result<()> {
+        if !self.get_format().enable_dir_stats {
+            return Ok(());
+        }
+
+        // recursively update the quota of the parent node until the root node is encountered
+        loop {
+            let quota = {
+                let dir_quota = self.as_ref().dir_quotas.read();
+                dir_quota.get(&inode).map(|q| q.clone())
+            };
+            if let Some(quota) = quota {
+                quota.update(space, inodes);
+            }
+            if inode <= ROOT_INODE {
+                break;
+            }
+            inode = self.get_dir_parent(inode).await.inspect_err(|err| {
+                warn!("Get directory parent of inode {} err: {}", inode, err);
+            })?;
+        }
+        Ok(())
     }
 
-    async fn next_inode(&self) -> Result<Ino>  {
+    async fn next_inode(&self) -> Result<Ino> {
         let mut guard = self.as_ref().free_inodes.lock().await;
         if guard.next >= guard.maxid {
             let v = self.incr_counter("nextInode", INODE_BATCH).await?;
@@ -501,6 +538,13 @@ where
             guard.next += 1;
         }
         Ok(n)
+    }
+
+    async fn reslove_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
+        let entries = self.do_readdir(parent, 0, -1).await?;
+        Ok(entries
+            .map(|ens| ens.into_iter().find(|e| e.name.eq_ignore_ascii_case(&name)))
+            .flatten())
     }
 }
 
@@ -531,7 +575,7 @@ where
 
     // Reset cleans up all metadata, VERY DANGEROUS!
     async fn reset(&self) -> Result<()> {
-        todo!()
+        self.do_reset().await
     }
 
     // Load loads the existing setting of a formatted volume from meta service.
@@ -673,7 +717,27 @@ where
 
     // Access checks the access permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()> {
-        todo!()
+        // dont check acl if mask is 0
+        if attr.access_acl != acl::NONE && (attr.mode & 0o070) != 0 {
+            let rule = self
+                .do_get_facl(inode, AclType::Access, attr.access_acl)
+                .await?;
+            if rule.can_access(uid(), gids(), attr.uid, attr.gid, mode_mask) {
+                return Ok(());
+            }
+            return SysSnafu { code: libc::EACCES }.fail();
+        }
+
+        let mode = access_mode(attr, uid(), gids());
+        if mode & mode_mask != mode_mask {
+            debug!(
+                "Access inode {} {:o}, mode {:o}, request mode {:o}",
+                inode, attr.mode, mode, mode_mask
+            );
+            SysSnafu { code: libc::EACCES }.fail()
+        } else {
+            Ok(())
+        }
     }
 
     // Lookup returns the inode and attributes for the given entry in a directory.
@@ -784,7 +848,6 @@ where
         let (space, inodes) = (align_4k(0), 1);
         self.check_quota(space, inodes, [parent].into()).await?;
 
-        let ino = self.next_inode().await?;
         let mut attr = Attr::default();
         match r#type {
             INodeType::TypeDirectory => {
@@ -806,14 +869,15 @@ where
         attr.gid = gid();
         attr.parent = parent;
         attr.full = true;
+        let ino = self.next_inode().await?;
         match self
-            .do_mknod(parent, &name, r#type as u8, mode, cumask, &path)
+            .do_mknod(parent, &name, r#type, mode, cumask, &path, ino, attr)
             .await
         {
-            Ok(()) => {
+            Ok(attr) => {
                 self.update_stats(space, inodes).await;
                 self.update_dir_stats(parent, 0, space, inodes);
-                self.update_dir_quota(parent, space, inodes).await;
+                self.update_dir_quota(parent, space, inodes).await?;
                 Ok((ino, attr))
             }
             Err(e) => Err(e),
