@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::base::{
-    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, MetaState, TrashFileScan,
+    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan,
     TrashSliceScan,
 };
 use crate::config::{Config, Format};
@@ -29,12 +29,32 @@ pub const TRASH_NAME: &str = ".Trash";
 // ChunkSize is size of a chunk
 pub const CHUNK_SIZE: u64 = 1 << 26; // ChunkSize is size of a chunk, default 64M
 pub const MAX_VERSION: i32 = 1; // MaxVersion is the max of supported versions.
+pub const MAX_FILE_NAME_LEN: usize = 255; // MaxNameLen is the max length of a name.
 
 pub type Ino = u64;
 
-// TODO: encapsulated code into Ino struct
-pub fn is_trash(ino: Ino) -> bool {
-    ino >= TRASH_INODE
+pub trait InoExt {
+    fn is_trash(&self) -> bool;
+    fn is_root(&self) -> bool;
+    fn transfer_root(&self, real_root: Ino) -> Ino;
+}
+
+impl InoExt for Ino {
+    fn is_trash(&self) -> bool {
+        *self >= TRASH_INODE
+    }
+
+    fn is_root(&self) -> bool {
+        *self == ROOT_INODE
+    }
+    
+    fn transfer_root(&self, real_root: Ino) -> Ino {
+        match *self {
+            0 => ROOT_INODE,  // force using Root inode
+            ROOT_INODE => real_root,
+            _ => *self,   
+        }
+    }
 }
 
 // TODO: encapsulated uid, gid
@@ -71,7 +91,7 @@ pub struct Entry {
 
 // Slice is a slice of a chunk.
 // Multiple slices could be combined together as a chunk.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 pub struct Slice {
     pub id: u64,
     pub size: u32,
@@ -142,6 +162,7 @@ bitflags! {
         // TODO: 特殊权限，文件类型
     }
 
+    #[derive(Default, Serialize, Deserialize)]
     pub struct Flag: u8 {
         const IMMUTABLE  = 0b001;
         const APPEND     = 0b010;
@@ -151,7 +172,7 @@ bitflags! {
 // Attr represents attributes of a node.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Attr {
-    pub flags: u8,        // flags
+    pub flags: Flag,        // flags
     pub typ: INodeType,   // type of a node
     pub mode: u16,        // permission mode
     pub uid: u32,         // owner id
@@ -320,13 +341,12 @@ pub trait Meta: Send + Sync + 'static {
 
     // Truncate changes the length for given file.
     async fn truncate(
-        &self,
+        self: Arc<Self>,
         inode: Ino,
         flags: u8,
         attr_length: u64,
-        attr: &Attr,
         skip_perm_check: bool,
-    ) -> Result<()>;
+    ) -> Result<Attr>;
 
     // Fallocate preallocate given space for given file.
     async fn fallocate(
@@ -375,10 +395,10 @@ pub trait Meta: Send + Sync + 'static {
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
-    async fn unlink(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()>;
+    async fn unlink(self: Arc<Self>, parent: Ino, name: &str, skip_check_trash: bool) -> Result<()>;
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()>;
+    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: &[bool]) -> Result<()>;
 
     // Rename move an entry from a source directory to another with given name.
     // The targeted entry will be overwrited if it's a file or empty directory.
@@ -395,6 +415,8 @@ pub trait Meta: Send + Sync + 'static {
     ) -> Result<()>;
 
     // Link creates an entry for node.
+    // inode_src: source inode
+    // parent + name: dst inode, parent is dst inode's parent inode, name is the link name
     async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()>;
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
@@ -420,10 +442,10 @@ pub trait Meta: Send + Sync + 'static {
     async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()>;
 
     // NewSlice returns an id for new slice.
-    async fn new_slice(&self, id: &u64) -> Result<()>;
+    async fn new_slice(&self) -> Result<u64>;
 
     // Write put a slice of data on top of the given chunk.
-    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: &Slice, mtime: u64)
+    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: Slice, mtime: SystemTime)
         -> Result<()>;
 
     // InvalidateChunkCache invalidate chunk cache
@@ -501,10 +523,9 @@ pub trait Meta: Send + Sync + 'static {
     // ListSlices returns all slices used by all files.
     async fn list_slices(
         &self,
-        slices: &HashMap<Ino, Vec<Slice>>,
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
-    ) -> Result<()>;
+    ) -> Result<HashMap<Ino, Vec<Slice>>>;
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
@@ -546,7 +567,7 @@ pub trait Meta: Send + Sync + 'static {
 }
 
 // NewClient creates a Meta client for given uri.
-pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
+pub async fn new_client(uri: String, conf: Config) -> Box<Arc<dyn Meta>> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
@@ -556,7 +577,7 @@ pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
-    let res: Result<Box<dyn Meta>> = match driver {
+    let res: Result<Box<Arc<dyn Meta> >> = match driver {
         "redis" => {
             RedisEngine::new(driver, addr, conf).await
         }

@@ -1,21 +1,23 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::Utc;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::time::SystemTime;
 use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, TryAcquireError};
 use tracing::{debug, info, warn};
 
 use crate::acl::{self, AclCache, AclType, Rule};
 use crate::api::{
-    gid, gids, is_trash, uid, Attr, Entry, INodeType, Ino, Meta, ModeMask, Session, SessionInfo,
-    Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_NAME,
+    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo,
+    Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
@@ -28,6 +30,12 @@ pub const SLICE_ID_BATCH: i64 = 1 << 10;
 pub const N_LOCK: usize = 1 << 10;
 pub const CHANNEL_BUFFER: usize = 1024;
 const SEGMENT_LOCK: Mutex<()> = Mutex::new(());
+
+pub const NEXT_INODE: &str = "nextinode";
+pub const NEXT_CHUNK: &str = "nextchunk";
+pub const NEXT_SESSION: &str = "nextsession";
+pub const NEXT_TRASH: &str = "nexttrash";
+
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
 // (id, size) -> clean
@@ -96,7 +104,7 @@ pub trait Engine {
     async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
     async fn do_load(&self) -> Result<Option<Format>>;
-    async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()>;
+    async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
     async fn do_refresh_session(&self) -> Result<()>;
 
     /// find stale session
@@ -139,12 +147,11 @@ pub trait Engine {
         sugidclearmode: u8,
         attr: &Attr,
     ) -> Result<()>;
-    async fn do_lookup(&self, parent: Ino, name: &str, inode: &Ino, attr: &Attr) -> Result<()>;
+    async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)>;
     async fn do_mknod(
         &self,
         parent: Ino,
         name: &str,
-        ino_type: INodeType,
         mode: u16,
         cumask: u16,
         path: &str,
@@ -153,18 +160,17 @@ pub trait Engine {
     ) -> Result<Attr>;
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
     async fn do_unlink(
-        &self,
+        self: Arc<Self>,
         parent: Ino,
         name: &str,
-        attr: &Attr,
         skip_check_trash: bool,
-    ) -> Result<()>;
+    ) -> Result<Attr>;
     async fn do_rmdir(
         &self,
         parent: Ino,
         name: &str,
         inode: &Ino,
-        skip_check_trash: bool,
+        skip_check_trash: &[bool],
     ) -> Result<()>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
     async fn do_readdir(&self, inode: Ino, plus: u8, limit: i32) -> Result<Option<Vec<Entry>>>;
@@ -202,10 +208,8 @@ pub trait Engine {
         inode: Ino,
         flags: u8,
         length: u64,
-        delta: &mut DirStat,
-        attr: &mut Attr,
         skip_perm_check: bool,
-    ) -> Result<()>;
+    ) -> Result<(Attr, DirStat)>;
 
     async fn do_fallocate(
         &self,
@@ -251,59 +255,43 @@ pub trait Engine {
 pub trait MetaOtherFunction {
     async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
     async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool;
-    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64) -> Result<()>;
+    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64);
     async fn load_dir_quotas(&self) -> Result<()>;
 
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
+    async fn update_parent_stats(self: Arc<Self>, inode: Ino, parent: Ino, length: i64, space: i64);
     async fn next_inode(&self) -> Result<Ino>;
-    async fn reslove_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
-}
+    async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
 
-pub struct MetaState {
-    pub conf: Config,
-    pub fmt: RwLock<Arc<Format>>,
-    pub current_sid: AtomicU64,
-    pub open_files: Arc<OpenFiles>,
-    pub fs_stat: FsStat,
-    // TODO: encapsulation it into Segmented Lock
-    // Pessimistic locks to reduce conflicts
-    pub txn_locks: [Mutex<()>; N_LOCK],
-    pub canceled: AtomicBool,
-}
+    /// Add a temporary folder to keep removed files for a certain time
+    /// If rm, unlink, rm dir.e.g happens, they can be moved to `.trash` dir to keep some times.
+    ///
+    /// Returns the new trash inode if this ino should be moved to trash
+    async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>>;
 
-impl MetaState {
-    pub fn new(conf: Config) -> Self {
-        let current_sid = AtomicU64::new(conf.sid);
-        let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
-        Self {
-            conf,
-            fmt: RwLock::new(Arc::new(Format::default())),
-            current_sid,
-            open_files,
-            fs_stat: FsStat {
-                new_space: AtomicI64::new(0),
-                new_inodes: AtomicI64::new(0),
-                used_space: AtomicI64::new(0),
-                used_inodes: AtomicI64::new(0),
-            },
-            txn_locks: [SEGMENT_LOCK; N_LOCK],
-            canceled: AtomicBool::new(false),
-        }
-    }
+    /// Immediately spawn a task to delete task
+    /// force: wait unitl delete task has free handler
+    /// delete_on_close: delete file when close
+    async fn try_spawn_delete_file(
+        self: Arc<Self>,
+        inode: Ino,
+        length: u64,
+        force: bool,
+        delete_on_close: bool,
+    );
 }
 
 pub struct CommonMeta {
     pub addr: String,
     pub root: Ino,
-    pub sub_trash: Option<InternalNode>,
-    pub removed_files: HashMap<Ino, bool>,
+    pub sub_trash: Mutex<Option<InternalNode>>,
+    pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
-    pub max_deleting: Sender<()>,
-    pub dslices: Sender<Slice>, // slices to delete
+    pub max_deleting: Arc<Semaphore>,
+    pub dslices: (Sender<Slice>, Receiver<Slice>), // slices to delete
     pub symlinks: HashMap<Ino, String>,
     pub umounting: bool,
-    pub ses_mu: Mutex<()>,
     pub acl_cache: AsyncMutex<AclCache>,
     pub dir_stats_lock: Mutex<HashMap<Ino, DirStat>>,
     pub fs_stat: FsStat,
@@ -313,7 +301,9 @@ pub struct CommonMeta {
     pub free_slices: AsyncMutex<FreeID>,
     pub conf: Config,
     pub fmt: RwLock<Arc<Format>>,
-    pub current_sid: AtomicU64,
+    // session id
+    pub sid: Option<AtomicU64>,
+    pub ses_mu: Mutex<()>,
     pub open_files: Arc<OpenFiles>,
     // TODO: encapsulation it into Segmented Lock
     // Pessimistic locks to reduce conflicts
@@ -323,15 +313,15 @@ pub struct CommonMeta {
 
 impl CommonMeta {
     pub fn new(addr: &str, conf: Config) -> Self {
-        let (max_deleting, receiver) = channel();
-        let (dslices, receiver) = channel::<Slice>();
-        let current_sid = AtomicU64::new(conf.sid);
+        let max_deleting = Arc::new(Semaphore::new(conf.max_deletes_task as usize));
+        let dslices = channel::<Slice>(conf.max_deletes_threads as usize * 10240);
+        let sid = conf.sid.map(AtomicU64::new);
         let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
             addr: addr.to_string(),
             root: ROOT_INODE,
-            sub_trash: None,
-            removed_files: HashMap::new(),
+            sub_trash: Mutex::new(None),
+            removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
             max_deleting,
             dslices,
@@ -347,7 +337,7 @@ impl CommonMeta {
             free_slices: AsyncMutex::new(FreeID::default()),
             conf,
             fmt: RwLock::new(Arc::new(Format::default())),
-            current_sid,
+            sid,
             open_files,
             txn_locks: [SEGMENT_LOCK; N_LOCK],
             canceled: AtomicBool::new(false),
@@ -499,9 +489,59 @@ where
         stats.inodes += inodes;
     }
 
-    async fn update_dir_quota(&self, mut inode: Ino, space: i64, inodes: i64) -> Result<()> {
+    async fn update_parent_stats(
+        self: Arc<Self>,
+        inode: Ino,
+        parent: Ino,
+        length: i64,
+        space: i64,
+    ) {
+        if length == 0 && space == 0 {
+            return;
+        }
+        self.update_stats(space, 0).await;
         if !self.get_format().enable_dir_stats {
-            return Ok(());
+            return;
+        }
+
+        if parent > 0 {
+            self.update_dir_stats(parent, length, space, 0);
+            self.update_dir_quota(parent, space, 0).await;
+        } else {
+            // spawn a task to shorten the time of updating parent stats
+            tokio::spawn(async move {
+                for (parent, _) in self.get_parents(inode).await {
+                    self.update_dir_stats(parent, length, space, 0);
+                    self.update_dir_quota(parent, space, 0).await;
+                }
+            });
+        }
+
+        /*
+            if length == 0 && space == 0 {
+            return
+        }
+        m.en.updateStats(space, 0)
+        if !m.getFormat().DirStats {
+            return
+        }
+        if parent > 0 {
+            m.updateDirStat(ctx, parent, length, space, 0)
+            m.updateDirQuota(ctx, parent, space, 0)
+        } else {
+            go func() {
+                for p := range m.en.doGetParents(ctx, inode) {
+                    m.updateDirStat(ctx, p, length, space, 0)
+                    m.updateDirQuota(ctx, p, space, 0)
+                }
+            }()
+        }
+             */
+    }
+
+    async fn update_dir_quota(&self, mut inode: Ino, space: i64, inodes: i64) {
+        if !self.get_format().enable_dir_stats {
+            return;
         }
 
         // recursively update the quota of the parent node until the root node is encountered
@@ -516,11 +556,14 @@ where
             if inode <= ROOT_INODE {
                 break;
             }
-            inode = self.get_dir_parent(inode).await.inspect_err(|err| {
-                warn!("Get directory parent of inode {} err: {}", inode, err);
-            })?;
+            inode = match self.get_dir_parent(inode).await {
+                Ok(parent) => parent,
+                Err(err) => {
+                    warn!("Get directory parent of inode {} err: {}", inode, err);
+                    break;
+                }
+            };
         }
-        Ok(())
     }
 
     async fn next_inode(&self) -> Result<Ino> {
@@ -540,11 +583,110 @@ where
         Ok(n)
     }
 
-    async fn reslove_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
+    async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
         let entries = self.do_readdir(parent, 0, -1).await?;
         Ok(entries
             .map(|ens| ens.into_iter().find(|e| e.name.eq_ignore_ascii_case(&name)))
             .flatten())
+    }
+
+    async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>> {
+        let trash_enable = {
+            if parent.is_trash() {
+                false
+            } else {
+                self.as_ref().get_format().trash_days > 0
+            }
+        };
+
+        if !trash_enable {
+            return Ok(None);
+        }
+        let name = Utc::now().format("%Y-%m-%d-%H").to_string();
+        {
+            let sub_trash = self.as_ref().sub_trash.lock();
+            if let Some(trash) = &*sub_trash
+                && trash.name == name
+            {
+                return Ok(Some(trash.inode));
+            }
+        }
+
+        let mut trash = None;
+        // all trash file in one trash directory: `%Y-%m-%d-%H`
+        // find trash name in trash root first, if this trash dir does not exist, create it.
+        let lookup_res = match self.do_lookup(TRASH_INODE, &name).await {
+            Err(MyError::SysError { code }) if code == libc::ENOENT => {
+                let next = self.incr_counter(NEXT_TRASH, 1).await?;
+                trash.insert(TRASH_INODE + next as u64);
+                self.do_mknod(
+                    TRASH_INODE,
+                    &name,
+                    0555,
+                    0,
+                    "",
+                    trash.unwrap(),
+                    Attr {
+                        typ: INodeType::TypeDirectory,
+                        nlink: 2,
+                        length: 4 << 10,
+                        parent: TRASH_INODE,
+                        full: true,
+                        ..Attr::default()
+                    },
+                )
+                .await
+            }
+            Err(e) => Err(e),
+            Ok((_, attr)) => Ok(attr),
+        };
+        match lookup_res {
+            Err(e @ MyError::SysError { code }) if code != libc::EEXIST => {
+                warn!("create subTrash {} failed {}", name, e);
+                Err(e)
+            }
+            _ if trash.is_some_and(|trash_ino| trash_ino <= TRASH_INODE) => {
+                warn!("invalid trash inode: {:?}", trash);
+                Err(MyError::SysError { code: libc::EBADF }.into())
+            }
+            _ => Ok(trash.inspect(|trash| {
+                let mut sub_trash = self.as_ref().sub_trash.lock();
+                sub_trash.replace(InternalNode {
+                    inode: *trash,
+                    name,
+                });
+            })),
+        }
+    }
+
+    async fn try_spawn_delete_file(
+        self: Arc<Self>,
+        inode: Ino,
+        length: u64,
+        force: bool,
+        delete_on_close: bool,
+    ) {
+        let base = self.as_ref().as_ref();
+        if delete_on_close {
+            let mut remove_files = base.removed_files.lock();
+            remove_files.insert(inode, true);
+        } else {
+            let meta = self.clone();
+            let max_deleting = base.max_deleting.clone();
+            tokio::spawn(async move {
+                let permit = match force {
+                    // TODO: 这里如果拿不到被关闭了，是不是要处理下
+                    true => Some(max_deleting.acquire().await.unwrap()),
+                    false => max_deleting.try_acquire().inspect_err(|err| {
+                        warn!("try acquire delete inode({}) permit failed: {}", inode, err);
+                    }).ok(),
+                };
+                if let Some(permit) = permit {
+                    meta.do_delete_file_data(inode, length).await;
+                    drop(permit);
+                }
+            });
+        }
     }
 }
 
@@ -781,14 +923,22 @@ where
 
     // Truncate changes the length for given file.
     async fn truncate(
-        &self,
+        self: Arc<Self>,
         inode: Ino,
         flags: u8,
         attr_length: u64,
-        attr: &Attr,
         skip_perm_check: bool,
-    ) -> Result<()> {
-        todo!()
+    ) -> Result<Attr> {
+        if let Some(file) = self.as_ref().as_ref().open_files.find(inode) {
+            let _ = file.lock().await;
+        }
+
+        let (attr, dir_stat) = self
+            .do_truncate(inode, flags, attr_length, skip_perm_check)
+            .await?;
+        self.update_parent_stats(inode, attr.parent, dir_stat.length, dir_stat.space)
+            .await;
+        Ok(attr)
     }
 
     // Fallocate preallocate given space for given file.
@@ -831,7 +981,7 @@ where
         rdev: u32,
         path: String,
     ) -> Result<(Ino, Attr)> {
-        if is_trash(parent) {
+        if parent.is_trash() {
             return SysSnafu { code: libc::EPERM }.fail();
         }
         if parent == ROOT_INODE && name == TRASH_NAME {
@@ -871,13 +1021,13 @@ where
         attr.full = true;
         let ino = self.next_inode().await?;
         match self
-            .do_mknod(parent, &name, r#type, mode, cumask, &path, ino, attr)
+            .do_mknod(parent, &name, mode, cumask, &path, ino, attr)
             .await
         {
             Ok(attr) => {
                 self.update_stats(space, inodes).await;
                 self.update_dir_stats(parent, 0, space, inodes);
-                self.update_dir_quota(parent, space, inodes).await?;
+                self.update_dir_quota(parent, space, inodes).await;
                 Ok((ino, attr))
             }
             Err(e) => Err(e),
@@ -898,12 +1048,39 @@ where
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
-    async fn unlink(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()> {
-        todo!()
+    async fn unlink(
+        self: Arc<Self>,
+        parent: Ino,
+        name: &str,
+        skip_check_trash: bool,
+    ) -> Result<()> {
+        if (parent == ROOT_INODE && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
+            return SysSnafu { code: libc::EPERM }.fail();
+        }
+
+        let base = self.as_ref().as_ref();
+        if base.conf.read_only {
+            return SysSnafu { code: libc::EROFS }.fail();
+        }
+
+        let parent = parent.transfer_root(base.root);
+        let attr = self
+            .clone()
+            .do_unlink(parent, name, skip_check_trash)
+            .await?;
+        let diff_length = if attr.typ == INodeType::TypeFile {
+            attr.length
+        } else {
+            0
+        };
+        self.update_dir_stats(parent, -(diff_length as i64), -(align_4k(diff_length)), -1);
+        self.update_dir_quota(parent, -(align_4k(diff_length)), -1)
+            .await;
+        Ok(())
     }
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: bool) -> Result<()> {
+    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: &[bool]) -> Result<()> {
         todo!()
     }
 
@@ -984,8 +1161,16 @@ where
     }
 
     // NewSlice returns an id for new slice.
-    async fn new_slice(&self, id: &u64) -> Result<()> {
-        todo!()
+    async fn new_slice(&self) -> Result<u64> {
+        let mut slices = self.as_ref().free_slices.lock().await;
+        if slices.next >= slices.maxid {
+            let v = self.incr_counter("nextChunk", SLICE_ID_BATCH).await?;
+            slices.next = (v - SLICE_ID_BATCH) as u64;
+            slices.maxid = v as u64;
+        }
+        let next = slices.next;
+        slices.next += 1;
+        Ok(next)
     }
 
     // Write put a slice of data on top of the given chunk.
@@ -994,8 +1179,8 @@ where
         inode: Ino,
         indx: u32,
         off: u32,
-        slice: &Slice,
-        mtime: u64,
+        slice: Slice,
+        mtime: SystemTime,
     ) -> Result<()> {
         todo!()
     }
@@ -1101,10 +1286,9 @@ where
     // ListSlices returns all slices used by all files.
     async fn list_slices(
         &self,
-        slices: &HashMap<Ino, Vec<Slice>>,
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
-    ) -> Result<()> {
+    ) -> Result<HashMap<Ino, Vec<Slice>>> {
         todo!()
     }
 

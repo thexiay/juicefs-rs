@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ModeMask;

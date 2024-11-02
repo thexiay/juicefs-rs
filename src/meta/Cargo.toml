@@ -30,6 +30,7 @@ futures = { workspace = true }
 deadpool = { workspace = true }
 deadpool-redis = { workspace = true }
 crc32fast = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

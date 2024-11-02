@@ -56,7 +56,14 @@ pub enum MyError {
     #[snafu(display("unknown driver: {driver}"))]
     DriverError {
         driver: String,
-    }
+    },
+    #[snafu(display("ino cann't found in db: {ino}"))]
+    NotFoundInoError {
+        ino: Ino,
+    },
+    #[snafu(display("message queue closed"))]
+    SemaphoraCloseError,
+    
     
 }
 

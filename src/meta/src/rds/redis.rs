@@ -10,27 +10,30 @@ use redis::{
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
+use tokio::sync::mpsc::Sender;
 use std::hash::{DefaultHasher, Hasher};
 use std::ops::DerefMut;
 use std::result::Result as StdResult;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use tokio::time::{self, sleep, Instant};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclId, AclType, Rule};
 use crate::api::{
-    gids, Attr, Entry, Flag, INodeType, Ino, Meta, ModeMask, Session, Slice, Slices, CHUNK_SIZE, ROOT_INODE, TRASH_INODE
+    gids, uid, Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, Session, Slice, Slices,
+    CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
-    Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, MetaState, PendingFileScan,
-    PendingSliceScan, TrashSliceScan, N_LOCK,
+    Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
+    TrashSliceScan, NEXT_CHUNK, NEXT_INODE, N_LOCK,
 };
 use crate::config::{Config, Format};
 use crate::error::{
-    ConnectionSnafu, EmptyKeySnafu, FileExistSnafu, MyError, RedisDetailSnafu, Result, SysSnafu,
+    ConnectionSnafu, EmptyKeySnafu, FileExistSnafu, MyError, NotFoundInoSnafu, RedisDetailSnafu,
+    Result, SysSnafu,
 };
+use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::Quota;
 use crate::utils;
 use std::collections::HashMap;
@@ -129,7 +132,10 @@ return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
 /**
  * conn: ConnectionLike
  * key:
- * body: Fn() -> Option<T>
+ * body: Fn() -> Result<Option<T>>,
+ *       Ok(Some(T)) => exec ok
+ *       Ok(None) => exec faile, but can retry to exec
+ *       Err(e) => exec faile, can't retry to exec
  */
 macro_rules! async_transaction {
     ($conn:expr, $keys:expr, $body:expr) => {
@@ -343,6 +349,18 @@ impl RedisEngine {
         format!("{}acl", self.prefix)
     }
 
+    fn trash_entry(&self, parent: Ino, ino: Ino, name: &str) -> String {
+        let mut s = format!("{}-{}-{}", parent, ino, name);
+        if s.len() > MAX_FILE_NAME_LEN {
+            s = s[..MAX_FILE_NAME_LEN].to_string();
+            warn!(
+                "File name is too long as a trash entry, truncating it: {} -> {}",
+                name, s
+            );
+        }
+        s
+    }
+
     fn expire_time(&self) -> u64 {
         (SystemTime::now() + self.meta.conf.heartbeat * 5)
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -357,7 +375,7 @@ impl RedisEngine {
 impl RedisEngine {
     /// redis URL:
     /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
-    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
+    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<Arc<dyn Meta>>> {
         let url = format!("{}://{}", driver, addr);
         let conn_info = url.into_connection_info()?;
         let prefix = conn_info.redis.db.to_string();
@@ -377,7 +395,7 @@ impl RedisEngine {
         };
 
         engine.check_server_config().await?;
-        Ok(Box::new(engine))
+        Ok(Box::new(Arc::new(engine)))
     }
 
     async fn check_server_config(&self) -> Result<()> {
@@ -709,7 +727,7 @@ impl Engine for RedisEngine {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let name_lower = name.to_lowercase();
-        if name_lower.eq("nextinode") || name.eq("nextchunk") {
+        if name_lower.eq(NEXT_INODE) || name.eq(NEXT_CHUNK) {
             let key = format!("{}{}", self.prefix, name.to_lowercase());
             let v: i64 = conn.incr(key, value).await?;
             Ok(v + 1)
@@ -752,10 +770,9 @@ impl Engine for RedisEngine {
         }
     }
 
-    async fn do_new_session(self: Arc<Self>, sinfo: &[u8], update: bool) -> Result<()> {
+    async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        let sid = self.meta.current_sid.load(Ordering::SeqCst).to_string();
         conn.zadd(self.all_sessions(), &sid, self.expire_time())
             .await
             .context(RedisDetailSnafu {
@@ -793,7 +810,13 @@ impl Engine for RedisEngine {
     async fn do_refresh_session(&self) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        let ssid = self.meta.current_sid.load(Ordering::SeqCst);
+        let ssid = match self.meta.sid {
+            Some(ref sid) => sid.load(Ordering::SeqCst),
+            None => {
+                error!("new session has not been called");
+                return Ok(())
+            },
+        };
         // we have to check sessionInfo here because the operations are not within a transaction
         match conn.hexists(self.session_infos(), &ssid).await {
             Ok(false) => {
@@ -964,8 +987,9 @@ impl Engine for RedisEngine {
             }
             Ok(())
         } else {
-            let _: () =  redis::cmd("FLUSHDB")
-                .query_async(&mut self.share_conn()).await?;
+            let _: () = redis::cmd("FLUSHDB")
+                .query_async(&mut self.share_conn())
+                .await?;
             Ok(())
         }
     }
@@ -1005,6 +1029,7 @@ impl Engine for RedisEngine {
                         .parse::<u32>()
                         .expect("error parse");
                     ch.send(Cchunk::new(inode, indx, cnt as isize))
+                        .await
                         .map_err(|_| MyError::SendError)?;
                 }
                 _ => error!("No way to happen for chunk key: {}", key),
@@ -1150,7 +1175,7 @@ impl Engine for RedisEngine {
         unimplemented!()
     }
 
-    async fn do_lookup(&self, parent: Ino, name: &str, inode: &Ino, attr: &Attr) -> Result<()> {
+    async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)> {
         unimplemented!()
     }
 
@@ -1158,12 +1183,11 @@ impl Engine for RedisEngine {
         &self,
         parent: Ino,
         name: &str,
-        ino_type: INodeType,
         mut mode: u16,
         cumask: u16,
         path: &str,
         inode: Ino,
-        attr: Attr,
+        mut attr: Attr,
     ) -> Result<Attr> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
@@ -1187,12 +1211,11 @@ impl Engine for RedisEngine {
                 .into());
             }
             self.access(parent, ModeMask::WRITE, &pattr).await?;
-            if !(Flag::IMMUTABLE & Flag::from_bits_truncate(pattr.flags)).is_empty() {
+            if !(Flag::IMMUTABLE & pattr.flags).is_empty() {
                 return SysSnafu { code: libc::EPERM }.fail();
             }
 
             // check exists
-            let mut new_attr = attr.clone();
             let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
             let found_ino = match buf {
                 Some(buf) => {
@@ -1200,36 +1223,34 @@ impl Engine for RedisEngine {
                     Some((ino_type, ino))
                 }
                 None if self.meta.conf.case_insensi => self
-                    .reslove_case(parent, name)
+                    .resolve_case(parent, name)
                     .await?
                     .map(|entry| (entry.attr.typ, entry.inode)),
                 None => None,
             };
             if let Some((found_type, found_ino)) = found_ino {
-                match found_type {
+                let found_attr = match found_type {
                     // file for create, directory for subTrash
                     INodeType::TypeFile | INodeType::TypeDirectory => {
-                        let attr_bytes: Option<Vec<u8>> =
+                        let exists_attr_bytes: Option<Vec<u8>> =
                             conn.get(self.inode_key(found_ino)).await?;
-                        match attr_bytes {
-                            Some(attr_bytes) => {
-                                new_attr = bincode::deserialize(&attr_bytes)?;
-                            }
+                        match exists_attr_bytes {
+                            Some(attr_bytes) => bincode::deserialize(&attr_bytes)?,
                             None => {
                                 // cirrupt entry
-                                new_attr = Attr {
+                                Attr {
                                     typ: found_type,
                                     parent: parent,
                                     ..Default::default()
-                                };
+                                }
                             }
                         }
                     }
-                    _ => (),
-                }
+                    _ => attr.clone(),
+                };
                 return FileExistSnafu {
                     ino: found_ino,
-                    attr: new_attr,
+                    attr: found_attr,
                 }
                 .fail();
             };
@@ -1237,9 +1258,9 @@ impl Engine for RedisEngine {
             // acl mode search
             mode &= 0o7777;
             let mut pipe = pipe();
-            if pattr.default_acl != acl::NONE && ino_type != INodeType::TypeSymlink {
+            if pattr.default_acl != acl::NONE && attr.typ != INodeType::TypeSymlink {
                 // inherit default acl
-                if ino_type == INodeType::TypeDirectory {
+                if attr.typ == INodeType::TypeDirectory {
                     pattr.default_acl = pattr.default_acl;
                 }
 
@@ -1265,7 +1286,7 @@ impl Engine for RedisEngine {
                 .as_nanos();
             let mut update_parent = false;
             if parent != TRASH_INODE {
-                if ino_type == INodeType::TypeDirectory {
+                if attr.typ == INodeType::TypeDirectory {
                     pattr.nlink += 1;
                     update_parent = true;
                 }
@@ -1275,16 +1296,16 @@ impl Engine for RedisEngine {
                     update_parent = true;
                 }
             }
-            new_attr.atime = now;
-            new_attr.mtime = now;
-            new_attr.ctime = now;
+            attr.atime = now;
+            attr.mtime = now;
+            attr.ctime = now;
 
             // different os adapt
             if cfg!(target_os = "macos") {
                 pattr.gid = pattr.gid;
             } else if cfg!(target_os = "linux") && pattr.mode & 0o2000 != 0 {
                 pattr.gid = pattr.gid;
-                if ino_type == INodeType::TypeDirectory {
+                if attr.typ == INodeType::TypeDirectory {
                     pattr.mode |= 0o2000;
                 } else if pattr.mode & 0o2010 == 0o2010 && 0 != 0 {
                     if let None = gids().iter().find(|gid| **gid == pattr.gid) {
@@ -1298,16 +1319,16 @@ impl Engine for RedisEngine {
             pipe.hset(
                 self.dir_key(parent),
                 name,
-                bincode::serialize(&(&ino_type, inode))?,
+                bincode::serialize(&(&attr.typ, inode))?,
             );
             if update_parent {
                 pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
             }
             pipe.set(self.inode_key(inode), bincode::serialize(&attr)?);
-            if ino_type == INodeType::TypeSymlink {
+            if attr.typ == INodeType::TypeSymlink {
                 pipe.set(self.sym_key(inode), path);
             }
-            if ino_type == INodeType::TypeDirectory {
+            if attr.typ == INodeType::TypeDirectory {
                 pipe.hset(self.dir_used_inodes_key(), inode, "0");
                 pipe.hset(self.dir_data_length_key(), inode, "0");
                 pipe.hset(self.dir_used_space_key(), inode, "0");
@@ -1315,7 +1336,7 @@ impl Engine for RedisEngine {
             pipe.incr(self.used_space_key(), utils::align_4k(0));
             pipe.incr(self.total_inodes_key(), 1);
             pipe.query_async(conn).await?;
-            Ok(Some(new_attr))
+            Ok(Some(attr.clone()))
         })
     }
 
@@ -1324,13 +1345,235 @@ impl Engine for RedisEngine {
     }
 
     async fn do_unlink(
-        &self,
+        self: Arc<Self>,
         parent: Ino,
         name: &str,
-        attr: &Attr,
         skip_check_trash: bool,
-    ) -> Result<()> {
-        unimplemented!()
+    ) -> Result<Attr> {
+        let mut trash = if !skip_check_trash {
+            self.check_trash(parent).await?
+        } else {
+            None
+        };
+        info!("do unlink trash: {:?}", trash);
+        let base_meta = self.as_ref().as_ref();
+        if let Some(trash_ino) = trash {
+            base_meta
+                .open_files
+                .invalid(trash_ino, INVALIDATE_ATTR_ONLY)
+                .await;
+        }
+
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        let (space_guage, ino_cnt_guage, should_del, open_session_id, ino, attr) =
+            async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
+                let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+                let (buf, name) = match buf {
+                    Some(entry) => (entry, name.to_owned()),
+                    None if base_meta.conf.case_insensi => {
+                        if let Some(entry) = self.resolve_case(parent, name).await? {
+                            (
+                                bincode::serialize(&(entry.attr.typ, entry.inode)).unwrap(),
+                                entry.name.to_string(),
+                            )
+                        } else {
+                            return NotFoundInoSnafu { ino: parent }.fail();
+                        }
+                    }
+                    None => return NotFoundInoSnafu { ino: parent }.fail(),
+                };
+
+                let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
+                if typ == INodeType::TypeDirectory {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+
+                // first find ino by parent ino and son name, then watch it
+                cmd("WATCH")
+                    .arg(self.inode_key(ino))
+                    .query_async(conn)
+                    .await?;
+                let (pattr_bytes, attr_bytes): (Vec<u8>, Option<Vec<u8>>) = conn
+                    .mget((self.inode_key(ino), self.inode_key(parent)))
+                    .await?;
+                let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
+                // double check: parent mut be a dir
+                if pattr.typ != INodeType::TypeDirectory {
+                    return SysSnafu {
+                        code: libc::ENOTDIR,
+                    }
+                    .fail();
+                }
+                self.access(parent, ModeMask::WRITE | ModeMask::EXECUTE, &pattr)
+                    .await?;
+                if pattr.flags.contains(Flag::APPEND) || pattr.flags.contains(Flag::IMMUTABLE) {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+
+                // change time
+                let mut update_parent = false;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_nanos();
+                if !parent.is_trash()
+                    && now - pattr.mtime >= self.meta.conf.skip_dir_mtime.as_nanos()
+                {
+                    pattr.mtime = now;
+                    pattr.ctime = now;
+                    update_parent = true;
+                }
+
+                let (mut should_del, mut open_session_id) = (false, None); // only check when consider del ino
+                let attr = match attr_bytes {
+                    Some(attr_bytes) => {
+                        let mut attr = bincode::deserialize::<Attr>(&attr_bytes)?;
+                        let uid = uid();
+                        if uid != 0
+                            && pattr.mode & 0o1000 != 0
+                            && uid != pattr.uid
+                            && uid != attr.uid
+                        {
+                            return SysSnafu { code: libc::EACCES }.fail();
+                        }
+                        if attr.flags.contains(Flag::APPEND) || attr.flags.contains(Flag::IMMUTABLE)
+                        {
+                            return SysSnafu { code: libc::EPERM }.fail();
+                        }
+                        // check if trash ino and name already exists, don't repeat generate
+                        if let Some(trash_ino) = trash
+                            && attr.nlink > 1
+                        {
+                            if conn
+                                .hexists(
+                                    self.dir_key(trash_ino),
+                                    self.trash_entry(parent, ino, &name),
+                                )
+                                .await?
+                            {
+                                trash.take();
+                                base_meta
+                                    .open_files
+                                    .invalid(trash_ino, INVALIDATE_ATTR_ONLY)
+                                    .await;
+                            }
+                        }
+                        attr.ctime = now;
+                        // check opened, if link is 0, so check if any session open it, if none, del it
+                        match trash {
+                            Some(trash_ino) if attr.parent > 0 => attr.parent = trash_ino,
+                            None => {
+                                attr.nlink -= 1;
+                                if typ == INodeType::TypeFile && attr.nlink == 0 {
+                                    should_del = true;
+                                    if let Some(ref sid) = self.meta.sid
+                                        && base_meta.open_files.is_open(ino).await
+                                    {
+                                        open_session_id.replace(sid.load(Ordering::SeqCst));
+                                    }
+                                }
+                            }
+                            _ => (),
+                        };
+                        attr
+                    }
+                    None => {
+                        warn!("no attribute  for inode {}  ({}, {})", ino, parent, name);
+                        trash.take();
+                        Attr::default()
+                    }
+                };
+
+                // make trascation
+                let mut pipe = pipe();
+                pipe.atomic();
+                pipe.hdel(self.dir_key(parent), &name);
+                if update_parent {
+                    pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
+                }
+                let guaga = if attr.nlink > 0 {
+                    pipe.set(self.inode_key(ino), bincode::serialize(&attr)?);
+                    if let Some(trash_ino) = trash {
+                        pipe.hset(
+                            self.dir_key(trash_ino),
+                            self.trash_entry(parent, ino, &name),
+                            buf,
+                        );
+                        if attr.parent == 0 {
+                            pipe.hincr(self.parent_key(ino), trash_ino.to_string(), 1);
+                        }
+                    }
+                    if attr.parent == 0 {
+                        pipe.hincr(self.parent_key(ino), parent.to_string(), -1);
+                    }
+                    (0, 0)
+                } else {
+                    let guaga = match typ {
+                        INodeType::TypeFile => {
+                            if let Some(sid) = open_session_id {
+                                pipe.set(self.inode_key(ino), bincode::serialize(&attr)?);
+                                pipe.sadd(self.sustained(sid), &ino);
+                                (0, 0)
+                            } else {
+                                let ts = SystemTime::now()
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .expect("Time went backwards")
+                                    .as_secs();
+                                pipe.zadd(self.del_files(), Self::to_delete(ino, attr.length), ts);
+                                pipe.del(self.inode_key(ino));
+                                let new_space = -utils::align_4k(attr.length);
+                                pipe.incr(self.used_space_key(), new_space);
+                                pipe.decr(self.total_inodes_key(), -1);
+                                (new_space, -1)
+                            }
+                        }
+                        INodeType::TypeSymlink => {
+                            pipe.del(self.inode_key(ino));
+                            pipe.del(self.inode_key(ino));
+                            let new_space = -utils::align_4k(0);
+                            pipe.incr(self.used_space_key(), new_space);
+                            pipe.decr(self.total_inodes_key(), -1);
+                            (new_space, -1)
+                        }
+                        _ => {
+                            pipe.del(self.inode_key(ino));
+                            let new_space = -utils::align_4k(0);
+                            pipe.incr(self.used_space_key(), new_space);
+                            pipe.decr(self.total_inodes_key(), -1);
+                            (new_space, -1)
+                        }
+                    };
+                    pipe.del(self.xattr_key(ino));
+                    if attr.parent == 0 {
+                        pipe.del(self.parent_key(ino));
+                    }
+                    guaga
+                };
+                Ok::<Option<_>, MyError>(Some((
+                    guaga.0,
+                    guaga.1,
+                    should_del,
+                    open_session_id,
+                    ino,
+                    attr.clone(),
+                )))
+            })?;
+
+        if trash.is_none() {
+            if should_del {
+                self.clone()
+                    .try_spawn_delete_file(
+                        ino,
+                        attr.length,
+                        parent.is_trash(),
+                        open_session_id.is_some(),
+                    )
+                    .await
+            }
+            self.update_stats(space_guage, ino_cnt_guage).await;
+        }
+        Ok(attr)
     }
 
     async fn do_rmdir(
@@ -1338,7 +1581,7 @@ impl Engine for RedisEngine {
         parent: Ino,
         name: &str,
         inode: &Ino,
-        skip_check_trash: bool,
+        skip_check_trash: &[bool],
     ) -> Result<()> {
         unimplemented!()
     }
@@ -1405,10 +1648,8 @@ impl Engine for RedisEngine {
         inode: Ino,
         flags: u8,
         length: u64,
-        delta: &mut DirStat,
-        attr: &mut Attr,
         skip_perm_check: bool,
-    ) -> Result<()> {
+    ) -> Result<(Attr, DirStat)> {
         unimplemented!()
     }
 

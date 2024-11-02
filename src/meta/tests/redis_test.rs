@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    hash::{DefaultHasher, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock,
@@ -65,7 +64,7 @@ impl RedisDbOffer {
         }
     }
 
-    async fn take(&self, config: Config) -> (Box<dyn Meta>, RedisDbHodler) {
+    async fn take(&self, config: Config) -> (Box<Arc<dyn Meta>>, RedisDbHodler) {
         loop {
             for i in 0..self.db_nums {
                 let redis_url = format!("{}/{}", self.redis_url, i);
@@ -112,12 +111,18 @@ async fn test_meta_client() {
     base_test::test_meta_client(meta).await;
 }
 
-async fn test_truncate_and_delete() {}
+#[tokio::test]
+async fn test_truncate_and_delete() {
+    let guard = REDIS_DB_HOLDER.read();
+    let (meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_truncate_and_delete(meta).await;
+}
 
 async fn test_trash() {}
 
 async fn test_parents() {}
 
+// TODO: wrap them with macro
 #[tokio::test]
 async fn test_remove() {
     let guard = REDIS_DB_HOLDER.read();
