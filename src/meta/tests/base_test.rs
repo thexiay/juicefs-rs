@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::{Duration, SystemTime}};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use juice_meta::{
     api::{Attr, Ino, Meta, Slice},
@@ -14,7 +17,84 @@ pub fn test_format() -> Format {
     }
 }
 
-pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {}
+pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
+    match m.get_attr(1).await {
+        Ok(attr) if attr.mode != 0777 => panic!("getattr root mode err"),
+        Err(err) => panic!("getattr root err {}", err),
+        _ => {}
+    }
+    m.init(test_format(), true)
+        .await
+        .expect("initialize failed");
+    m.init(
+        Format {
+            name: "test2".to_string(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect_err("change name without --force is not allowed");
+    /*
+    m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+    ctx := Background
+    var attr = &Attr{}
+    if st := m.GetAttr(ctx, 1, attr); st != 0 || attr.Mode != 0777 { // getattr of root always succeed
+        t.Fatalf("getattr root: %s", st)
+    }
+
+    if err := m.Init(testFormat(), true); err != nil {
+        t.Fatalf("initialize failed: %s", err)
+    }
+    if err := m.Init(&Format{Name: "test2"}, false); err == nil { // not allowed
+        t.Fatalf("change name without --force is not allowed")
+    }
+    format, err := m.Load(true)
+    if err != nil {
+        t.Fatalf("load failed after initialization: %s", err)
+    }
+    if format.Name != "test" {
+        t.Fatalf("load got volume name %s, expected %s", format.Name, "test")
+    }
+    if err = m.NewSession(true); err != nil {
+        t.Fatalf("new session: %s", err)
+    }
+    defer m.CloseSession()
+    ses, err := m.ListSessions()
+    if err != nil || len(ses) != 1 {
+        t.Fatalf("list sessions %+v: %s", ses, err)
+    }
+    base := m.getBase()
+    if base.sid != ses[0].Sid {
+        t.Fatalf("my sid %d != registered sid %d", base.sid, ses[0].Sid)
+    }
+    go m.CleanStaleSessions()
+
+    var parent, inode, dummyInode Ino
+    if st := m.Mkdir(ctx, 1, "d", 0640, 022, 0, &parent, attr); st != 0 {
+        t.Fatalf("mkdir d: %s", st)
+    }
+    defer m.Rmdir(ctx, 1, "d")
+    if st := m.Unlink(ctx, 1, "d"); st != syscall.EPERM {
+        t.Fatalf("unlink d: %s", st)
+    }
+    if st := m.Rmdir(ctx, parent, "."); st != syscall.EINVAL {
+        t.Fatalf("unlink d.: %s", st)
+    }
+    if st := m.Rmdir(ctx, parent, ".."); st != syscall.ENOTEMPTY {
+        t.Fatalf("unlink d..: %s", st)
+    }
+    if st := m.Lookup(ctx, 1, "d", &parent, attr, true); st != 0 {
+        t.Fatalf("lookup d: %s", st)
+    }
+    if st := m.Lookup(ctx, 1, "d", &parent, nil, true); st != syscall.EINVAL {
+        t.Fatalf("lookup d: %s", st)
+    }
+    if st := m.Lookup(ctx, 1, "..", &inode, attr, true); st != 0 || inode != 1 {
+        t.Fatalf("lookup ..: %s", st)
+    }
+     */
+}
 
 pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
     let mut format = m.load(false).await.unwrap().as_ref().clone();
@@ -41,17 +121,22 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
     )
     .await
     .expect("write file: ");
-    m.clone().truncate(inode, 0, 200 << 20, false)
+    m.clone()
+        .truncate(inode, 0, 200 << 20, false)
         .await
         .expect("truncate file: ");
-    m.clone().truncate(inode, 0, (10 << 40) + 10, false)
+    m.clone()
+        .truncate(inode, 0, (10 << 40) + 10, false)
         .await
         .expect("truncate file: ");
-    let attr = m.clone().truncate(inode, 0, (300 << 20) + 10, false)
+    let attr = m
+        .clone()
+        .truncate(inode, 0, (300 << 20) + 10, false)
         .await
         .expect("truncate file: ");
 
-    let slices = m.list_slices(false, Box::new(|| {}))
+    let slices = m
+        .list_slices(false, Box::new(|| {}))
         .await
         .expect("list slices: ");
     let total_slices = slices.values().map(|s| s.len()).sum::<usize>();
@@ -63,7 +148,8 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
     time::sleep(Duration::from_millis(100)).await;
 
     // unlink and list slices again
-    let slices = m.list_slices(false, Box::new(|| {}))
+    let slices = m
+        .list_slices(false, Box::new(|| {}))
         .await
         .expect("list slices: ");
     let total_slices = slices.values().map(|s| s.len()).sum::<usize>();

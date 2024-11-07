@@ -63,6 +63,10 @@ pub enum MyError {
     },
     #[snafu(display("message queue closed"))]
     SemaphoraCloseError,
+    #[snafu(display("cannot upgrade format: {detail}"))]
+    UpgradeFormatError {
+        detail: String,
+    }
     
     
 }

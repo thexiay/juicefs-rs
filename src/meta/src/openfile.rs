@@ -16,7 +16,7 @@ pub const INVALIDATE_ATTR_ONLY: u32 = 0xFFFFFFFF;
 pub struct OpenFile {
     attr: Attr,
     refs: i32,
-    last_check: u64,
+    last_check: Duration,
     first: Vec<Slice>,
     chunks: HashMap<u32, Vec<Slice>>,
 }
@@ -28,6 +28,8 @@ impl OpenFile {
     }
 }
 
+/// OpenFiles is a cache for open files.
+/// It also hold a lock for every open file, once it is open, other open request will wait until the lock is released.
 pub struct OpenFiles {
     expire: Duration,
     limit: u64,
@@ -64,8 +66,7 @@ impl OpenFiles {
         of.refs += 1;
         of.last_check = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
+            .expect("Time went backwards");
     }
 
     pub async fn is_open(&self, ino: Ino) -> bool {
@@ -74,11 +75,54 @@ impl OpenFiles {
             files.get(&ino).map(|file| file.clone())
         };
         match file {
-            Some(file)  => {
+            Some(file) => {
                 let of = file.lock().await;
                 of.refs > 0
-            },
-            None => false
+            }
+            None => false,
+        }
+    }
+
+    /// get attr in openfiles cache
+    pub async fn get_attr(&self, ino: Ino) -> Option<Attr> {
+        if self.expire == Duration::ZERO {
+            return None;
+        }
+        let file = {
+            let files = self.files.lock();
+            files.get(&ino).map(|file| file.clone())
+        };
+        if let Some(of) = file {
+            let of = of.lock().await;
+            if SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                - of.last_check
+                < self.expire
+            {
+                return Some(of.attr.clone());
+            }
+        }
+        None
+    }
+
+    /// update attr in openfiles cache
+    pub async fn update_attr(&self, ino: Ino, mut attr: Attr) {
+        let file = {
+            let files = self.files.lock();
+            files.get(&ino).map(|file| file.clone())
+        };
+        if let Some(of) = file {
+            let mut of = of.lock().await;
+            if attr.mtime != of.attr.mtime {
+                of.invalidate_chunk();
+            } else {
+                attr.keep_cache = of.attr.keep_cache;
+            }
+            of.attr = attr;
+            of.last_check = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards");
         }
     }
 
@@ -103,7 +147,7 @@ impl OpenFiles {
                     of.chunks.remove(&indx);
                 }
             }
-            of.last_check = 0;
+            of.last_check = Duration::ZERO;
         }
     }
 }

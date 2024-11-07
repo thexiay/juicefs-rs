@@ -3,21 +3,25 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{api::MAX_VERSION, error::{NotIncompatibleClientSnafu, Result}};
+use crate::{
+    api::MAX_VERSION,
+    error::{NotIncompatibleClientSnafu, Result, UpgradeFormatSnafu},
+};
 
 // Config for clients.
 #[derive(Clone)]
 pub struct Config {
-	pub strict: bool,  // update ctime
-	pub retries: isize, // number of retries
+    pub strict: bool,   // update ctime
+    pub retries: isize, // number of retries
     // max delete gc threads
-    pub max_deletes_threads: isize, 
+    pub max_deletes_threads: isize,
     // max delete task in queue
-    pub max_deletes_task: isize, 
+    pub max_deletes_task: isize,
     pub skip_dir_nlink: isize,
     pub case_insensi: bool,
     pub read_only: bool,
-    pub no_bg_job: bool,  // disable background jobs like clean-up, backup, etc.
+    pub no_bg_job: bool, // disable background jobs like clean-up, backup, etc.
+    // open files cache expire time
     pub open_cache: Duration,
     /// max number of files to cache (soft limit)
     pub open_cache_limit: u64,
@@ -72,7 +76,7 @@ impl Config {
 }
 
 /// Config for server
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Format {
     pub name: String,
     pub uuid: String,
@@ -91,7 +95,7 @@ pub struct Format {
     pub encrypt_key: Option<String>,
     pub encrypt_algo: Option<String>,
     pub key_encrypted: Option<bool>,
-    pub upload_limit: Option<i64>, // Mbps
+    pub upload_limit: Option<i64>,   // Mbps
     pub download_limit: Option<i64>, // Mbps
     pub trash_days: i32,
     pub meta_version: i32,
@@ -103,17 +107,53 @@ pub struct Format {
 
 impl Format {
     /// check format can be update or not
-    pub fn check_ugrade(&self, old: &Format, force: bool) -> Result<()> {
+    pub fn check_ugrade(&mut self, old: Format, force: bool) -> Result<()> {
+        if force {
+            warn!("Existing volume will be overwrited: {:?}", old);
+        } else {
+            if self.name != old.name {
+                return UpgradeFormatSnafu {
+                    detail: format!("name {} -> {}", old.name, self.name),
+                }
+                .fail();
+            } else if self.block_size != old.block_size {
+                return UpgradeFormatSnafu {
+                    detail: format!("block size {} -> {}", old.block_size, self.block_size),
+                }
+                .fail();
+            } else if self.compression != old.compression {
+                return UpgradeFormatSnafu {
+                    detail: format!("compression {:?} -> {:?}", old.compression, self.compression),
+                }
+                .fail();
+            } else if self.shards != old.shards {
+                return UpgradeFormatSnafu {
+                    detail: format!("shards {:?} -> {:?}", old.shards, self.shards),
+                }
+                .fail();
+            } else if self.hash_prefix != old.hash_prefix {
+                return UpgradeFormatSnafu {
+                    detail: format!("hash prefix {:?} -> {:?}", old.hash_prefix, self.hash_prefix),
+                }
+                .fail();
+            } else if self.meta_version != old.meta_version {
+                return UpgradeFormatSnafu {
+                    detail: format!("meta version {} -> {}", old.meta_version, self.meta_version),
+                }
+                .fail();
+            }
+        }
         Ok(())
     }
 
     pub fn check_version(&self) -> Result<()> {
         if self.meta_version > MAX_VERSION {
-            return NotIncompatibleClientSnafu{ 
-                version: self.meta_version 
-            }.fail();
+            return NotIncompatibleClientSnafu {
+                version: self.meta_version,
+            }
+            .fail();
         }
-    
+
         // TODO: check client version
         Ok(())
     }

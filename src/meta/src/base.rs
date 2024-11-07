@@ -3,11 +3,12 @@ use bytes::Bytes;
 use chrono::Utc;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
+use tokio::time::timeout;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use sysinfo::{get_current_pid, PidExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -139,7 +140,7 @@ pub trait Engine {
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
     async fn do_flush_quotas(&self, quotas: HashMap<Ino, Quota>) -> Result<()>;
     // meta functions
-    async fn do_get_attr(&self, inode: Ino, attr: &Attr) -> Result<()>;
+    async fn do_get_attr(&self, inode: Ino) -> Result<Attr>;
     async fn do_set_attr(
         &self,
         inode: Ino,
@@ -902,7 +903,41 @@ where
 
     // GetAttr returns the attributes for given node.
     async fn get_attr(&self, inode: Ino) -> Result<Attr> {
-        todo!()
+        let base = self.as_ref();
+        let inode = inode.transfer_root(base.root);
+        if let Some(attr) = base.open_files.get_attr(inode).await {
+            return Ok(attr);
+        }
+        // for root and trash, maybe the attr is not persist, but we need it always return ok
+        if inode.is_root() || inode.is_trash() {
+            // do_get_attr could overwrite the `attr` after timeout
+            if let Ok(Ok(attr)) = timeout(Duration::from_millis(300), async {
+                self.do_get_attr(inode).await
+            }).await {
+                Ok(attr)
+            } else {
+                Ok(Attr{
+                    typ: INodeType::TypeDirectory,
+                    mode: if inode.is_trash() {
+                        0o555
+                    } else {
+                        0o777
+                    },
+                    nlink: 2,
+                    length: 4 << 10,
+                    parent: ROOT_INODE,
+                    full: true,
+                    ..Attr::default()
+                })
+            }
+        } else {
+            let attr = self.do_get_attr(inode).await?;
+            base.open_files.update_attr(inode, attr.clone()).await;
+            if attr.typ == INodeType::TypeDirectory && inode.is_root() && !attr.parent.is_trash() {
+                base.dir_parents.lock().insert(inode, attr.parent);
+            }
+            Ok(attr)
+        }
     }
 
     // SetAttr updates the attributes for given node.

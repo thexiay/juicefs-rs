@@ -921,7 +921,7 @@ impl Engine for RedisEngine {
          */
     }
 
-    async fn do_init(&self, format: Format, force: bool) -> Result<()> {
+    async fn do_init(&self, mut format: Format, force: bool) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let body: Option<Vec<u8>> = conn.get(self.settings()).await?;
@@ -936,7 +936,7 @@ impl Engine for RedisEngine {
                         detail: "remove dir stats",
                     })?;
             }
-            format.check_ugrade(&old, force)?;
+            format.check_ugrade(old, force)?;
         }
 
         let ts = SystemTime::now()
@@ -1161,8 +1161,14 @@ impl Engine for RedisEngine {
         unimplemented!()
     }
 
-    async fn do_get_attr(&self, inode: Ino, attr: &Attr) -> Result<()> {
-        unimplemented!()
+    async fn do_get_attr(&self, inode: Ino) -> Result<Attr> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &[self.inode_key(inode)], {
+            let attr_bytes: Vec<u8> = conn.get(self.inode_key(inode)).await?;
+            let attr: Attr = bincode::deserialize(&attr_bytes)?;
+            Ok(Some(attr))
+        })
     }
 
     async fn do_set_attr(
