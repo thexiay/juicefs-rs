@@ -35,20 +35,20 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     )
     .await
     .expect_err("change name without --force is not allowed");
+    let format = m.load(true).await.expect("load failed after initalization: ");
+    if format.name != "test" {
+        panic!("load got volume name {} != test", format.name);
+    }
+    m.clone().new_session(true).await.expect("new session: ");
     /*
-    m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
-    ctx := Background
-    var attr = &Attr{}
-    if st := m.GetAttr(ctx, 1, attr); st != 0 || attr.Mode != 0777 { // getattr of root always succeed
-        t.Fatalf("getattr root: %s", st)
+    m.close_session().await.expect("close session: ");
+    let sessions = m.list_sessions().await.expect("list sessions: ");
+    if sessions.len() != 1 {
+        panic!("list sessions cnt should be 1");
     }
-
-    if err := m.Init(testFormat(), true); err != nil {
-        t.Fatalf("initialize failed: %s", err)
-    }
-    if err := m.Init(&Format{Name: "test2"}, false); err == nil { // not allowed
-        t.Fatalf("change name without --force is not allowed")
-    }
+     */
+    /*
+    
     format, err := m.Load(true)
     if err != nil {
         t.Fatalf("load failed after initialization: %s", err)

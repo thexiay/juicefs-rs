@@ -13,6 +13,7 @@ pub mod acl;
 pub(crate) mod rds;
 pub(crate) mod utils;
 pub(crate) mod base;
+pub(crate) mod session;
 pub(crate) mod openfile;
 pub(crate) mod slice;
 pub(crate) mod random_test;

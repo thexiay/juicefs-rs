@@ -3,39 +3,42 @@ use bytes::Bytes;
 use chrono::Utc;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
-use tokio::time::timeout;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::{mem, process};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, PidExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, TryAcquireError};
-use tracing::{debug, info, warn};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclCache, AclType, Rule};
 use crate::api::{
-    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo,
-    Slice, Summary, TreeSummary, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
 };
 use crate::config::{Config, Format};
 use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFile, OpenFiles};
 use crate::quota::Quota;
-use crate::utils::{access_mode, align_4k, FLockItem, FreeID, PLockItem};
+use crate::utils::{access_mode, align_4k, sleep_with_jitter, FLockItem, FreeID, PLockItem};
 
 pub const INODE_BATCH: i64 = 1 << 10;
 pub const SLICE_ID_BATCH: i64 = 1 << 10;
 pub const N_LOCK: usize = 1 << 10;
 pub const CHANNEL_BUFFER: usize = 1024;
 const SEGMENT_LOCK: Mutex<()> = Mutex::new(());
+const UMOUNT_EXIT_CODE: i32 = 11;
 
 pub const NEXT_INODE: &str = "nextinode";
 pub const NEXT_CHUNK: &str = "nextchunk";
 pub const NEXT_SESSION: &str = "nextsession";
 pub const NEXT_TRASH: &str = "nexttrash";
+pub const USED_SPACE: &str = "usedSpace";
+pub const TOTAL_INODES: &str = "totalInodes";
 
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
@@ -101,12 +104,12 @@ pub trait Engine {
     // Increase counter name by value. Do not use this if value is 0, use getCounter instead.
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64>;
     // Set counter name to value if old <= value - diff.
-    async fn set_if_small(&self, name: &str, value: i64, diff: i64) -> Result<bool>;
+    async fn set_if_small(&self, name: &str, value: Duration, diff: Duration) -> Result<bool>;
     async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
     async fn do_load(&self) -> Result<Option<Format>>;
     async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
-    async fn do_refresh_session(&self) -> Result<()>;
+    async fn do_refresh_session(&self, sid: u64) -> Result<()>;
 
     /// find stale session
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>>;
@@ -115,7 +118,7 @@ pub trait Engine {
     async fn do_reset(&self) -> Result<()>;
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()>;
     async fn do_delete_sustained_inode(&self, sid: u64, inode: Ino) -> Result<()>;
-    async fn do_find_deleted_files(&self, ts: i64, limit: isize) -> Result<HashMap<Ino, u64>>;
+    async fn do_find_deleted_files(&self, ts: Duration, limit: isize) -> Result<HashMap<Ino, u64>>;
     async fn do_delete_file_data(&self, inode: Ino, length: u64);
     async fn do_cleanup_slices(&self);
     async fn do_cleanup_delayed_slices(&self, edge: i64) -> Result<i32>;
@@ -138,7 +141,7 @@ pub trait Engine {
     async fn do_get_quota(&self, inode: Ino) -> Result<Quota>;
     async fn do_del_quota(&self, inode: Ino) -> Result<()>;
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
-    async fn do_flush_quotas(&self, quotas: HashMap<Ino, Quota>) -> Result<()>;
+    async fn do_flush_quotas(&self, quotas: &HashMap<Ino, (i64, i64)>) -> Result<()>;
     // meta functions
     async fn do_get_attr(&self, inode: Ino) -> Result<Attr>;
     async fn do_set_attr(
@@ -236,7 +239,8 @@ pub trait Engine {
     ) -> Result<()>;
 
     async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, i32>;
-    async fn do_update_dir_stat(&self, batch: HashMap<Ino, DirStat>) -> Result<()>;
+    /// do add dirstats batch periodly
+    async fn do_flush_dir_stat(&self, batch: HashMap<Ino, DirStat>) -> Result<()>;
     // @trySync: try sync dir stat if broken or not existed
     async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<DirStat>;
     async fn do_sync_dir_stat(&self, ino: Ino) -> Result<DirStat>;
@@ -254,11 +258,6 @@ pub trait Engine {
 
 #[async_trait]
 pub trait MetaOtherFunction {
-    async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
-    async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool;
-    async fn update_dir_quota(&self, inode: Ino, space: i64, inodes: i64);
-    async fn load_dir_quotas(&self) -> Result<()>;
-
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
     async fn update_parent_stats(self: Arc<Self>, inode: Ino, parent: Ino, length: i64, space: i64);
@@ -281,6 +280,41 @@ pub trait MetaOtherFunction {
         force: bool,
         delete_on_close: bool,
     );
+
+    /// ------------------------------ quota func ------------------------------
+    /// check if the space and inodes exceed the quota limit for parents ino
+    async fn check_quotas(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
+
+    /// check if the space and inodes exceed the quota limit for single ino
+    async fn check_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool;
+
+    /// update the new space and new inode for quota
+    async fn update_quota(&self, inode: Ino, space: i64, inodes: i64);
+
+    /// load quotas from persist layer
+    async fn load_quotas(&self);
+
+    /// flush quotas once
+    async fn flush_quotas(&self);
+
+    /// flush dir stats once
+    async fn flush_dir_stat(&self);
+
+    /// ------------------------------ session func ------------------------------
+    /// do persist session info into meta persist layer periodly
+    async fn refresh_session(self: Arc<Self>);
+
+    /// cleanup stale sessions which have not been refreshed for days
+    async fn cleanup_stale_sessions(&self);
+    
+    /// cleanup trash which have not been deleted for days
+    async fn cleanup_trash(&self, days: u8, force: bool);
+
+    /// cleanup trash which is earlier than edge
+    async fn cleanup_trash_before(&self, edge: Duration);
+
+    /// cleanup delayed deleted slices which have not been deleted for days
+    async fn cleanup_trash_slices(&self, days: u8);
 }
 
 pub struct CommonMeta {
@@ -290,21 +324,25 @@ pub struct CommonMeta {
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
     pub max_deleting: Arc<Semaphore>,
-    pub dslices: (Sender<Slice>, Receiver<Slice>), // slices to delete
     pub symlinks: HashMap<Ino, String>,
-    pub umounting: bool,
+    pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
     pub acl_cache: AsyncMutex<AclCache>,
-    pub dir_stats_lock: Mutex<HashMap<Ino, DirStat>>,
+    pub dir_stats_batch: Mutex<HashMap<Ino, DirStat>>,
     pub fs_stat: FsStat,
     pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
-    pub dir_quotas: RwLock<HashMap<Ino, Arc<Quota>>>, // directory inode -> quota
+    // dir quotas, it storage every inode(dir type)'s quota
+    pub quotas: RwLock<HashMap<Ino, Quota>>,
     pub free_inodes: AsyncMutex<FreeID>,
     pub free_slices: AsyncMutex<FreeID>,
     pub conf: Config,
     pub fmt: RwLock<Arc<Format>>,
-    // session id
-    pub sid: Option<AtomicU64>,
-    pub ses_mu: Mutex<()>,
+    // current session id
+    // session id can from
+    // - set from user config
+    // - new session greater than persist layer session id
+    pub sid: RwLock<Option<u64>>,
+    // session umounting, once meta begin, fs mounting; once session is closed, unmounting
+    pub ses_umounting: AsyncMutex<bool>,
     pub open_files: Arc<OpenFiles>,
     // TODO: encapsulation it into Segmented Lock
     // Pessimistic locks to reduce conflicts
@@ -315,8 +353,6 @@ pub struct CommonMeta {
 impl CommonMeta {
     pub fn new(addr: &str, conf: Config) -> Self {
         let max_deleting = Arc::new(Semaphore::new(conf.max_deletes_task as usize));
-        let dslices = channel::<Slice>(conf.max_deletes_threads as usize * 10240);
-        let sid = conf.sid.map(AtomicU64::new);
         let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
             addr: addr.to_string(),
@@ -325,20 +361,19 @@ impl CommonMeta {
             removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
             max_deleting,
-            dslices,
             symlinks: HashMap::new(),
-            umounting: false,
-            ses_mu: Mutex::new(()),
+            reload_format_callbacks: Vec::new(),
+            ses_umounting: AsyncMutex::new(false),
             acl_cache: AsyncMutex::new(AclCache::default()),
-            dir_stats_lock: Mutex::new(HashMap::new()),
+            dir_stats_batch: Mutex::new(HashMap::new()),
             fs_stat: FsStat::default(),
             dir_parents: Mutex::new(HashMap::new()),
-            dir_quotas: RwLock::new(HashMap::new()),
+            quotas: RwLock::new(HashMap::new()),
             free_inodes: AsyncMutex::new(FreeID::default()),
             free_slices: AsyncMutex::new(FreeID::default()),
             conf,
             fmt: RwLock::new(Arc::new(Format::default())),
-            sid,
+            sid: RwLock::new(None),
             open_files,
             txn_locks: [SEGMENT_LOCK; N_LOCK],
             canceled: AtomicBool::new(false),
@@ -357,7 +392,7 @@ impl CommonMeta {
         self.fmt.read().clone()
     }
 
-    pub fn new_session_info(&self) -> String {
+    pub fn new_session_info(&self) -> SessionInfo {
         let host = match hostname::get() {
             Ok(host) => host.to_string_lossy().to_string(),
             Err(err) => {
@@ -372,16 +407,14 @@ impl CommonMeta {
                 Vec::new()
             }
         };
-        let session_info = SessionInfo {
+        SessionInfo {
             version: "0.1".to_string(), // TODO: get it in runtime
             host_name: host,
             ip_addrs: ips,
             mount_point: self.conf.mount_point.clone(),
             mount_time: SystemTime::now(),
             process_id: get_current_pid().unwrap().as_u32(),
-        };
-        serde_json::to_string(&session_info)
-            .expect("session info serialization should never failed")
+        }
     }
 }
 
@@ -390,7 +423,7 @@ impl<E> MetaOtherFunction for E
 where
     E: Send + Sync + 'static + Engine + AsRef<CommonMeta>,
 {
-    async fn check_quota(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()> {
+    async fn check_quotas(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()> {
         if space <= 0 && inodes <= 0 {
             return Ok(());
         }
@@ -418,28 +451,25 @@ where
             return Ok(());
         }
         for ino in parents {
-            if self.check_dir_quota(ino, space, inodes).await {
+            if self.check_quota(ino, space, inodes).await {
                 return SysSnafu { code: libc::EDQUOT }.fail();
             }
         }
         Ok(())
     }
 
-    async fn check_dir_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool {
+    async fn check_quota(&self, ino: Ino, space: i64, inodes: i64) -> bool {
         if !self.get_format().enable_dir_stats {
             return false;
         }
 
         let mut inode = ino;
         loop {
-            let quota = {
-                let guard = self.as_ref().dir_quotas.read();
-                guard.get(&inode).map(|q| q.clone())
-            };
-            if let Some(quota) = quota
-                && quota.check(space, inodes)
             {
-                return true;
+                let guard = self.as_ref().quotas.read();
+                if let Some(quota) = guard.get(&inode) && quota.check(space, inodes) {
+                    return true;
+                }
             }
             if inode <= ROOT_INODE {
                 break;
@@ -456,12 +486,35 @@ where
         false
     }
 
-    async fn load_dir_quotas(&self) -> Result<()> {
+    async fn load_quotas(&self) {
         if !self.get_format().enable_dir_stats {
-            return Ok(());
+            return;
         }
 
-        unimplemented!()
+        // Here can not replcae directly, quotas's quota maybe concurrently accessed by other thread,
+        // so we must modify it in place
+        match self.do_load_quotas().await {
+            Ok(loaded_quotas) => {
+                let base = self.as_ref();
+                let mut quotas = base.quotas.write();
+                
+                quotas.iter().for_each(|(ino, _)| {
+                    if !loaded_quotas.contains_key(ino) {
+                        // quota cache should be consistent with the meta persist layer
+                        error!("Quota for inode {} is deleted", ino);
+                    }
+                });
+                
+                loaded_quotas.iter().for_each(|(ino, quota)| {
+                    if let Some(q) = quotas.get(ino) {
+                        quota.new_space.fetch_add(q.new_space.load(Ordering::SeqCst), Ordering::SeqCst);
+                        quota.new_inodes.fetch_add(q.new_inodes.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
+                });
+                *quotas = loaded_quotas;
+            },
+            Err(e) => warn!("Load quotas: {}", e),
+        }
     }
 
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino> {
@@ -483,7 +536,7 @@ where
             return;
         }
 
-        let mut dir_stats = self.as_ref().dir_stats_lock.lock();
+        let mut dir_stats = self.as_ref().dir_stats_batch.lock();
         let stats = dir_stats.entry(inode).or_insert(DirStat::default());
         stats.length += length;
         stats.space += space;
@@ -507,13 +560,13 @@ where
 
         if parent > 0 {
             self.update_dir_stats(parent, length, space, 0);
-            self.update_dir_quota(parent, space, 0).await;
+            self.update_quota(parent, space, 0).await;
         } else {
             // spawn a task to shorten the time of updating parent stats
             tokio::spawn(async move {
                 for (parent, _) in self.get_parents(inode).await {
                     self.update_dir_stats(parent, length, space, 0);
-                    self.update_dir_quota(parent, space, 0).await;
+                    self.update_quota(parent, space, 0).await;
                 }
             });
         }
@@ -540,19 +593,18 @@ where
              */
     }
 
-    async fn update_dir_quota(&self, mut inode: Ino, space: i64, inodes: i64) {
+    async fn update_quota(&self, mut inode: Ino, space: i64, inodes: i64) {
         if !self.get_format().enable_dir_stats {
             return;
         }
 
         // recursively update the quota of the parent node until the root node is encountered
         loop {
-            let quota = {
-                let dir_quota = self.as_ref().dir_quotas.read();
-                dir_quota.get(&inode).map(|q| q.clone())
-            };
-            if let Some(quota) = quota {
-                quota.update(space, inodes);
+            {
+                let dir_quota = self.as_ref().quotas.read();
+                if let Some(quota) = dir_quota.get(&inode) {
+                    quota.update(space, inodes);
+                }
             }
             if inode <= ROOT_INODE {
                 break;
@@ -678,9 +730,12 @@ where
                 let permit = match force {
                     // TODO: 这里如果拿不到被关闭了，是不是要处理下
                     true => Some(max_deleting.acquire().await.unwrap()),
-                    false => max_deleting.try_acquire().inspect_err(|err| {
-                        warn!("try acquire delete inode({}) permit failed: {}", inode, err);
-                    }).ok(),
+                    false => max_deleting
+                        .try_acquire()
+                        .inspect_err(|err| {
+                            warn!("try acquire delete inode({}) permit failed: {}", inode, err);
+                        })
+                        .ok(),
                 };
                 if let Some(permit) = permit {
                     meta.do_delete_file_data(inode, length).await;
@@ -688,6 +743,159 @@ where
                 }
             });
         }
+    }
+
+    async fn refresh_session(self: Arc<Self>) {
+        loop {
+            let base = self.as_ref().as_ref();
+            sleep_with_jitter(base.conf.heartbeat).await;
+            {
+                let unmounting = self.as_ref().as_ref().ses_umounting.lock().await;
+                if *unmounting {
+                    return;
+                }
+                let sid = {
+                    base.sid.read().map(|sid| sid)
+                };
+                if let Some(sid) = sid && base.conf.read_only {
+                    self.do_refresh_session(sid).await.inspect_err(|err| error!("Refresh session: {}", err));
+                }
+            }
+            
+            // notify format changed
+            let old = self.get_format();
+            let format = self.load(false).await;
+            match format {
+                Ok(format) => {
+                    if format.meta_version > MAX_VERSION {
+                        error!("incompatible metadata version {} > max version {}", format.meta_version, MAX_VERSION);
+                        process::exit(UMOUNT_EXIT_CODE);
+                    }
+                    if format.uuid != old.uuid {
+                        error!("UUID changed from {} to {}", old.uuid, format.uuid);
+                        process::exit(UMOUNT_EXIT_CODE);
+                    }
+                    
+                    if format != old {
+                        for cb in base.reload_format_callbacks.iter() {
+                            cb(format.clone());
+                        }
+                    }
+                }
+                Err(e @ MyError::NotInitializedError) => {
+                    error!("reload setting: {}", e);
+                    process::exit(UMOUNT_EXIT_CODE);
+                },
+                Err(e) => warn!("reload setting: {}", e),
+            }
+
+            match self.get_counter(USED_SPACE).await {
+                Ok(v) => base.fs_stat.used_space.store(v, Ordering::SeqCst),
+                Err(e) => warn!("Get counter {}: {}", USED_SPACE, e),
+            }
+            match self.get_counter(TOTAL_INODES).await {
+                Ok(v) => base.fs_stat.used_inodes.store(v, Ordering::SeqCst),
+                Err(e) => warn!("Get counter {}: {}", TOTAL_INODES, e),
+            }
+            self.load_quotas().await;
+
+            if base.conf.read_only || !base.conf.enable_bg_job {
+                continue;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards");
+            match self.set_if_small("lastCleanupSessions", now, base.conf.heartbeat * 9 / 10).await {
+                Ok(true) => {
+                    let meta = self.clone();
+                    tokio::spawn(async move {
+                        meta.cleanup_stale_sessions().await;
+                    });
+                }
+                Err(e) => warn!("checking counter lastCleanupSessions: {}", e),
+                _ => {}
+            }
+        }
+    }
+
+    async fn cleanup_stale_sessions(&self) {
+        match self.do_find_stale_sessions(1000).await {
+            Ok(sids) => {
+                for sid in sids {
+                    if let Ok(session) = self.get_session(sid, false).await {
+                        warn!("Get stale session info {}: {:?}", sid, session);
+                    }
+                    info!("Clean up stale session {}: {:?}", sid, self.do_clean_stale_session(sid).await);
+                }
+            },
+            Err(e) => warn!("scan stale sessions: {}", e),
+        }
+    }
+
+    async fn flush_quotas(&self) {
+        if !self.get_format().enable_dir_stats {
+            return;
+        }
+
+        let base = self.as_ref();
+        let stage_map = {
+            let quotas = base.quotas.read();
+            let mut stage_map = HashMap::new();
+            for (ino, quota) in quotas.iter() {
+                let new_space = quota.new_space.load(Ordering::SeqCst);
+                let new_inodes = quota.new_inodes.load(Ordering::SeqCst);
+                if new_space != 0 || new_inodes != 0 {
+                    stage_map.insert(*ino, (new_space, new_inodes));
+                }
+            }
+            stage_map
+        };
+        if stage_map.is_empty() {
+            return;
+        }
+
+        match self.do_flush_quotas(&stage_map).await {
+            Ok(_) => {
+                let mut quotas = base.quotas.write();
+                for (ino, snap) in stage_map {
+                    let q = quotas.get_mut(&ino);
+                    if let Some(q) = q {
+                        q.new_space.fetch_sub(snap.0, Ordering::SeqCst);
+                        q.used_space.fetch_add(snap.0, Ordering::SeqCst);
+                        q.new_inodes.fetch_sub(snap.1, Ordering::SeqCst);
+                        q.used_inodes.fetch_add(snap.1, Ordering::SeqCst);
+                    }
+                }
+            },
+            Err(e) => warn!("Flush quotas: {}", e),
+        }
+    }
+
+    async fn flush_dir_stat(&self) {
+        if !self.get_format().enable_dir_stats {
+            return;
+        }
+
+        let base = self.as_ref();
+        let dir_stats = {
+            let mut dir_stats = base.dir_stats_batch.lock();
+            mem::take(&mut *dir_stats)
+        };
+        if !dir_stats.is_empty() {
+            self.do_flush_dir_stat(dir_stats).await;
+        }
+    }
+
+    async fn cleanup_trash(&self, days: u8, force: bool) {
+        todo!()
+    }
+
+    async fn cleanup_trash_before(&self, edge: Duration) {
+        todo!()
+    }
+
+    async fn cleanup_trash_slices(&self, days: u8) {
+        todo!()
     }
 }
 
@@ -740,13 +948,160 @@ where
     }
 
     // NewSession creates or update client session.
-    async fn new_session(&self, persist: bool) -> Result<()> {
-        todo!()
+    // TODO: 将部分需要new session修改的东西放在一个单独的结构体。还有比如在new session中启动的协程在close时进行关闭
+    async fn new_session(self: Arc<Self>, persist: bool) -> Result<()> {
+        let meta = self.clone();
+        tokio::spawn(async {
+            meta.refresh_session().await;
+        });
+
+        let base = self.as_ref().as_ref();
+        self.cache_acls().await?;
+        if base.conf.read_only {
+            // TODO: add version detail
+            info!("Create read-only session OK with version: ");
+            return Ok(());
+        }
+
+        // use the original sid if it's not 0
+        let (action, sid) = match base.conf.sid {
+            Some(sid) => ("Update", sid),
+            None => {
+                let next_sid = self.incr_counter("nextSession", 1).await?;
+                ("Create", next_sid as u64)
+            }
+        };
+        {
+            let mut sid_guard = base.sid.write();
+            *sid_guard = Some(sid);
+        }
+        if persist {   
+            let session_info = base.new_session_info();    
+            self.clone().do_new_session(sid, &bincode::serialize(&session_info).unwrap(), action == "Update")
+                .await?;
+            info!("{} session {} OK with version:", action, sid);
+        }
+
+        self.load_quotas().await;
+        let meta = self.clone();
+        // flush stats
+        tokio::spawn(async move {
+            meta.flush_stats().await;
+        });
+        let meta = self.clone();
+        // flush dir stats
+        tokio::spawn(async move {
+            let period = meta.as_ref().as_ref().conf.dir_stat_flush_period;
+            loop {
+                sleep(period).await;
+                meta.flush_dir_stat().await;
+            }
+        });
+        // flush quota
+        let meta = self.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(3)).await;
+                meta.flush_quotas().await;
+            }
+        });
+
+        if base.conf.enable_bg_job {
+            // cleanup deleted files
+            let meta = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep_with_jitter(Duration::from_mins(1)).await;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+                    match meta.set_if_small("lastCleanupFiles", now, Duration::from_secs(54)).await {
+                        Ok(true) => {
+                            match meta.do_find_deleted_files(now - Duration::from_hours(1), 10000).await {
+                                Ok(files) => {
+                                    for (inode, length) in files {
+                                        info!("cleanup chunks of inode {} with {} bytes", inode, length);
+                                        meta.do_delete_file_data(inode, length).await;
+                                    }
+                                }
+                                Err(e) => warn!("scan deleted files: {}", e),
+                            }                            
+                            
+                        },
+                        Ok(false) => (),
+                        Err(e) => warn!("checking counter lastCleanupFiles: {}", e),
+                    }
+                }
+            }); 
+            // cleaup slices
+            let meta = self.clone();
+            tokio::spawn(async move{
+                loop {
+                    sleep_with_jitter(Duration::from_hours(1)).await;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+                    match meta.set_if_small("nextCleanupSlices", now, Duration::from_mins(54)).await {
+                        Ok(true) => {
+                            meta.do_cleanup_slices().await;
+                        },
+                        Ok(false) => (),
+                        Err(e) => warn!("checking counter nextCleanupSlices: {}", e),
+                    }
+                }
+            });
+            // cleanup trash
+            let meta = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep_with_jitter(Duration::from_hours(1)).await;
+                    if let Err(e) = meta.do_get_attr(TRASH_INODE).await {
+                        if let MyError::SysError { code } = e && code != libc::ENOENT {
+                            warn!("getattr inode {}: {}", TRASH_INODE, code);
+                        }
+                        continue;
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+                    match meta.set_if_small("lastCleanupTrash", now, Duration::from_mins(54)).await {
+                        Ok(true) => {
+                            let days = meta.get_format().trash_days;
+                            meta.cleanup_trash(days, false).await;
+                            meta.cleanup_trash_slices(days).await;
+                        },
+                        Ok(false) => {},
+                        Err(e) => warn!("checking counter lastCleanupTrash: {}", e),
+                    }
+                }
+            });
+        }
+        Ok(())
     }
 
     // CloseSession does cleanup and close the session.
     async fn close_session(&self) -> Result<()> {
-        todo!()
+        let base = self.as_ref();
+        if base.conf.read_only {
+            return Ok(());
+        }
+
+        self.flush_dir_stat().await;
+        self.flush_quotas().await;
+        {
+            let mut unmounting = base.ses_umounting.lock().await;
+            *unmounting = true;
+        }
+        let sid = {
+            base.sid.read().clone()
+        };
+        if let Some(sid) = sid {
+            let res = self.do_clean_stale_session(sid).await;
+            info!("close session {}: {:?}", sid, res);
+            res
+        } else {
+            Ok(())
+        }
     }
 
     // GetSession retrieves information of session with sid
@@ -913,16 +1268,14 @@ where
             // do_get_attr could overwrite the `attr` after timeout
             if let Ok(Ok(attr)) = timeout(Duration::from_millis(300), async {
                 self.do_get_attr(inode).await
-            }).await {
+            })
+            .await
+            {
                 Ok(attr)
             } else {
-                Ok(Attr{
+                Ok(Attr {
                     typ: INodeType::TypeDirectory,
-                    mode: if inode.is_trash() {
-                        0o555
-                    } else {
-                        0o777
-                    },
+                    mode: if inode.is_trash() { 0o555 } else { 0o777 },
                     nlink: 2,
                     length: 4 << 10,
                     parent: ROOT_INODE,
@@ -1031,7 +1384,7 @@ where
 
         let parent = self.as_ref().check_root(parent);
         let (space, inodes) = (align_4k(0), 1);
-        self.check_quota(space, inodes, [parent].into()).await?;
+        self.check_quotas(space, inodes, [parent].into()).await?;
 
         let mut attr = Attr::default();
         match r#type {
@@ -1062,7 +1415,7 @@ where
             Ok(attr) => {
                 self.update_stats(space, inodes).await;
                 self.update_dir_stats(parent, 0, space, inodes);
-                self.update_dir_quota(parent, space, inodes).await;
+                self.update_quota(parent, space, inodes).await;
                 Ok((ino, attr))
             }
             Err(e) => Err(e),
@@ -1109,7 +1462,7 @@ where
             0
         };
         self.update_dir_stats(parent, -(diff_length as i64), -(align_4k(diff_length)), -1);
-        self.update_dir_quota(parent, -(align_4k(diff_length)), -1)
+        self.update_quota(parent, -(align_4k(diff_length)), -1)
             .await;
         Ok(())
     }

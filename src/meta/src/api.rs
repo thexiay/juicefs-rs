@@ -122,7 +122,7 @@ pub struct TreeSummary {
     pub children: Option<Vec<TreeSummary>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub version: String,
     pub host_name: String,
@@ -132,18 +132,21 @@ pub struct SessionInfo {
     pub process_id: u32,
 }
 
+#[derive(Debug)]
 pub struct Flock {
     pub inode: Ino,
     pub owner: u64,
     pub l_type: String,
 }
 
+#[derive(Debug)]
 pub struct Plock {
     pub inode: Ino,
     pub owner: u64,
     pub records: Vec<PlockRecord>,
 }
 
+#[derive(Debug)]
 pub struct Session {
     pub sid: u64,
     pub expire: SystemTime,
@@ -225,10 +228,13 @@ pub trait Meta: Send + Sync + 'static {
     // Reset cleans up all metadata, VERY DANGEROUS!
     async fn reset(&self) -> Result<()>;
 
-    // NewSession creates or update client session.
-    async fn new_session(&self, persist: bool) -> Result<()>;
+    /// Mount func.NewSession creates or update client session.
+    /// 
+    /// New session will start serveal different coroutine to do background job, those backgroud job no need to consider
+    /// be closed, because once session close, this process exit.
+    async fn new_session(self: Arc<Self>, persist: bool) -> Result<()>;
 
-    // CloseSession does cleanup and close the session.
+    // UnMount func.CloseSession does cleanup and close the session.
     async fn close_session(&self) -> Result<()>;
 
     // GetSession retrieves information of session with sid

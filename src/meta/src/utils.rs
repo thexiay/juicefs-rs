@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
+
+use rand::Rng;
+use tokio::time::sleep;
 
 use crate::api::{Attr, ModeMask};
 
@@ -8,6 +11,7 @@ pub struct FreeID {
 	pub maxid: u64,
 }
 
+#[derive(Debug)]
 pub struct PlockRecord {
 	pub r#type: u32,
 	pub pid: u32,
@@ -51,4 +55,13 @@ pub fn access_mode(attr: &Attr, uid: u32, gids: Vec<u32>) -> ModeMask {
 		}
 	}
 	return ModeMask::FULL & ModeMask::from_bits_truncate(mode as u8);
+}
+
+pub async fn sleep_with_jitter(d: Duration) {
+	let j = (d / 20).as_millis() as i64;
+	let num = {
+		let mut rng = rand::thread_rng();
+		rng.gen_range((-j)..j)
+	};
+	sleep(Duration::from_millis((d.as_millis() as i64 + num) as u64)).await;
 }

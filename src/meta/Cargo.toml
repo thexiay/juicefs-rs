@@ -31,6 +31,8 @@ deadpool = { workspace = true }
 deadpool-redis = { workspace = true }
 crc32fast = { workspace = true }
 chrono = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

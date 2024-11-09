@@ -1,5 +1,6 @@
 use std::sync::atomic::AtomicI64;
 
+#[derive(Default, Debug)]
 pub struct Quota {
     pub max_space: AtomicI64,
     pub max_inodes: AtomicI64,

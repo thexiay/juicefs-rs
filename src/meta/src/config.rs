@@ -20,7 +20,8 @@ pub struct Config {
     pub skip_dir_nlink: isize,
     pub case_insensi: bool,
     pub read_only: bool,
-    pub no_bg_job: bool, // disable background jobs like clean-up, backup, etc.
+    // enable background jobs like clean-up, backup, etc.
+    pub enable_bg_job: bool,
     // open files cache expire time
     pub open_cache: Duration,
     /// max number of files to cache (soft limit)
@@ -32,6 +33,7 @@ pub struct Config {
     pub dir_stat_flush_period: Duration,
     /// skip directory mtime update if the difference is less than this value
     pub skip_dir_mtime: Duration,
+    /// user set sid
     pub sid: Option<u64>,
 }
 
@@ -39,20 +41,20 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             strict: true,
-            retries: 10,
+            retries: 3,
             max_deletes_threads: 2,
             max_deletes_task: 100,
             skip_dir_nlink: 0,
             case_insensi: false,
             read_only: false,
-            no_bg_job: false,
+            enable_bg_job: true,
             open_cache: Duration::from_secs(60),
             open_cache_limit: 100000,
             heartbeat: Duration::from_secs(10),
             mount_point: "/".to_string(),
             subdir: "juicefs".to_string(),
             atime_mode: "relatime".to_string(),
-            dir_stat_flush_period: Duration::from_secs(60),
+            dir_stat_flush_period: Duration::from_secs(1),
             skip_dir_mtime: Duration::from_secs(1),
             sid: None,
         }
@@ -76,7 +78,7 @@ impl Config {
 }
 
 /// Config for server
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Format {
     pub name: String,
     pub uuid: String,
@@ -97,12 +99,45 @@ pub struct Format {
     pub key_encrypted: Option<bool>,
     pub upload_limit: Option<i64>,   // Mbps
     pub download_limit: Option<i64>, // Mbps
-    pub trash_days: i32,
+    // max days to remain for trash(trash dir and trash slices)
+    pub trash_days: u8,
     pub meta_version: i32,
     pub min_client_version: Option<String>,
     pub max_client_version: Option<String>,
     pub enable_dir_stats: bool,
     pub enable_acl: bool,
+}
+
+impl Default for Format {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            uuid: Default::default(),
+            storage: Default::default(),
+            storage_class: Default::default(),
+            bucket: Default::default(),
+            access_key: Default::default(),
+            secret_key: Default::default(),
+            session_token: Default::default(),
+            block_size: Default::default(),
+            compression: Default::default(),
+            shards: Default::default(),
+            hash_prefix: Default::default(),
+            capacity: Default::default(),
+            inodes: Default::default(),
+            encrypt_key: Default::default(),
+            encrypt_algo: Default::default(),
+            key_encrypted: Default::default(),
+            upload_limit: Default::default(),
+            download_limit: Default::default(),
+            trash_days: Default::default(),
+            meta_version: Default::default(),
+            min_client_version: Default::default(),
+            max_client_version: Default::default(),
+            enable_dir_stats: false,
+            enable_acl: false,
+        }
+    }
 }
 
 impl Format {
@@ -123,7 +158,10 @@ impl Format {
                 .fail();
             } else if self.compression != old.compression {
                 return UpgradeFormatSnafu {
-                    detail: format!("compression {:?} -> {:?}", old.compression, self.compression),
+                    detail: format!(
+                        "compression {:?} -> {:?}",
+                        old.compression, self.compression
+                    ),
                 }
                 .fail();
             } else if self.shards != old.shards {
@@ -133,7 +171,10 @@ impl Format {
                 .fail();
             } else if self.hash_prefix != old.hash_prefix {
                 return UpgradeFormatSnafu {
-                    detail: format!("hash prefix {:?} -> {:?}", old.hash_prefix, self.hash_prefix),
+                    detail: format!(
+                        "hash prefix {:?} -> {:?}",
+                        old.hash_prefix, self.hash_prefix
+                    ),
                 }
                 .fail();
             } else if self.meta_version != old.meta_version {
