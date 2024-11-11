@@ -66,6 +66,10 @@ pub enum MyError {
     #[snafu(display("cannot upgrade format: {detail}"))]
     UpgradeFormatError {
         detail: String,
+    },
+    #[snafu(display("cannot deserialize rightfully from data, detail: {detail}"))]
+    IllegalDataFormatError {
+        detail: String,
     }
     
     

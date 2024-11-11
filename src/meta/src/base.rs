@@ -5,10 +5,10 @@ use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::{mem, process};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{mem, process};
 use sysinfo::{get_current_pid, PidExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclCache, AclType, Rule};
 use crate::api::{
-    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
+    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo,
+    Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
@@ -110,6 +111,8 @@ pub trait Engine {
     async fn do_load(&self) -> Result<Option<Format>>;
     async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
     async fn do_refresh_session(&self, sid: u64) -> Result<()>;
+    async fn do_list_sessions(&self) -> Result<Vec<Session>>;
+    async fn do_get_session(&self, sid: u64, detail: bool) -> Result<Session>;
 
     /// find stale session
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>>;
@@ -249,8 +252,6 @@ pub trait Engine {
     async fn scan_pending_slices(&self, pending_slice_scan: PendingSliceScan) -> Result<()>;
     async fn scan_pending_files(&self, pending_file_scan: PendingFileScan) -> Result<()>;
 
-    async fn get_session(&self, sid: u64, detail: bool) -> Result<Session>;
-
     async fn do_set_facl(&self, ino: Ino, acl_type: AclType, rule: &Rule) -> Result<()>;
     async fn do_get_facl(&self, ino: Ino, acl_type: AclType, acl_id: u32) -> Result<Rule>;
     async fn cache_acls(&self) -> Result<()>;
@@ -304,9 +305,6 @@ pub trait MetaOtherFunction {
     /// do persist session info into meta persist layer periodly
     async fn refresh_session(self: Arc<Self>);
 
-    /// cleanup stale sessions which have not been refreshed for days
-    async fn cleanup_stale_sessions(&self);
-    
     /// cleanup trash which have not been deleted for days
     async fn cleanup_trash(&self, days: u8, force: bool);
 
@@ -467,7 +465,9 @@ where
         loop {
             {
                 let guard = self.as_ref().quotas.read();
-                if let Some(quota) = guard.get(&inode) && quota.check(space, inodes) {
+                if let Some(quota) = guard.get(&inode)
+                    && quota.check(space, inodes)
+                {
                     return true;
                 }
             }
@@ -497,22 +497,26 @@ where
             Ok(loaded_quotas) => {
                 let base = self.as_ref();
                 let mut quotas = base.quotas.write();
-                
+
                 quotas.iter().for_each(|(ino, _)| {
                     if !loaded_quotas.contains_key(ino) {
                         // quota cache should be consistent with the meta persist layer
                         error!("Quota for inode {} is deleted", ino);
                     }
                 });
-                
+
                 loaded_quotas.iter().for_each(|(ino, quota)| {
                     if let Some(q) = quotas.get(ino) {
-                        quota.new_space.fetch_add(q.new_space.load(Ordering::SeqCst), Ordering::SeqCst);
-                        quota.new_inodes.fetch_add(q.new_inodes.load(Ordering::SeqCst), Ordering::SeqCst);
+                        quota
+                            .new_space
+                            .fetch_add(q.new_space.load(Ordering::SeqCst), Ordering::SeqCst);
+                        quota
+                            .new_inodes
+                            .fetch_add(q.new_inodes.load(Ordering::SeqCst), Ordering::SeqCst);
                     }
                 });
                 *quotas = loaded_quotas;
-            },
+            }
             Err(e) => warn!("Load quotas: {}", e),
         }
     }
@@ -754,28 +758,34 @@ where
                 if *unmounting {
                     return;
                 }
-                let sid = {
-                    base.sid.read().map(|sid| sid)
-                };
-                if let Some(sid) = sid && base.conf.read_only {
-                    self.do_refresh_session(sid).await.inspect_err(|err| error!("Refresh session: {}", err));
+                let sid = { base.sid.read().map(|sid| sid) };
+                if let Some(sid) = sid
+                    && base.conf.read_only
+                {
+                    match self.do_refresh_session(sid).await {
+                        Ok(_) => (),
+                        Err(e) => error!("Refresh session: {}", e),
+                    }
                 }
             }
-            
+
             // notify format changed
             let old = self.get_format();
             let format = self.load(false).await;
             match format {
                 Ok(format) => {
                     if format.meta_version > MAX_VERSION {
-                        error!("incompatible metadata version {} > max version {}", format.meta_version, MAX_VERSION);
+                        error!(
+                            "incompatible metadata version {} > max version {}",
+                            format.meta_version, MAX_VERSION
+                        );
                         process::exit(UMOUNT_EXIT_CODE);
                     }
                     if format.uuid != old.uuid {
                         error!("UUID changed from {} to {}", old.uuid, format.uuid);
                         process::exit(UMOUNT_EXIT_CODE);
                     }
-                    
+
                     if format != old {
                         for cb in base.reload_format_callbacks.iter() {
                             cb(format.clone());
@@ -785,7 +795,7 @@ where
                 Err(e @ MyError::NotInitializedError) => {
                     error!("reload setting: {}", e);
                     process::exit(UMOUNT_EXIT_CODE);
-                },
+                }
                 Err(e) => warn!("reload setting: {}", e),
             }
 
@@ -805,7 +815,10 @@ where
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards");
-            match self.set_if_small("lastCleanupSessions", now, base.conf.heartbeat * 9 / 10).await {
+            match self
+                .set_if_small("lastCleanupSessions", now, base.conf.heartbeat * 9 / 10)
+                .await
+            {
                 Ok(true) => {
                     let meta = self.clone();
                     tokio::spawn(async move {
@@ -815,20 +828,6 @@ where
                 Err(e) => warn!("checking counter lastCleanupSessions: {}", e),
                 _ => {}
             }
-        }
-    }
-
-    async fn cleanup_stale_sessions(&self) {
-        match self.do_find_stale_sessions(1000).await {
-            Ok(sids) => {
-                for sid in sids {
-                    if let Ok(session) = self.get_session(sid, false).await {
-                        warn!("Get stale session info {}: {:?}", sid, session);
-                    }
-                    info!("Clean up stale session {}: {:?}", sid, self.do_clean_stale_session(sid).await);
-                }
-            },
-            Err(e) => warn!("scan stale sessions: {}", e),
         }
     }
 
@@ -866,7 +865,7 @@ where
                         q.used_inodes.fetch_add(snap.1, Ordering::SeqCst);
                     }
                 }
-            },
+            }
             Err(e) => warn!("Flush quotas: {}", e),
         }
     }
@@ -975,9 +974,14 @@ where
             let mut sid_guard = base.sid.write();
             *sid_guard = Some(sid);
         }
-        if persist {   
-            let session_info = base.new_session_info();    
-            self.clone().do_new_session(sid, &bincode::serialize(&session_info).unwrap(), action == "Update")
+        if persist {
+            let session_info = base.new_session_info();
+            self.clone()
+                .do_new_session(
+                    sid,
+                    &bincode::serialize(&session_info).unwrap(),
+                    action == "Update",
+                )
                 .await?;
             info!("{} session {} OK with version:", action, sid);
         }
@@ -1015,36 +1019,47 @@ where
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Time went backwards");
-                    match meta.set_if_small("lastCleanupFiles", now, Duration::from_secs(54)).await {
+                    match meta
+                        .set_if_small("lastCleanupFiles", now, Duration::from_secs(54))
+                        .await
+                    {
                         Ok(true) => {
-                            match meta.do_find_deleted_files(now - Duration::from_hours(1), 10000).await {
+                            match meta
+                                .do_find_deleted_files(now - Duration::from_hours(1), 10000)
+                                .await
+                            {
                                 Ok(files) => {
                                     for (inode, length) in files {
-                                        info!("cleanup chunks of inode {} with {} bytes", inode, length);
+                                        info!(
+                                            "cleanup chunks of inode {} with {} bytes",
+                                            inode, length
+                                        );
                                         meta.do_delete_file_data(inode, length).await;
                                     }
                                 }
                                 Err(e) => warn!("scan deleted files: {}", e),
-                            }                            
-                            
-                        },
+                            }
+                        }
                         Ok(false) => (),
                         Err(e) => warn!("checking counter lastCleanupFiles: {}", e),
                     }
                 }
-            }); 
+            });
             // cleaup slices
             let meta = self.clone();
-            tokio::spawn(async move{
+            tokio::spawn(async move {
                 loop {
                     sleep_with_jitter(Duration::from_hours(1)).await;
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Time went backwards");
-                    match meta.set_if_small("nextCleanupSlices", now, Duration::from_mins(54)).await {
+                    match meta
+                        .set_if_small("nextCleanupSlices", now, Duration::from_mins(54))
+                        .await
+                    {
                         Ok(true) => {
                             meta.do_cleanup_slices().await;
-                        },
+                        }
                         Ok(false) => (),
                         Err(e) => warn!("checking counter nextCleanupSlices: {}", e),
                     }
@@ -1056,7 +1071,9 @@ where
                 loop {
                     sleep_with_jitter(Duration::from_hours(1)).await;
                     if let Err(e) = meta.do_get_attr(TRASH_INODE).await {
-                        if let MyError::SysError { code } = e && code != libc::ENOENT {
+                        if let MyError::SysError { code } = e
+                            && code != libc::ENOENT
+                        {
                             warn!("getattr inode {}: {}", TRASH_INODE, code);
                         }
                         continue;
@@ -1064,13 +1081,16 @@ where
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Time went backwards");
-                    match meta.set_if_small("lastCleanupTrash", now, Duration::from_mins(54)).await {
+                    match meta
+                        .set_if_small("lastCleanupTrash", now, Duration::from_mins(54))
+                        .await
+                    {
                         Ok(true) => {
                             let days = meta.get_format().trash_days;
                             meta.cleanup_trash(days, false).await;
                             meta.cleanup_trash_slices(days).await;
-                        },
-                        Ok(false) => {},
+                        }
+                        Ok(false) => {}
                         Err(e) => warn!("checking counter lastCleanupTrash: {}", e),
                     }
                 }
@@ -1092,9 +1112,7 @@ where
             let mut unmounting = base.ses_umounting.lock().await;
             *unmounting = true;
         }
-        let sid = {
-            base.sid.read().clone()
-        };
+        let sid = { base.sid.read().clone() };
         if let Some(sid) = sid {
             let res = self.do_clean_stale_session(sid).await;
             info!("close session {}: {:?}", sid, res);
@@ -1111,7 +1129,7 @@ where
 
     // ListSessions returns all client sessions.
     async fn list_sessions(&self) -> Result<Vec<Session>> {
-        todo!()
+        self.do_list_sessions().await
     }
 
     // ScanDeletedObject scan deleted objects by customized scanner.
@@ -1130,13 +1148,23 @@ where
         todo!()
     }
 
-    // CleanStaleSessions cleans up sessions not active for more than 5 minutes
-    async fn clean_stale_sessions(
-        &self,
-        edge: SystemTime,
-        incre_process: Box<dyn Fn(isize) + Send>,
-    ) {
-        todo!()
+    // CleanStaleSessions cleans up sessions not active for edge times.
+    async fn cleanup_stale_sessions(&self) {
+        match self.do_find_stale_sessions(1000).await {
+            Ok(sids) => {
+                for sid in sids {
+                    if let Ok(session) = self.get_session(sid, false).await {
+                        warn!("Get stale session info {}: {:?}", sid, session);
+                    }
+                    info!(
+                        "Clean up stale session {}: {:?}",
+                        sid,
+                        self.do_clean_stale_session(sid).await
+                    );
+                }
+            }
+            Err(e) => warn!("scan stale sessions: {}", e),
+        }
     }
 
     // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
@@ -1362,12 +1390,12 @@ where
     async fn mknod(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         r#type: INodeType,
         mode: u16,
         cumask: u16,
         rdev: u32,
-        path: String,
+        path: &str,
     ) -> Result<(Ino, Attr)> {
         if parent.is_trash() {
             return SysSnafu { code: libc::EPERM }.fail();
@@ -1409,7 +1437,7 @@ where
         attr.full = true;
         let ino = self.next_inode().await?;
         match self
-            .do_mknod(parent, &name, mode, cumask, &path, ino, attr)
+            .do_mknod(parent, &name, mode, cumask, path, ino, attr)
             .await
         {
             Ok(attr) => {
@@ -1426,12 +1454,17 @@ where
     async fn mkdir(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         mode: u16,
         cumask: u16,
         copysgid: u8,
     ) -> Result<(Ino, Attr)> {
-        todo!()
+        self.mknod(parent, name, INodeType::TypeDirectory, mode, cumask, 0, "").await
+            .inspect(|(ino, _)| {
+                let base = self.as_ref();
+                let mut dir_parents = base.dir_parents.lock();
+                dir_parents.insert(*ino, parent);
+            })
     }
 
     // Unlink removes a file entry from a directory.
@@ -1502,7 +1535,7 @@ where
     async fn create(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         mode: u16,
         cumask: u16,
         flags: i32,
@@ -1515,18 +1548,18 @@ where
                 mode,
                 cumask,
                 0,
-                "".to_string(),
+                "",
             )
             .await
         {
             Ok((ino, mut attr)) => {
-                self.as_ref().open_files.open(ino, &mut attr);
+                self.as_ref().open_files.open(ino, &mut attr).await;
                 Ok((ino, attr))
             }
             Err(MyError::FileExistError { ino, mut attr })
                 if (flags & libc::O_EXCL == 0 && attr.typ == INodeType::TypeFile) =>
             {
-                self.as_ref().open_files.open(ino, &mut attr);
+                self.as_ref().open_files.open(ino, &mut attr).await;
                 Ok((ino, attr))
             }
             Err(e) => Err(e),
@@ -1682,7 +1715,7 @@ where
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: String, count: &mut u64) -> Result<()> {
+    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> Result<()> {
         todo!()
     }
 
@@ -1726,5 +1759,9 @@ where
     // Change root to a directory specified by subdir
     async fn chroot(&self, subdir: String) -> Result<()> {
         todo!()
+    }
+
+    fn get_base(&self) -> &CommonMeta {
+        self.as_ref()
     }
 }

@@ -1,3 +1,5 @@
+#![feature(let_chains)]
+
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
@@ -17,6 +19,7 @@ pub fn test_format() -> Format {
     }
 }
 
+#[cfg(test)]
 pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     match m.get_attr(1).await {
         Ok(attr) if attr.mode != 0777 => panic!("getattr root mode err"),
@@ -35,40 +38,37 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     )
     .await
     .expect_err("change name without --force is not allowed");
-    let format = m.load(true).await.expect("load failed after initalization: ");
+    let format = m
+        .load(true)
+        .await
+        .expect("load failed after initalization: ");
     if format.name != "test" {
         panic!("load got volume name {} != test", format.name);
     }
+    // begin session
     m.clone().new_session(true).await.expect("new session: ");
-    /*
-    m.close_session().await.expect("close session: ");
     let sessions = m.list_sessions().await.expect("list sessions: ");
     if sessions.len() != 1 {
         panic!("list sessions cnt should be 1");
     }
-     */
+    let base = m.get_base();
+    let base_sid = { base.sid.read().clone() };
+    match base_sid {
+        Some(sid) if sid == sessions[0].sid => (),
+        _ => panic!(
+            "my sid {:?} != registered sid {}",
+            base_sid, sessions[0].sid
+        ),
+    }
+    let meta = m.clone();
+    tokio::spawn(async move {
+        meta.cleanup_stale_sessions().await;
+    });
+
+    // test mkdir rmdir
+    let (parent, attr) = m.mkdir(1, "d", 0o640, 0o22, 0).await.expect("mkdir d: ");
+
     /*
-    
-    format, err := m.Load(true)
-    if err != nil {
-        t.Fatalf("load failed after initialization: %s", err)
-    }
-    if format.Name != "test" {
-        t.Fatalf("load got volume name %s, expected %s", format.Name, "test")
-    }
-    if err = m.NewSession(true); err != nil {
-        t.Fatalf("new session: %s", err)
-    }
-    defer m.CloseSession()
-    ses, err := m.ListSessions()
-    if err != nil || len(ses) != 1 {
-        t.Fatalf("list sessions %+v: %s", ses, err)
-    }
-    base := m.getBase()
-    if base.sid != ses[0].Sid {
-        t.Fatalf("my sid %d != registered sid %d", base.sid, ses[0].Sid)
-    }
-    go m.CleanStaleSessions()
 
     var parent, inode, dummyInode Ino
     if st := m.Mkdir(ctx, 1, "d", 0640, 022, 0, &parent, attr); st != 0 {
@@ -103,7 +103,7 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
 
     m.clone().unlink(1, "f", false).await.expect("unlink f: ");
     let (inode, attr) = m
-        .create(1, "f".to_string(), 0650, 022, 0)
+        .create(1, "f", 0650, 022, 0)
         .await
         .expect("create file: {}");
     let slice_id = m.new_slice().await.expect("new chunk: ");
@@ -167,21 +167,21 @@ pub async fn test_parents(m: Box<Arc<dyn Meta>>) {}
 
 pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
     let (_, _) = m
-        .create(1, "f".to_string(), 0644, 0, 0)
+        .create(1, "f", 0644, 0, 0)
         .await
         .expect("create f: ");
 
-    m.remove(1, "f".to_string(), &mut 0).await.expect("rmr f: ");
+    m.remove(1, "f", &mut 0).await.expect("rmr f: ");
     let (parent, _) = m
-        .mkdir(1, "d".to_string(), 0755, 0, 0)
+        .mkdir(1, "d", 0755, 0, 0)
         .await
         .expect("mkdir d: ");
     let (_, _) = m
-        .mkdir(parent, "d2".to_string(), 0755, 0, 0)
+        .mkdir(parent, "d2", 0755, 0, 0)
         .await
         .expect("create d/d2: ");
     let (inode, attr) = m
-        .create(parent, "f".to_string(), 0644, 0, 0)
+        .create(parent, "f", 0644, 0, 0)
         .await
         .expect("create d/f: ");
 
@@ -195,7 +195,7 @@ pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
     }
     for i in 0..4096 {
         let name = format!("f{}", i);
-        m.create(1, name.clone(), 0644, 0, 0)
+        m.create(1, &name, 0644, 0, 0)
             .await
             .expect(&format!("create {name}"));
     }
@@ -205,7 +205,7 @@ pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
     if entries.len() != 4099 {
         panic!("entries: {}", entries.len());
     }
-    m.remove(1, "d".to_string(), &mut 0).await.expect("rmr d: ");
+    m.remove(1, "d", &mut 0).await.expect("rmr d: ");
 }
 
 async fn test_resolve(m: Box<Arc<dyn Meta>>) {}

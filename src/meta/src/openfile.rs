@@ -51,11 +51,15 @@ impl OpenFiles {
     }
 
     pub async fn open(&self, ino: Ino, attr: &mut Attr) {
-        let mut guard = self.files.lock();
-        let arc_of = guard
-            .entry(ino)
-            .or_insert(Arc::new(AsyncMutex::new(OpenFile::default())));
-        let mut of = arc_of.lock().await;
+        let of = {
+            let mut files = self.files.lock();
+            files
+                .entry(ino)
+                .or_insert(Arc::new(AsyncMutex::new(OpenFile::default())))
+                .clone()
+        };
+        
+        let mut of = of.lock().await;
         if attr.mtime == of.attr.mtime {
             attr.keep_cache = of.attr.keep_cache;
         } else {

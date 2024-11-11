@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::ops::BitAnd;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::base::{
-    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan,
-    TrashSliceScan,
+    CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
 };
 use crate::config::{Config, Format};
 use crate::error::{DriverSnafu, Result};
@@ -47,12 +46,12 @@ impl InoExt for Ino {
     fn is_root(&self) -> bool {
         *self == ROOT_INODE
     }
-    
+
     fn transfer_root(&self, real_root: Ino) -> Ino {
         match *self {
-            0 => ROOT_INODE,  // force using Root inode
+            0 => ROOT_INODE, // force using Root inode
             ROOT_INODE => real_root,
-            _ => *self,   
+            _ => *self,
         }
     }
 }
@@ -122,6 +121,7 @@ pub struct TreeSummary {
     pub children: Option<Vec<TreeSummary>>,
 }
 
+/// info about mount info. E.g, mount ip, mount host, mount time.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub version: String,
@@ -149,8 +149,8 @@ pub struct Plock {
 #[derive(Debug)]
 pub struct Session {
     pub sid: u64,
-    pub expire: SystemTime,
-    pub session_info: SessionInfo,
+    pub expire: Duration,
+    pub session_info: Option<SessionInfo>,
     pub sustained: Option<Vec<Ino>>,
     pub flocks: Option<Vec<Flock>>,
     pub plocks: Option<Vec<Plock>>,
@@ -175,7 +175,7 @@ bitflags! {
 // Attr represents attributes of a node.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Attr {
-    pub flags: Flag,        // flags
+    pub flags: Flag,      // flags
     pub typ: INodeType,   // type of a node
     pub mode: u16,        // permission mode
     pub uid: u32,         // owner id
@@ -228,8 +228,10 @@ pub trait Meta: Send + Sync + 'static {
     // Reset cleans up all metadata, VERY DANGEROUS!
     async fn reset(&self) -> Result<()>;
 
+    /// ------------------------------- Session func ----------------------------------------
+
     /// Mount func.NewSession creates or update client session.
-    /// 
+    ///
     /// New session will start serveal different coroutine to do background job, those backgroud job no need to consider
     /// be closed, because once session close, this process exit.
     async fn new_session(self: Arc<Self>, persist: bool) -> Result<()>;
@@ -255,12 +257,8 @@ pub trait Meta: Send + Sync + 'static {
     // ListLocks returns all locks of a inode.
     async fn list_locks(&self, inode: Ino) -> Result<(Vec<PLockItem>, Vec<FLockItem>)>;
 
-    // CleanStaleSessions cleans up sessions not active for more than 5 minutes
-    async fn clean_stale_sessions(
-        &self,
-        edge: SystemTime,
-        incre_process: Box<dyn Fn(isize) + Send>,
-    );
+    // CleanStaleSessions cleans up sessions which is expired.
+    async fn cleanup_stale_sessions(&self);
 
     // CleanupDetachedNodesBefore deletes all detached nodes before the given time.
     async fn cleanup_detached_nodes_before(
@@ -381,19 +379,19 @@ pub trait Meta: Send + Sync + 'static {
     async fn mknod(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         r#type: INodeType,
         mode: u16,
         cumask: u16,
         rdev: u32,
-        path: String,
+        path: &str,
     ) -> Result<(Ino, Attr)>;
 
     // Mkdir creates a sub-directory with given name and mode.
     async fn mkdir(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         mode: u16,
         cumask: u16,
         copysgid: u8,
@@ -401,7 +399,8 @@ pub trait Meta: Send + Sync + 'static {
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
-    async fn unlink(self: Arc<Self>, parent: Ino, name: &str, skip_check_trash: bool) -> Result<()>;
+    async fn unlink(self: Arc<Self>, parent: Ino, name: &str, skip_check_trash: bool)
+        -> Result<()>;
 
     // Rmdir removes an empty sub-directory.
     async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: &[bool]) -> Result<()>;
@@ -432,7 +431,7 @@ pub trait Meta: Send + Sync + 'static {
     async fn create(
         &self,
         parent: Ino,
-        name: String,
+        name: &str,
         mode: u16,
         cumask: u16,
         flags: i32,
@@ -451,8 +450,14 @@ pub trait Meta: Send + Sync + 'static {
     async fn new_slice(&self) -> Result<u64>;
 
     // Write put a slice of data on top of the given chunk.
-    async fn write(&self, inode: Ino, indx: u32, off: u32, slice: Slice, mtime: SystemTime)
-        -> Result<()>;
+    async fn write(
+        &self,
+        inode: Ino,
+        indx: u32,
+        off: u32,
+        slice: Slice,
+        mtime: SystemTime,
+    ) -> Result<()>;
 
     // InvalidateChunkCache invalidate chunk cache
     async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()>;
@@ -535,7 +540,7 @@ pub trait Meta: Send + Sync + 'static {
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: String, count: &mut u64) -> Result<()>;
+    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> Result<()>;
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(
@@ -570,6 +575,9 @@ pub trait Meta: Send + Sync + 'static {
 
     // Change root to a directory specified by subdir
     async fn chroot(&self, subdir: String) -> Result<()>;
+
+    // just for test
+    fn get_base(&self) -> &CommonMeta;
 }
 
 // NewClient creates a Meta client for given uri.
@@ -583,10 +591,8 @@ pub async fn new_client(uri: String, conf: Config) -> Box<Arc<dyn Meta>> {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
-    let res: Result<Box<Arc<dyn Meta> >> = match driver {
-        "redis" => {
-            RedisEngine::new(driver, addr, conf).await
-        }
+    let res: Result<Box<Arc<dyn Meta>>> = match driver {
+        "redis" => RedisEngine::new(driver, addr, conf).await,
         _ => DriverSnafu {
             driver: driver.to_string(),
         }

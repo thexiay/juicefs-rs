@@ -21,8 +21,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclId, AclType, Rule};
 use crate::api::{
-    gids, uid, Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, Session, Slice, Slices,
-    CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    gids, uid, Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session,
+    SessionInfo, Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
@@ -704,6 +704,62 @@ impl RedisEngine {
             }
         }
     }
+
+    async fn do_fill_session(&self, session: &mut Session, detail: bool) -> Result<()> {
+        let mut conn = self.share_conn();
+        let sid = session.sid;
+        let info: Option<Vec<u8>> = conn.hget(self.session_infos(), sid).await?;
+        session.session_info = match info {
+            Some(info) => Some(bincode::deserialize(&info)?),
+            None => None,
+        };
+
+        if detail {
+            let inodes: Vec<u64> = conn.smembers(self.sustained(sid)).await?;
+            session.sustained = Some(inodes);
+
+            let mut flocks = Vec::new();
+            let mut plocks = Vec::new();
+            let locks: Vec<String> = conn.smembers(self.locked(sid)).await?;
+            for lock in locks {
+                let owners: HashMap<String, Vec<u8>> = conn.hgetall(&lock).await?;
+                let is_flock = lock.starts_with("lockf");
+                let inode = lock[self.prefix.len() + 5..]
+                    .parse::<u64>()
+                    .map_err(|err| MyError::IllegalDataFormatError {
+                        detail: format!(
+                            "parse int err {}. fill session {}, semember {}",
+                            err, sid, lock
+                        ),
+                    })?;
+                for (k, v) in owners {
+                    let parts: Vec<&str> = k.split('_').collect();
+                    if parts[0] != sid.to_string() {
+                        continue;
+                    }
+                    let owner = match u64::from_str_radix(parts[1], 16) {
+                        Ok(owner) => owner,
+                        Err(err) => continue,
+                    };
+                    if is_flock {
+                        flocks.push(Flock {
+                            inode,
+                            owner,
+                            l_type: bincode::deserialize(&v)?,
+                        });
+                    } else {
+                        plocks.push(Plock {
+                            inode,
+                            owner,
+                            records: bincode::deserialize(&v)?,
+                        });
+                    }
+                }
+            }
+            (session.flocks, session.plocks) = (Some(flocks), Some(plocks));
+        }
+        Ok(())
+    }
 }
 
 impl AsRef<CommonMeta> for RedisEngine {
@@ -834,6 +890,43 @@ impl Engine for RedisEngine {
             .await?)
     }
 
+    async fn do_list_sessions(&self) -> Result<Vec<Session>> {
+        let mut conn = self.share_conn();
+        let keys: Vec<(u64, f64)> = conn.zrange_withscores(self.all_sessions(), 0, -1).await?;
+        let mut sessions = Vec::new();
+        for (key, ts) in keys {
+            let mut session = Session {
+                sid: key,
+                expire: Duration::from_secs_f64(ts),
+                session_info: None,
+                sustained: None,
+                flocks: None,
+                plocks: None,
+            };
+            if let Err(e) = self.do_fill_session(&mut session, false).await {
+                error!("Get session error: {}", e);
+                continue;
+            }
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    async fn do_get_session(&self, sid: u64, detail: bool) -> Result<Session> {
+        let mut conn = self.share_conn();
+        let score: f64 = conn.zscore(self.all_sessions(), sid).await?;
+        let mut session = Session {
+            sid,
+            expire: Duration::from_secs_f64(score),
+            session_info: None,
+            sustained: None,
+            flocks: None,
+            plocks: None,
+        };
+        self.do_fill_session(&mut session, detail).await?;
+        Ok(session)
+    }
+
     async fn do_find_stale_sessions(&self, limit: isize) -> Result<Vec<u64>> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
@@ -847,7 +940,6 @@ impl Engine for RedisEngine {
         Ok(conn
             .zrangebyscore_limit(self.all_sessions(), range.0, range.1, 0, limit)
             .await?)
-        // ignore go version before 1.0-beta3 as well, this version range is different
     }
 
     async fn do_clean_stale_session(&self, sid: u64) -> Result<()> {
@@ -1203,7 +1295,7 @@ impl Engine for RedisEngine {
                 quotas.insert(
                     inode,
                     Quota {
-                        max_space: AtomicI64::new(max_space) ,
+                        max_space: AtomicI64::new(max_space),
                         max_inodes: AtomicI64::new(max_inodes),
                         used_space: AtomicI64::new(used_space),
                         used_inodes: AtomicI64::new(used_inodes),
@@ -1780,10 +1872,6 @@ impl Engine for RedisEngine {
     }
 
     async fn scan_pending_files(&self, pending_file_scan: PendingFileScan) -> Result<()> {
-        unimplemented!()
-    }
-
-    async fn get_session(&self, sid: u64, detail: bool) -> Result<Session> {
         unimplemented!()
     }
 

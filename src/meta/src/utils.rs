@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::api::{Attr, ModeMask};
@@ -11,7 +12,7 @@ pub struct FreeID {
 	pub maxid: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PlockRecord {
 	pub r#type: u32,
 	pub pid: u32,
