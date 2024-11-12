@@ -13,7 +13,7 @@ use snafu::{ensure, ResultExt};
 use std::hash::{DefaultHasher, Hasher};
 use std::mem;
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{self, AtomicI64};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{self, sleep, Instant};
@@ -1561,10 +1561,10 @@ impl Engine for RedisEngine {
                     .query_async(conn)
                     .await?;
                 let (pattr_bytes, attr_bytes): (Vec<u8>, Option<Vec<u8>>) = conn
-                    .mget((self.inode_key(ino), self.inode_key(parent)))
+                    .mget((self.inode_key(parent), self.inode_key(ino)))
                     .await?;
                 let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
-                // double check: parent mut be a dir
+                // double check: parent mut be a dir and access mode 
                 if pattr.typ != INodeType::TypeDirectory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
@@ -1747,10 +1747,131 @@ impl Engine for RedisEngine {
         &self,
         parent: Ino,
         name: &str,
-        inode: &Ino,
-        skip_check_trash: &[bool],
-    ) -> Result<()> {
-        unimplemented!()
+        skip_check_trash: bool,
+    ) -> Result<Ino> {
+        let mut trash = if !skip_check_trash {
+            self.check_trash(parent).await?
+        } else {
+            None
+        };
+
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        let base = self.as_ref();
+        let ino = async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
+            // TODO: here is same with unlink
+            let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+            let (buf, name) = match buf {
+                Some(entry) => (entry, name.to_owned()),
+                None if base.conf.case_insensi => {
+                    if let Some(entry) = self.resolve_case(parent, name).await? {
+                        (
+                            bincode::serialize(&(entry.attr.typ, entry.inode)).unwrap(),
+                            entry.name.to_string(),
+                        )
+                    } else {
+                        return NotFoundInoSnafu { ino: parent }.fail();
+                    }
+                }
+                None => return NotFoundInoSnafu { ino: parent }.fail(),
+            };
+
+            let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
+            
+            if typ != INodeType::TypeDirectory {
+                return SysSnafu { code: libc::ENOTDIR }.fail();
+            }
+            // first find ino by parent ino and son name, then watch it
+            cmd("WATCH")
+                .arg(self.inode_key(ino))
+                .query_async(conn)
+                .await?;
+            let (pattr_bytes, attr_bytes): (Vec<u8>, Option<Vec<u8>>) = conn
+                .mget((self.inode_key(parent), self.inode_key(ino)))
+                .await?;
+            let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
+            // double check: parent mut be a dir and access mode 
+            if pattr.typ != INodeType::TypeDirectory {
+                return SysSnafu {
+                    code: libc::ENOTDIR,
+                }
+                .fail();
+            }
+            self.access(parent, ModeMask::WRITE | ModeMask::EXECUTE, &pattr)
+                .await?;
+            if pattr.flags.contains(Flag::APPEND) || pattr.flags.contains(Flag::IMMUTABLE) {
+                return SysSnafu { code: libc::EPERM }.fail();
+            }
+
+            // change time
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos();
+            pattr.nlink -= 1;
+            pattr.mtime = now;
+            pattr.ctime = now;
+            
+            let cnt: u64 = conn.hlen(self.dir_key(ino)).await?;
+            if cnt > 0 {
+                return SysSnafu { code: libc::ENOTEMPTY }.fail();
+            }
+            let attr = match attr_bytes {
+                Some(attr_bytes) => {
+                    let mut attr = bincode::deserialize::<Attr>(&attr_bytes)?;
+                    let uid = uid();
+                    if uid != 0
+                        && pattr.mode & 0o1000 != 0
+                        && uid != pattr.uid
+                        && uid != attr.uid
+                    {
+                        return SysSnafu { code: libc::EACCES }.fail();
+                    }
+                    if let Some(trash_ino) = trash {
+                        attr.ctime = now;
+                        attr.parent = trash_ino;
+                    }
+                    attr
+                },
+                None => {
+                    warn!("no attribute for inode {}  ({}, {})", ino, parent, name);
+                    trash.take();
+                    Attr::default()
+                }
+            };
+            
+            // make trascation
+            let mut pipe = pipe();
+            pipe.atomic();
+            pipe.hdel(self.dir_key(parent), &name);
+            if !parent.is_trash() {
+                pipe.set(self.inode_key(parent), bincode::serialize(&pattr).unwrap());
+            }
+            match trash {
+                Some(trash_ino) => {
+                    pipe.set(self.inode_key(ino), bincode::serialize(&attr).unwrap());
+                    pipe.hset(self.dir_key(trash_ino), self.trash_entry(parent, ino, &name), buf);
+                },
+                None => {
+                    pipe.del(self.inode_key(ino));
+                    pipe.del(self.xattr_key(ino));
+                    pipe.incr(self.used_space_key(), -utils::align_4k(0));
+                    pipe.decr(self.total_inodes_key(), -1);
+                }
+            }
+            pipe.hdel(self.dir_data_length_key(), ino);
+            pipe.hdel(self.dir_used_space_key(), ino);
+            pipe.hdel(self.dir_used_inodes_key(), ino);
+            pipe.hdel(self.dir_quota_key(), ino);
+            pipe.hdel(self.dir_quota_used_space_key(), ino);
+            pipe.hdel(self.dir_quota_used_inodes_key(), ino);
+            pipe.query_async(conn).await?;
+            Ok::<Option<u64>, MyError>(Some(ino))
+        })?;
+        if trash.is_none() {
+            self.update_stats(-utils::align_4k(0), -1).await;
+        }
+        Ok(ino)
     }
 
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)> {

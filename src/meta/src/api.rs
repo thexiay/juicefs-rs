@@ -403,7 +403,7 @@ pub trait Meta: Send + Sync + 'static {
         -> Result<()>;
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: &[bool]) -> Result<()>;
+    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino>;
 
     // Rename move an entry from a source directory to another with given name.
     // The targeted entry will be overwrited if it's a file or empty directory.

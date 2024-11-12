@@ -176,9 +176,8 @@ pub trait Engine {
         &self,
         parent: Ino,
         name: &str,
-        inode: &Ino,
-        skip_check_trash: &[bool],
-    ) -> Result<()>;
+        skip_check_trash: bool,
+    ) -> Result<Ino>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
     async fn do_readdir(&self, inode: Ino, plus: u8, limit: i32) -> Result<Option<Vec<Entry>>>;
     async fn do_rename(
@@ -1501,8 +1500,30 @@ where
     }
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: String, skip_check_trash: &[bool]) -> Result<()> {
-        todo!()
+    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino> {
+        match name {
+            "." => return SysSnafu { code: libc::EINVAL }.fail(),
+            ".." => return SysSnafu { code: libc::ENOTEMPTY }.fail(),
+            _ => {},
+        }
+        if (parent.is_root() && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
+            return SysSnafu { code: libc::EPERM }.fail();
+        }
+        let base = self.as_ref();
+        if base.conf.read_only {
+            return SysSnafu { code: libc::EROFS }.fail();
+        }
+        
+        let parent = parent.transfer_root(base.root);
+        self.do_rmdir(parent, name, skip_check_trash).await
+            .inspect(|ino| {
+                if !parent.is_trash() {
+                    let mut dir_parents = base.dir_parents.lock();
+                    dir_parents.remove(ino);
+                }
+                self.update_dir_stats(parent, 0, -(align_4k(0)), -1);
+                self.update_quota(parent, -(align_4k(0)), -1);
+            })
     }
 
     // Rename move an entry from a source directory to another with given name.

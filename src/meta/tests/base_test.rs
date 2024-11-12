@@ -21,7 +21,9 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
-    match m.get_attr(1).await {
+    use juice_meta::{api::ROOT_INODE, error::MyError};
+
+    match m.get_attr(ROOT_INODE).await {
         Ok(attr) if attr.mode != 0777 => panic!("getattr root mode err"),
         Err(err) => panic!("getattr root err {}", err),
         _ => {}
@@ -66,24 +68,22 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     });
 
     // test mkdir rmdir
-    let (parent, attr) = m.mkdir(1, "d", 0o640, 0o22, 0).await.expect("mkdir d: ");
+    let (parent, attr) = m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0).await.expect("mkdir d: ");
+    match m.clone().unlink(ROOT_INODE, "d", false).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::EPERM => (),
+        other => panic!("unlink d: {:?}", other),
+    };
+    match m.rmdir(parent, ".", false).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::EINVAL => (),
+        other => panic!("rmdir d: {:?}", other),
+    };
+    match m.rmdir(parent, "..", false).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::ENOTEMPTY => (),
+        other => panic!("rmdir d: {:?}", other),
+    };
+    // test lookup
 
     /*
-
-    var parent, inode, dummyInode Ino
-    if st := m.Mkdir(ctx, 1, "d", 0640, 022, 0, &parent, attr); st != 0 {
-        t.Fatalf("mkdir d: %s", st)
-    }
-    defer m.Rmdir(ctx, 1, "d")
-    if st := m.Unlink(ctx, 1, "d"); st != syscall.EPERM {
-        t.Fatalf("unlink d: %s", st)
-    }
-    if st := m.Rmdir(ctx, parent, "."); st != syscall.EINVAL {
-        t.Fatalf("unlink d.: %s", st)
-    }
-    if st := m.Rmdir(ctx, parent, ".."); st != syscall.ENOTEMPTY {
-        t.Fatalf("unlink d..: %s", st)
-    }
     if st := m.Lookup(ctx, 1, "d", &parent, attr, true); st != 0 {
         t.Fatalf("lookup d: %s", st)
     }
