@@ -50,6 +50,7 @@ impl OpenFiles {
         of
     }
 
+    /// Open a file. Hold a file locker.
     pub async fn open(&self, ino: Ino, attr: &mut Attr) {
         let of = {
             let mut files = self.files.lock();
@@ -84,6 +85,22 @@ impl OpenFiles {
                 of.refs > 0
             }
             None => false,
+        }
+    }
+
+    /// Close a fileholder.
+    /// Reentrant func.
+    pub async fn close(&self, ino: Ino) -> bool {
+        let file = {
+            let files = self.files.lock();
+            files.get(&ino).map(|file| file.clone())
+        };
+        if let Some(file) = file {
+            let mut of = file.lock().await;
+            of.refs -= 1;
+            of.refs <= 0
+        } else {
+            true
         }
     }
 

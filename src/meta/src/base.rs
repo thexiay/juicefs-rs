@@ -155,6 +155,7 @@ pub trait Engine {
         attr: &Attr,
     ) -> Result<()>;
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)>;
+    async fn do_resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)>;
     async fn do_mknod(
         &self,
         parent: Ino,
@@ -1269,18 +1270,68 @@ where
     async fn lookup(
         &self,
         parent: Ino,
-        name: String,
-        inode: &Ino,
-        attr: &Attr,
-        check_perm: bool,
-    ) -> Result<()> {
-        todo!()
+        name: &str,
+        check_permission: bool,
+    ) -> Result<(Ino, Attr)> {
+        let base = self.as_ref();
+        let parent = base.check_root(parent);
+        if check_permission {
+            let par_attr = self.get_attr(parent).await?;
+            self.access(parent, ModeMask::EXECUTE, &par_attr).await?;
+        }
+        let name = match name {
+            ".." if parent == base.root => {
+                "."
+            },
+            other => other,
+        };
+        match name {
+            ".." => {
+                let par_attr = self.get_attr(parent).await?;
+                if par_attr.typ != INodeType::TypeDirectory {
+                    return SysSnafu { code: libc::ENOTDIR }.fail();
+                } else {
+                    Ok(((par_attr.parent), self.get_attr(par_attr.parent).await?))
+                }
+            },
+            "." => {
+                Ok((parent, self.get_attr(parent).await?))
+            },
+            _ => {
+                if parent.is_root() && name == TRASH_NAME {
+                    Ok((TRASH_INODE, self.get_attr(TRASH_INODE).await?))
+                } else {
+                    let (inode, attr) = match self.do_lookup(parent, name).await {
+                        Ok((inode, attr)) => (inode, attr),
+                        Err(MyError::SysError { code }) if code == libc::ENOENT && base.conf.case_insensi => {
+                            if let Ok(Some(entry)) = self.resolve_case(parent, name).await {
+                                // TODO: why here not use e.attr directly?
+                                match self.get_attr(entry.inode).await {
+                                    Ok(attr) => (entry.inode, attr),
+                                    Err(_err @ MyError::SysError { code }) if code == libc::ENOENT => {
+                                        warn!("no attribute for inode {}({},{})", entry.inode, parent, entry.name);
+                                        (entry.inode, entry.attr)
+                                    },
+                                    Err(err) => return Err(err),
+                                }
+                            } else {
+                                return SysSnafu { code: libc::ENOENT }.fail();
+                            }
+                        },
+                        Err(e) => return Err(e),
+                    };
+                    if attr.typ == INodeType::TypeDirectory && !parent.is_trash() {
+                        let mut dir_parents = base.dir_parents.lock();
+                        dir_parents.insert(inode, parent);
+                    }
+                    Ok((inode, attr))
+                }
+            },
+        }
     }
-    // Resolve fetches the inode and attributes for an entry identified by the given path.
-    // ENOTSUP will be returned if there's no natural implementation for this operation or
-    // if there are any symlink following involved.
-    async fn resolve(&self, parent: Ino, path: String, inode: &Ino, attr: &Attr) -> Result<()> {
-        todo!()
+    
+    async fn resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)> {
+        self.do_resolve(parent, path).await
     }
 
     // GetAttr returns the attributes for given node.
@@ -1594,7 +1645,28 @@ where
 
     // Close a file.
     async fn close(&self, inode: Ino) -> Result<()> {
-        todo!()
+        let base = self.as_ref();
+        if base.open_files.close(inode).await {
+            let removed = {
+                let mut removed_files = base.removed_files.lock();
+                removed_files.remove(&inode)
+            };
+
+            let sid = {
+                let sid = base.sid.read();
+                sid.clone()
+            };
+            match sid {
+                Some(sid) => {
+                    if let Some(removed) = removed && removed {
+                        self.do_delete_sustained_inode(sid, inode).await?;
+                    }
+                },
+                None => error!("close a file happend at no session"),
+                _ => (),
+            }
+        }
+        Ok(())
     }
 
     // Read returns the list of slices on the given chunk.

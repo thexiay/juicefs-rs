@@ -199,6 +199,7 @@ pub struct RedisEngine {
     /// Redis normal mode
     pool: Pool<RedisClient>,
     shared_conn: ConnectionManager,
+    // 单机和集群模式才有这个前缀，哨兵和主从模式没有这个前缀，juicefs中的很多判断区别是这个
     prefix: String,
     lookup_script: Script,  // lookup lua script
     resolve_script: Script, // reslove lua script
@@ -1342,7 +1343,56 @@ impl Engine for RedisEngine {
     }
 
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)> {
-        unimplemented!()
+        let mut conn = self.share_conn();
+        let buf: Vec<u8> = conn.hget(self.dir_key(parent), name).await?;
+        let (ino_type, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
+        let attr_bytes: Option<Vec<u8>> = conn.get(self.inode_key(ino)).await?;
+        match attr_bytes {
+            Some(attr_bytes) => {
+                Ok((ino, (bincode::deserialize(&attr_bytes))?))
+            },
+            None => { // corrupt entry
+                warn!("no attribute for inode {} ({}, {})", ino, parent, name);
+                Ok((ino, Attr { 
+                    typ: ino_type, 
+                    ..Default::default() 
+                }))
+            }
+        }
+    }
+
+    async fn do_resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)> {
+        if self.meta.conf.case_insensi || !self.prefix.is_empty() {
+            return SysSnafu { code: libc::ENOTSUP }.fail();
+        }
+        todo!()
+        /*
+        	if len(m.shaResolve) == 0 || m.conf.CaseInsensi || m.prefix != "" {
+		return syscall.ENOTSUP
+	}
+	defer m.timeit("Resolve", time.Now())
+	parent = m.checkRoot(parent)
+	keys := []string{parent.String(), path,
+		strconv.FormatUint(uint64(ctx.Uid()), 10)}
+	var gids []interface{}
+	for _, gid := range ctx.Gids() {
+		gids = append(gids, strconv.FormatUint(uint64(gid), 10))
+	}
+	res, err := m.rdb.EvalSha(ctx, m.shaResolve, keys, gids...).Result()
+	var returnedIno int64
+	var returnedAttr string
+	st := m.handleLuaResult("resolve", res, err, &returnedIno, &returnedAttr)
+	if st == 0 {
+		if inode != nil {
+			*inode = Ino(returnedIno)
+		}
+		m.parseAttr([]byte(returnedAttr), attr)
+	} else if st == syscall.EAGAIN {
+		return m.Resolve(ctx, parent, path, inode, attr)
+	}
+	return st
+         */
+       
     }
 
     async fn do_mknod(
@@ -1361,20 +1411,10 @@ impl Engine for RedisEngine {
             let pattr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
             let mut pattr: Attr = bincode::deserialize(&pattr_bytes)?;
             if pattr.typ != INodeType::TypeDirectory {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "type error",
-                    "not a directory".to_string(),
-                ))
-                .into());
+                return SysSnafu { code: libc::ENOTDIR }.fail();
             }
             if pattr.parent > TRASH_INODE {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "type error",
-                    "not a directory".to_string(),
-                ))
-                .into());
+                return SysSnafu { code: libc::ENOENT }.fail();
             }
             self.access(parent, ModeMask::WRITE, &pattr).await?;
             if !(Flag::IMMUTABLE & pattr.flags).is_empty() {

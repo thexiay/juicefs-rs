@@ -175,7 +175,7 @@ bitflags! {
 // Attr represents attributes of a node.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Attr {
-    pub flags: Flag,      // flags
+    pub flags: Flag,      // special flags
     pub typ: INodeType,   // type of a node
     pub mode: u16,        // permission mode
     pub uid: u32,         // owner id
@@ -323,15 +323,16 @@ pub trait Meta: Send + Sync + 'static {
     async fn lookup(
         &self,
         parent: Ino,
-        name: String,
-        inode: &Ino,
-        attr: &Attr,
-        check_perm: bool,
-    ) -> Result<()>;
+        name: &str,
+        check_permission: bool,
+    ) -> Result<(Ino, Attr)>;
+
     // Resolve fetches the inode and attributes for an entry identified by the given path.
     // ENOTSUP will be returned if there's no natural implementation for this operation or
     // if there are any symlink following involved.
-    async fn resolve(&self, parent: Ino, path: String, inode: &Ino, attr: &Attr) -> Result<()>;
+    // The different between with lookup and resolve is that resolve deep search in path, 
+    // but lookup only search in current directory.
+    async fn resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)>;
 
     // GetAttr returns the attributes for given node.
     async fn get_attr(&self, inode: Ino) -> Result<Attr>;

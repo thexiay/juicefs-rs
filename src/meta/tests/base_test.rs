@@ -21,7 +21,10 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
-    use juice_meta::{api::ROOT_INODE, error::MyError};
+    use juice_meta::{
+        api::{INodeType, ModeMask, ROOT_INODE},
+        error::MyError,
+    };
 
     match m.get_attr(ROOT_INODE).await {
         Ok(attr) if attr.mode != 0777 => panic!("getattr root mode err"),
@@ -68,7 +71,10 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     });
 
     // test mkdir rmdir
-    let (parent, attr) = m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0).await.expect("mkdir d: ");
+    let (parent, attr) = m
+        .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
+        .await
+        .expect("mkdir d: ");
     match m.clone().unlink(ROOT_INODE, "d", false).await {
         Err(_err @ MyError::SysError { code }) if code == libc::EPERM => (),
         other => panic!("unlink d: {:?}", other),
@@ -82,16 +88,67 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
         other => panic!("rmdir d: {:?}", other),
     };
     // test lookup
-
+    let (parent, _) = m.lookup(ROOT_INODE, "d", true).await.expect("lookup d: ");
+    let (inode, _) = m.lookup(ROOT_INODE, "..", true).await.expect("lookup ..: ");
+    if inode != ROOT_INODE {
+        panic!("lookup ..: {} != {}", inode, ROOT_INODE);
+    }
+    let (inode, _) = m.lookup(parent, ".", true).await.expect("lookup ..: ");
+    if inode != parent {
+        panic!("lookup .: {} != {}", inode, parent);
+    }
+    let (inode, attr) = m.lookup(parent, "..", true).await.expect("lookup ..: ");
+    if inode != ROOT_INODE {
+        panic!("lookup ..: {} != {}", inode, ROOT_INODE);
+    }
+    if attr.nlink != 3 {
+        panic!("nlink expect 3, but got {}", attr.nlink);
+    }
+    m.access(parent, ModeMask::READ, &attr)
+        .await
+        .expect("access d: ");
+    let (inode, attr) = m
+        .create(parent, "f", 0o650, 0o22, 0)
+        .await
+        .expect("create f: ");
+    let _ = m.close(inode).await;
+    let (tino, attr) = m.lookup(inode, ".", true).await.expect("lookup /d/f: ");
+    match m.lookup(inode, "..", true).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        other => panic!("lookup /d/f/..: {:?}", other),
+    }
+    match m.rmdir(parent, "f", false).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        other => panic!("rmdir f: {:?}", other),
+    }
+    match m.rmdir(ROOT_INODE, "d", false).await {
+        Err(_err @ MyError::SysError { code }) if code == libc::ENOTEMPTY => (),
+        other => panic!("rmdir d: {:?}", other),
+    }
+    match m
+        .mknod(inode, "df", INodeType::TypeDirectory, 0o650, 0o22, 0, "")
+        .await
+    {
+        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        other => panic!("create fd: {:?}", other),
+    }
+    match m
+        .mknod(parent, "f", INodeType::TypeFile, 0o650, 0o22, 0, "")
+        .await
+    {
+        Err(_err @ MyError::SysError { code }) if code == libc::EEXIST => (),
+        other => panic!("create f: {:?}", other),
+    }
+    let (inode, attr) = m.lookup(parent, "f", true).await.expect("lookup f: ");
     /*
-    if st := m.Lookup(ctx, 1, "d", &parent, attr, true); st != 0 {
-        t.Fatalf("lookup d: %s", st)
+    if st := m.Mknod(ctx, inode, "df", TypeFile, 0650, 022, 0, "", &dummyInode, nil); st != syscall.ENOTDIR {
+        t.Fatalf("create fd: %s", st)
     }
-    if st := m.Lookup(ctx, 1, "d", &parent, nil, true); st != syscall.EINVAL {
-        t.Fatalf("lookup d: %s", st)
+    if st := m.Mknod(ctx, parent, "f", TypeFile, 0650, 022, 0, "", &inode, attr); st != syscall.EEXIST {
+        t.Fatalf("create f: %s", st)
     }
-    if st := m.Lookup(ctx, 1, "..", &inode, attr, true); st != 0 || inode != 1 {
-        t.Fatalf("lookup ..: %s", st)
+    if st := m.Lookup(ctx, parent, "f", &inode, attr, true); st != 0 {
+        t.Fatalf("lookup f: %s", st)
     }
      */
 }
@@ -166,16 +223,10 @@ pub async fn test_trash(m: Box<Arc<dyn Meta>>) {}
 pub async fn test_parents(m: Box<Arc<dyn Meta>>) {}
 
 pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
-    let (_, _) = m
-        .create(1, "f", 0644, 0, 0)
-        .await
-        .expect("create f: ");
+    let (_, _) = m.create(1, "f", 0644, 0, 0).await.expect("create f: ");
 
     m.remove(1, "f", &mut 0).await.expect("rmr f: ");
-    let (parent, _) = m
-        .mkdir(1, "d", 0755, 0, 0)
-        .await
-        .expect("mkdir d: ");
+    let (parent, _) = m.mkdir(1, "d", 0755, 0, 0).await.expect("mkdir d: ");
     let (_, _) = m
         .mkdir(parent, "d2", 0755, 0, 0)
         .await
