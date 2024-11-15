@@ -71,20 +71,20 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     });
 
     // test mkdir rmdir
-    let (parent, attr) = m
+    let (parent, _) = m
         .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
         .expect("mkdir d: ");
     match m.clone().unlink(ROOT_INODE, "d", false).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::EPERM => (),
+        Err(errno) if errno == libc::EPERM => (),
         other => panic!("unlink d: {:?}", other),
     };
     match m.rmdir(parent, ".", false).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::EINVAL => (),
+        Err(errno) if errno == libc::EINVAL => (),
         other => panic!("rmdir d: {:?}", other),
     };
     match m.rmdir(parent, "..", false).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::ENOTEMPTY => (),
+        Err(errno) if errno == libc::ENOTEMPTY => (),
         other => panic!("rmdir d: {:?}", other),
     };
     // test lookup
@@ -114,29 +114,47 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     let _ = m.close(inode).await;
     let (tino, attr) = m.lookup(inode, ".", true).await.expect("lookup /d/f: ");
     match m.lookup(inode, "..", true).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        Err(errno) if errno == libc::ENOTDIR => (),
         other => panic!("lookup /d/f/..: {:?}", other),
     }
     match m.rmdir(parent, "f", false).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        Err(errno) if errno == libc::ENOTDIR => (),
         other => panic!("rmdir f: {:?}", other),
     }
     match m.rmdir(ROOT_INODE, "d", false).await {
-        Err(_err @ MyError::SysError { code }) if code == libc::ENOTEMPTY => (),
+        Err(errno) if errno == libc::ENOTEMPTY => (),
         other => panic!("rmdir d: {:?}", other),
     }
     match m
-        .mknod(inode, "df", INodeType::TypeDirectory, 0o650, 0o22, 0, "")
+        .mknod(
+            inode,
+            "df",
+            INodeType::TypeDirectory,
+            0o650,
+            0o22,
+            0,
+            "",
+            &mut None,
+        )
         .await
     {
-        Err(_err @ MyError::SysError { code }) if code == libc::ENOTDIR => (),
+        Err(errno) if errno == libc::ENOTDIR => (),
         other => panic!("create fd: {:?}", other),
     }
     match m
-        .mknod(parent, "f", INodeType::TypeFile, 0o650, 0o22, 0, "")
+        .mknod(
+            parent,
+            "f",
+            INodeType::TypeFile,
+            0o650,
+            0o22,
+            0,
+            "",
+            &mut None,
+        )
         .await
     {
-        Err(_err @ MyError::SysError { code }) if code == libc::EEXIST => (),
+        Err(errno) if errno == libc::EEXIST => (),
         other => panic!("create f: {:?}", other),
     }
     let (inode, attr) = m.lookup(parent, "f", true).await.expect("lookup f: ");

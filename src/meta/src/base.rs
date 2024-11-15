@@ -22,7 +22,7 @@ use crate::api::{
     Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
-use crate::error::{MyError, NotInitializedSnafu, Result, SysSnafu};
+use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFile, OpenFiles};
 use crate::quota::Quota;
 use crate::utils::{access_mode, align_4k, sleep_with_jitter, FLockItem, FreeID, PLockItem};
@@ -1237,12 +1237,12 @@ where
         availspace: AtomicU64,
         iused: AtomicU64,
         iavail: AtomicU64,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // Access checks the access permission on given inode.
-    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()> {
+    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> FsResult<()> {
         // dont check acl if mask is 0
         if attr.access_acl != acl::NONE && (attr.mode & 0o070) != 0 {
             let rule = self
@@ -1251,7 +1251,7 @@ where
             if rule.can_access(uid(), gids(), attr.uid, attr.gid, mode_mask) {
                 return Ok(());
             }
-            return SysSnafu { code: libc::EACCES }.fail();
+            return SysSnafu { code: libc::EACCES }.fail()?;
         }
 
         let mode = access_mode(attr, uid(), gids());
@@ -1260,7 +1260,7 @@ where
                 "Access inode {} {:o}, mode {:o}, request mode {:o}",
                 inode, attr.mode, mode, mode_mask
             );
-            SysSnafu { code: libc::EACCES }.fail()
+            SysSnafu { code: libc::EACCES }.fail()?
         } else {
             Ok(())
         }
@@ -1272,7 +1272,7 @@ where
         parent: Ino,
         name: &str,
         check_permission: bool,
-    ) -> Result<(Ino, Attr)> {
+    ) -> FsResult<(Ino, Attr)> {
         let base = self.as_ref();
         let parent = base.check_root(parent);
         if check_permission {
@@ -1289,7 +1289,7 @@ where
             ".." => {
                 let par_attr = self.get_attr(parent).await?;
                 if par_attr.typ != INodeType::TypeDirectory {
-                    return SysSnafu { code: libc::ENOTDIR }.fail();
+                    return SysSnafu { code: libc::ENOTDIR }.fail()?;
                 } else {
                     Ok(((par_attr.parent), self.get_attr(par_attr.parent).await?))
                 }
@@ -1308,17 +1308,17 @@ where
                                 // TODO: why here not use e.attr directly?
                                 match self.get_attr(entry.inode).await {
                                     Ok(attr) => (entry.inode, attr),
-                                    Err(_err @ MyError::SysError { code }) if code == libc::ENOENT => {
+                                    Err(code) if code == libc::ENOENT => {
                                         warn!("no attribute for inode {}({},{})", entry.inode, parent, entry.name);
                                         (entry.inode, entry.attr)
                                     },
                                     Err(err) => return Err(err),
                                 }
                             } else {
-                                return SysSnafu { code: libc::ENOENT }.fail();
+                                return SysSnafu { code: libc::ENOENT }.fail()?;
                             }
                         },
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(e.into()),
                     };
                     if attr.typ == INodeType::TypeDirectory && !parent.is_trash() {
                         let mut dir_parents = base.dir_parents.lock();
@@ -1330,12 +1330,13 @@ where
         }
     }
     
-    async fn resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)> {
-        self.do_resolve(parent, path).await
+    async fn resolve(&self, parent: Ino, path: String) -> FsResult<(Ino, Attr)> {
+        let (ino, attr) = self.do_resolve(parent, path).await?;
+        Ok((ino, attr))
     }
 
     // GetAttr returns the attributes for given node.
-    async fn get_attr(&self, inode: Ino) -> Result<Attr> {
+    async fn get_attr(&self, inode: Ino) -> FsResult<Attr> {
         let base = self.as_ref();
         let inode = inode.transfer_root(base.root);
         if let Some(attr) = base.open_files.get_attr(inode).await {
@@ -1378,12 +1379,12 @@ where
         set: u16,
         sggid_clear_mode: u8,
         attr: &Attr,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()> {
+    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> FsResult<()> {
         todo!()
     }
 
@@ -1394,7 +1395,7 @@ where
         flags: u8,
         attr_length: u64,
         skip_perm_check: bool,
-    ) -> Result<Attr> {
+    ) -> FsResult<Attr> {
         if let Some(file) = self.as_ref().as_ref().open_files.find(inode) {
             let _ = file.lock().await;
         }
@@ -1415,12 +1416,12 @@ where
         off: u64,
         size: u64,
         length: &u64,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // ReadLink returns the target of a symlink.
-    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> Result<()> {
+    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> FsResult<()> {
         todo!()
     }
 
@@ -1432,7 +1433,7 @@ where
         path: String,
         inode: &Ino,
         attr: &Attr,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
@@ -1446,18 +1447,19 @@ where
         cumask: u16,
         rdev: u32,
         path: &str,
-    ) -> Result<(Ino, Attr)> {
+        exists_node: &mut Option<(Ino, Attr)>,
+    ) -> FsResult<(Ino, Attr)> {
         if parent.is_trash() {
-            return SysSnafu { code: libc::EPERM }.fail();
+            return SysSnafu { code: libc::EPERM }.fail()?;
         }
         if parent == ROOT_INODE && name == TRASH_NAME {
-            return SysSnafu { code: libc::EPERM }.fail();
+            return SysSnafu { code: libc::EPERM }.fail()?;
         }
         if self.as_ref().conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail();
+            return SysSnafu { code: libc::EROFS }.fail()?;
         }
         if name.is_empty() {
-            return SysSnafu { code: libc::ENOENT }.fail();
+            return SysSnafu { code: libc::ENOENT }.fail()?;
         }
 
         let parent = self.as_ref().check_root(parent);
@@ -1496,7 +1498,11 @@ where
                 self.update_quota(parent, space, inodes).await;
                 Ok((ino, attr))
             }
-            Err(e) => Err(e),
+            Err(MyError::FileExistError { ino, attr }) => {
+                exists_node.replace((ino, attr));
+                Err(libc::EEXIST)
+            },
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1508,8 +1514,8 @@ where
         mode: u16,
         cumask: u16,
         copysgid: u8,
-    ) -> Result<(Ino, Attr)> {
-        self.mknod(parent, name, INodeType::TypeDirectory, mode, cumask, 0, "").await
+    ) -> FsResult<(Ino, Attr)> {
+        self.mknod(parent, name, INodeType::TypeDirectory, mode, cumask, 0, "", &mut None).await
             .inspect(|(ino, _)| {
                 let base = self.as_ref();
                 let mut dir_parents = base.dir_parents.lock();
@@ -1524,14 +1530,14 @@ where
         parent: Ino,
         name: &str,
         skip_check_trash: bool,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         if (parent == ROOT_INODE && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
-            return SysSnafu { code: libc::EPERM }.fail();
+            return SysSnafu { code: libc::EPERM }.fail()?;
         }
 
         let base = self.as_ref().as_ref();
         if base.conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail();
+            return SysSnafu { code: libc::EROFS }.fail()?;
         }
 
         let parent = parent.transfer_root(base.root);
@@ -1551,22 +1557,22 @@ where
     }
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino> {
+    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<Ino> {
         match name {
-            "." => return SysSnafu { code: libc::EINVAL }.fail(),
-            ".." => return SysSnafu { code: libc::ENOTEMPTY }.fail(),
+            "." => return SysSnafu { code: libc::EINVAL }.fail()?,
+            ".." => return SysSnafu { code: libc::ENOTEMPTY }.fail()?,
             _ => {},
         }
         if (parent.is_root() && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
-            return SysSnafu { code: libc::EPERM }.fail();
+            return SysSnafu { code: libc::EPERM }.fail()?;
         }
         let base = self.as_ref();
         if base.conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail();
+            return SysSnafu { code: libc::EROFS }.fail()?;
         }
         
         let parent = parent.transfer_root(base.root);
-        self.do_rmdir(parent, name, skip_check_trash).await
+        let ino = self.do_rmdir(parent, name, skip_check_trash).await
             .inspect(|ino| {
                 if !parent.is_trash() {
                     let mut dir_parents = base.dir_parents.lock();
@@ -1574,7 +1580,8 @@ where
                 }
                 self.update_dir_stats(parent, 0, -(align_4k(0)), -1);
                 self.update_quota(parent, -(align_4k(0)), -1);
-            })
+            })?;
+        Ok(ino)
     }
 
     // Rename move an entry from a source directory to another with given name.
@@ -1589,17 +1596,17 @@ where
         flags: u32,
         inode: &Ino,
         attr: &Attr,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // Link creates an entry for node.
-    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()> {
+    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> FsResult<()> {
         todo!()
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> Result<()> {
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> FsResult<()> {
         todo!()
     }
 
@@ -1611,7 +1618,8 @@ where
         mode: u16,
         cumask: u16,
         flags: i32,
-    ) -> Result<(Ino, Attr)> {
+    ) -> FsResult<(Ino, Attr)> {
+        let mut exist_node = None;
         match self
             .mknod(
                 parent,
@@ -1621,30 +1629,33 @@ where
                 cumask,
                 0,
                 "",
+                &mut exist_node
             )
             .await
         {
             Ok((ino, mut attr)) => {
                 self.as_ref().open_files.open(ino, &mut attr).await;
                 Ok((ino, attr))
-            }
-            Err(MyError::FileExistError { ino, mut attr })
-                if (flags & libc::O_EXCL == 0 && attr.typ == INodeType::TypeFile) =>
-            {
-                self.as_ref().open_files.open(ino, &mut attr).await;
-                Ok((ino, attr))
-            }
+            },
+            Err(libc::EEXIST) => {
+                if let Some((ino, mut attr)) = exist_node && (flags & libc::O_EXCL == 0 && attr.typ == INodeType::TypeFile) {
+                    self.as_ref().open_files.open(ino, &mut attr).await;
+                    Ok((ino, attr))    
+                } else {
+                    Err(libc::EEXIST)       
+                }
+            },
             Err(e) => Err(e),
         }
     }
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> Result<()> {
+    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> FsResult<()> {
         todo!()
     }
 
     // Close a file.
-    async fn close(&self, inode: Ino) -> Result<()> {
+    async fn close(&self, inode: Ino) -> FsResult<()> {
         let base = self.as_ref();
         if base.open_files.close(inode).await {
             let removed = {
@@ -1670,12 +1681,12 @@ where
     }
 
     // Read returns the list of slices on the given chunk.
-    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()> {
+    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> FsResult<()> {
         todo!()
     }
 
     // NewSlice returns an id for new slice.
-    async fn new_slice(&self) -> Result<u64> {
+    async fn new_slice(&self) -> FsResult<u64> {
         let mut slices = self.as_ref().free_slices.lock().await;
         if slices.next >= slices.maxid {
             let v = self.incr_counter("nextChunk", SLICE_ID_BATCH).await?;
@@ -1695,12 +1706,12 @@ where
         off: u32,
         slice: Slice,
         mtime: SystemTime,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // InvalidateChunkCache invalidate chunk cache
-    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()> {
+    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> FsResult<()> {
         todo!()
     }
 
@@ -1715,42 +1726,37 @@ where
         flags: u32,
         copied: &u64,
         out_length: &u64,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    // GetParents returns a map of node parents (> 1 parents if hardlinked)
-    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // GetDirStat returns the space and inodes usage of a directory.
-    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat> {
+    async fn get_dir_stat(&self, inode: Ino) -> FsResult<DirStat> {
         todo!()
     }
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()> {
+    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> FsResult<()> {
         todo!()
     }
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()> {
+    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> FsResult<()> {
         todo!()
     }
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()> {
+    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> FsResult<()> {
         todo!()
     }
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()> {
+    async fn remove_xattr(&self, inode: Ino, name: String) -> FsResult<()> {
         todo!()
     }
 
     // Flock tries to put a lock on given file.
-    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()> {
+    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> FsResult<()> {
         todo!()
     }
 
@@ -1763,7 +1769,7 @@ where
         start: &u64,
         end: &u64,
         pid: &u32,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
@@ -1777,12 +1783,12 @@ where
         start: u64,
         end: u64,
         pid: u32,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // Compact all the chunks by merge small slices together
-    async fn compact_all(&self, threads: isize, bar: juice_utils::process::Bar) -> Result<()> {
+    async fn compact_all(&self, threads: isize, bar: juice_utils::process::Bar) -> FsResult<()> {
         todo!()
     }
 
@@ -1793,7 +1799,7 @@ where
         concurrency: isize,
         pre_func: Box<dyn Fn() + Send>,
         post_func: Box<dyn Fn() + Send>,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
@@ -1802,13 +1808,13 @@ where
         &self,
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
-    ) -> Result<HashMap<Ino, Vec<Slice>>> {
+    ) -> FsResult<HashMap<Ino, Vec<Slice>>> {
         todo!()
     }
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> Result<()> {
+    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> FsResult<()> {
         todo!()
     }
 
@@ -1819,7 +1825,7 @@ where
         summary: &Summary,
         recursive: bool,
         strict: bool,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
@@ -1831,7 +1837,7 @@ where
         topn: u8,
         strict: bool,
         update_progress: Box<dyn Fn(u64, u64) + Send>,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
@@ -1845,12 +1851,17 @@ where
         cumask: u16,
         count: &u64,
         total: &u64,
-    ) -> Result<()> {
+    ) -> FsResult<()> {
         todo!()
     }
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> Result<()> {
+    async fn chroot(&self, subdir: String) -> FsResult<()> {
+        todo!()
+    }
+
+    // GetParents returns a map of node parents (> 1 parents if hardlinked)
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize> {
         todo!()
     }
 

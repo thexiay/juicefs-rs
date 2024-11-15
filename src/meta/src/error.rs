@@ -3,6 +3,7 @@ use std::backtrace::Backtrace;
 use deadpool::managed::PoolError;
 use redis::RedisError;
 use snafu::Snafu;
+use tracing::error;
 
 use crate::api::{Attr, Ino};
 
@@ -11,7 +12,7 @@ use crate::api::{Attr, Ino};
 pub enum MyError {
     #[snafu(display("An system error occurred: {code}"))]
     SysError {
-        code: i32,
+        code: Errno,
     },
     #[snafu(display("An connection error occurred: {:?}", source))]
     ConnectionError {
@@ -71,8 +72,26 @@ pub enum MyError {
     IllegalDataFormatError {
         detail: String,
     }
-    
-    
 }
 
 pub type Result<T> = std::result::Result<T, MyError>;
+pub type Errno = i32;
+pub type FsResult<T> = std::result::Result<T, Errno>;
+
+impl From<MyError> for Errno {
+    fn from(e: MyError) -> Self {
+        match e {
+            MyError::SysError { code } => code,
+            other =>  {
+                error!("error: {:?}, stack: {:?}", other, Backtrace::capture());
+                libc::EIO
+            },
+        }
+    }
+}
+
+impl From<Errno> for MyError {
+    fn from(e: Errno) -> Self {
+        MyError::SysError { code: e }
+    }
+}

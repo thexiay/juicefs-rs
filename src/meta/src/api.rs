@@ -16,7 +16,7 @@ use crate::base::{
     CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
 };
 use crate::config::{Config, Format};
-use crate::error::{DriverSnafu, Result};
+use crate::error::{DriverSnafu, FsResult, Result};
 use crate::quota::Quota;
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
@@ -202,6 +202,8 @@ pub trait Meta: Send + Sync + 'static {
     // Get a copy of the current format
     fn get_format(&self) -> Arc<Format>;
 
+
+    /// ------------------------------- Lifetime func ----------------------------------------
     /// Init init a formatted volumn for meta service.
     /// This is used for juice filesystem initialization and for a totally empty meta.
     ///
@@ -314,10 +316,10 @@ pub trait Meta: Send + Sync + 'static {
         availspace: AtomicU64,
         iused: AtomicU64,
         iavail: AtomicU64,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Access checks the access permission on given inode.
-    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;
+    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> FsResult<()>;
 
     // Lookup returns the inode and attributes for the given entry in a directory.
     async fn lookup(
@@ -325,24 +327,24 @@ pub trait Meta: Send + Sync + 'static {
         parent: Ino,
         name: &str,
         check_permission: bool,
-    ) -> Result<(Ino, Attr)>;
+    ) -> FsResult<(Ino, Attr)>;
 
     // Resolve fetches the inode and attributes for an entry identified by the given path.
     // ENOTSUP will be returned if there's no natural implementation for this operation or
     // if there are any symlink following involved.
     // The different between with lookup and resolve is that resolve deep search in path, 
     // but lookup only search in current directory.
-    async fn resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)>;
+    async fn resolve(&self, parent: Ino, path: String) -> FsResult<(Ino, Attr)>;
 
     // GetAttr returns the attributes for given node.
-    async fn get_attr(&self, inode: Ino) -> Result<Attr>;
+    async fn get_attr(&self, inode: Ino) -> FsResult<Attr>;
 
     // SetAttr updates the attributes for given node.
     async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
-        -> Result<()>;
+        -> FsResult<()>;
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()>;
+    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> FsResult<()>;
 
     // Truncate changes the length for given file.
     async fn truncate(
@@ -351,7 +353,7 @@ pub trait Meta: Send + Sync + 'static {
         flags: u8,
         attr_length: u64,
         skip_perm_check: bool,
-    ) -> Result<Attr>;
+    ) -> FsResult<Attr>;
 
     // Fallocate preallocate given space for given file.
     async fn fallocate(
@@ -361,10 +363,10 @@ pub trait Meta: Send + Sync + 'static {
         off: u64,
         size: u64,
         length: &u64,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // ReadLink returns the target of a symlink.
-    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> Result<()>;
+    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> FsResult<()>;
 
     // Symlink creates a symlink in a directory with given name.
     async fn symlink(
@@ -374,7 +376,7 @@ pub trait Meta: Send + Sync + 'static {
         path: String,
         inode: &Ino,
         attr: &Attr,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Mknod creates a node in a directory with given name, type and permissions.
     async fn mknod(
@@ -386,7 +388,8 @@ pub trait Meta: Send + Sync + 'static {
         cumask: u16,
         rdev: u32,
         path: &str,
-    ) -> Result<(Ino, Attr)>;
+        exists_node: &mut Option<(Ino, Attr)>,
+    ) -> FsResult<(Ino, Attr)>;
 
     // Mkdir creates a sub-directory with given name and mode.
     async fn mkdir(
@@ -396,15 +399,15 @@ pub trait Meta: Send + Sync + 'static {
         mode: u16,
         cumask: u16,
         copysgid: u8,
-    ) -> Result<(Ino, Attr)>;
+    ) -> FsResult<(Ino, Attr)>;
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
     async fn unlink(self: Arc<Self>, parent: Ino, name: &str, skip_check_trash: bool)
-        -> Result<()>;
+        -> FsResult<()>;
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino>;
+    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<Ino>;
 
     // Rename move an entry from a source directory to another with given name.
     // The targeted entry will be overwrited if it's a file or empty directory.
@@ -418,15 +421,15 @@ pub trait Meta: Send + Sync + 'static {
         flags: u32,
         inode: &Ino,
         attr: &Attr,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Link creates an entry for node.
     // inode_src: source inode
     // parent + name: dst inode, parent is dst inode's parent inode, name is the link name
-    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> Result<()>;
+    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> FsResult<()>;
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> Result<()>;
+    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> FsResult<()>;
 
     // Create creates a file in a directory with given name.
     async fn create(
@@ -436,19 +439,19 @@ pub trait Meta: Send + Sync + 'static {
         mode: u16,
         cumask: u16,
         flags: i32,
-    ) -> Result<(Ino, Attr)>;
+    ) -> FsResult<(Ino, Attr)>;
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> Result<()>;
+    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> FsResult<()>;
 
     // Close a file.
-    async fn close(&self, inode: Ino) -> Result<()>;
+    async fn close(&self, inode: Ino) -> FsResult<()>;
 
     // Read returns the list of slices on the given chunk.
-    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()>;
+    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> FsResult<()>;
 
     // NewSlice returns an id for new slice.
-    async fn new_slice(&self) -> Result<u64>;
+    async fn new_slice(&self) -> FsResult<u64>;
 
     // Write put a slice of data on top of the given chunk.
     async fn write(
@@ -458,10 +461,10 @@ pub trait Meta: Send + Sync + 'static {
         off: u32,
         slice: Slice,
         mtime: SystemTime,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // InvalidateChunkCache invalidate chunk cache
-    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()>;
+    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> FsResult<()>;
 
     // CopyFileRange copies part of a file to another one.
     async fn copy_file_range(
@@ -474,28 +477,25 @@ pub trait Meta: Send + Sync + 'static {
         flags: u32,
         copied: &u64,
         out_length: &u64,
-    ) -> Result<()>;
-
-    // GetParents returns a map of node parents (> 1 parents if hardlinked)
-    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize>;
+    ) -> FsResult<()>;
 
     // GetDirStat returns the space and inodes usage of a directory.
-    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
+    async fn get_dir_stat(&self, inode: Ino) -> FsResult<DirStat>;
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()>;
+    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> FsResult<()>;
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()>;
+    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> FsResult<()>;
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()>;
+    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> FsResult<()>;
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
+    async fn remove_xattr(&self, inode: Ino, name: String) -> FsResult<()>;
 
     // Flock tries to put a lock on given file.
-    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()>;
+    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> FsResult<()>;
 
     // Getlk returns the current lock owner for a range on a file.
     async fn getlk(
@@ -506,7 +506,7 @@ pub trait Meta: Send + Sync + 'static {
         start: &u64,
         end: &u64,
         pid: &u32,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Setlk sets a file range lock on given file.
     async fn setlk(
@@ -518,10 +518,10 @@ pub trait Meta: Send + Sync + 'static {
         start: u64,
         end: u64,
         pid: u32,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Compact all the chunks by merge small slices together
-    async fn compact_all(&self, threads: isize, bar: Bar) -> Result<()>;
+    async fn compact_all(&self, threads: isize, bar: Bar) -> FsResult<()>;
 
     // Compact chunks for specified path
     async fn compact(
@@ -530,18 +530,18 @@ pub trait Meta: Send + Sync + 'static {
         concurrency: isize,
         pre_func: Box<dyn Fn() + Send>,
         post_func: Box<dyn Fn() + Send>,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // ListSlices returns all slices used by all files.
     async fn list_slices(
         &self,
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
-    ) -> Result<HashMap<Ino, Vec<Slice>>>;
+    ) -> FsResult<HashMap<Ino, Vec<Slice>>>;
 
     // Remove all files and directories recursively.
     // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> Result<()>;
+    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> FsResult<()>;
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(
@@ -550,7 +550,7 @@ pub trait Meta: Send + Sync + 'static {
         summary: &Summary,
         recursive: bool,
         strict: bool,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // GetTreeSummary returns a summary in tree structure
     async fn get_tree_summary(
@@ -560,7 +560,7 @@ pub trait Meta: Send + Sync + 'static {
         topn: u8,
         strict: bool,
         update_progress: Box<dyn Fn(u64, u64) + Send>,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Clone a file or directory
     async fn clone(
@@ -572,10 +572,14 @@ pub trait Meta: Send + Sync + 'static {
         cumask: u16,
         count: &u64,
         total: &u64,
-    ) -> Result<()>;
+    ) -> FsResult<()>;
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> Result<()>;
+    async fn chroot(&self, subdir: String) -> FsResult<()>;
+
+    // GetParents returns a map of node parents (> 1 parents if hardlinked)
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize>;
+    // ---------------------------------------- sys call -----------------------------------------------------------
 
     // just for test
     fn get_base(&self) -> &CommonMeta;
