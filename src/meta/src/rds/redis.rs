@@ -1,32 +1,29 @@
 use async_trait::async_trait;
-use bytes::{Buf, BufMut, Bytes};
-use deadpool::managed::{Manager, Object, Pool};
+use bytes::{Buf, Bytes};
+use deadpool::managed::{Object, Pool};
 use futures::StreamExt;
 use juice_utils::process::Bar;
-use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
+use redis::aio::{ConnectionLike, ConnectionManager};
 use redis::{
-    cmd, pipe, AsyncCommands, Client, Commands, InfoDict, IntoConnectionInfo, Pipeline, RedisError,
-    RedisResult, ScanOptions, Script, ToRedisArgs,
+    cmd, pipe, AsyncCommands, AsyncIter, Client, InfoDict, IntoConnectionInfo, Pipeline, RedisError,
+    ScanOptions, Script, Value,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
-use std::hash::{DefaultHasher, Hasher};
-use std::mem;
-use std::ops::DerefMut;
-use std::sync::atomic::{self, AtomicI64};
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{self, sleep, Instant};
-use tracing::{debug, error, info, warn};
+use std::ops::DerefMut;
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 use crate::acl::{self, AclId, AclType, Rule};
 use crate::api::{
     gids, uid, Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session,
-    SessionInfo, Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
-    TrashSliceScan, NEXT_CHUNK, NEXT_INODE, N_LOCK, TOTAL_INODES, USED_SPACE,
+    TrashSliceScan, NEXT_CHUNK, NEXT_INODE, TOTAL_INODES, USED_SPACE,
 };
 use crate::config::{Config, Format};
 use crate::error::{
@@ -40,7 +37,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use super::check::RedisInfo;
-use super::conn::{ExclusiveConnection, RedisClient};
+use super::conn::RedisClient;
 
 pub const TXN_RETRY_LIMIT: u32 = 50;
 pub const LOOKUP_SCRIPT_CODE: &str = r#"
@@ -201,8 +198,8 @@ pub struct RedisEngine {
     shared_conn: ConnectionManager,
     // 单机和集群模式才有这个前缀，哨兵和主从模式没有这个前缀，juicefs中的很多判断区别是这个
     prefix: String,
-    lookup_script: Script,  // lookup lua script
-    resolve_script: Script, // reslove lua script
+    lookup_script_sha: String,  // lookup lua script sha
+    resolve_script_sha: String, // reslove lua script sha
     meta: CommonMeta,
 }
 
@@ -381,16 +378,30 @@ impl RedisEngine {
         let prefix = conn_info.redis.db.to_string();
         // TODO: should merge conf into `ConnectionInfo`
         let client = RedisClient::new(Client::open(conn_info.clone())?);
-        let conn = client.get_connection().await?;
+        let mut conn = client.get_connection().await?;
         let pool = Pool::builder(client).max_size(16).build().unwrap();
+        let lookup_script_sha = Script::new(LOOKUP_SCRIPT_CODE)
+            .prepare_invoke()
+            .load_async(&mut conn)
+            .await
+            .context(RedisDetailSnafu {
+                detail: "load scriptLookup",
+            })?;
+        let resolve_script_sha = Script::new(RESOLVE_SCRIPT_CODE)
+            .prepare_invoke()
+            .load_async(&mut conn)
+            .await
+            .context(RedisDetailSnafu {
+                detail: "load scriptResolve",
+            })?;
 
         let meta = CommonMeta::new(addr, conf);
         let engine = RedisEngine {
             pool,
             shared_conn: conn,
             prefix,
-            lookup_script: Script::new(LOOKUP_SCRIPT_CODE),
-            resolve_script: Script::new(RESOLVE_SCRIPT_CODE),
+            lookup_script_sha,
+            resolve_script_sha,
             meta,
         };
 
@@ -845,21 +856,6 @@ impl Engine for RedisEngine {
                 detail: "set session info err",
             })?;
 
-        self.lookup_script
-            .prepare_invoke()
-            .load_async(conn)
-            .await
-            .context(RedisDetailSnafu {
-                detail: "load scriptLookup",
-            })?;
-        self.resolve_script
-            .prepare_invoke()
-            .load_async(conn)
-            .await
-            .context(RedisDetailSnafu {
-                detail: "load scriptResolve",
-            })?;
-
         if self.meta.conf.enable_bg_job {
             tokio::spawn(async move {
                 self.cleanup_legacies().await;
@@ -1274,12 +1270,12 @@ impl Engine for RedisEngine {
                     Bytes::from(keys[i].clone()),
                     Bytes::from(keys[i + 1].clone()),
                 );
-                if key.len() != mem::size_of::<u64>() {
+                if key.len() != std::mem::size_of::<u64>() {
                     error!("Invalid key: {:?}", key);
                     continue;
                 }
                 let inode = key.get_u64();
-                if value.len() != 2 * mem::size_of::<i64>() {
+                if value.len() != 2 * std::mem::size_of::<i64>() {
                     error!("Invalid value: {:?}", value);
                     continue;
                 }
@@ -1361,10 +1357,27 @@ impl Engine for RedisEngine {
         }
     }
 
-    async fn do_resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)> {
+    async fn do_resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)> {
         if self.meta.conf.case_insensi || !self.prefix.is_empty() {
             return SysSnafu { code: libc::ENOTSUP }.fail();
         }
+
+        let mut conn = self.share_conn();
+        let parent = self.meta.check_root(parent);
+
+        let mut cmd = cmd("EVALSHA");
+        cmd.arg(&self.resolve_script_sha)
+            .arg(3)
+            .arg(parent.to_string())
+            .arg(path.to_string())
+            .arg(format!("{}", uid()));
+        for gid in gids() {
+            cmd.arg(gid.to_string());
+        }
+        let res: Value = cmd.query_async(&mut conn).await?;
+        info!("return res: {:?}", res);
+        
+        
         todo!()
         /*
         	if len(m.shaResolve) == 0 || m.conf.CaseInsensi || m.prefix != "" {

@@ -158,17 +158,30 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
         other => panic!("create f: {:?}", other),
     }
     let (inode, attr) = m.lookup(parent, "f", true).await.expect("lookup f: ");
+    
+    // test resolve
+    match m.resolve(1, "d/f").await {
+        Err(errno) if errno == libc::ENOTSUP => (),
+        other => panic!("resolve d/f: {:?}", other),
+    }
+    match m.resolve(parent, "/f").await {
+        Err(errno) if errno == libc::ENOTSUP => (),
+        other => panic!("resolve f: {:?}", other),
+    }
+    // TODO: test different user and group
     /*
-    if st := m.Mknod(ctx, inode, "df", TypeFile, 0650, 022, 0, "", &dummyInode, nil); st != syscall.ENOTDIR {
-        t.Fatalf("create fd: %s", st)
-    }
-    if st := m.Mknod(ctx, parent, "f", TypeFile, 0650, 022, 0, "", &inode, attr); st != syscall.EEXIST {
-        t.Fatalf("create f: %s", st)
-    }
-    if st := m.Lookup(ctx, parent, "f", &inode, attr, true); st != 0 {
-        t.Fatalf("lookup f: %s", st)
-    }
-     */
+	var ctx2 = NewContext(0, 1, []uint32{1})
+	if st := m.Resolve(ctx2, parent, "/f", &inode, attr); st != syscall.EACCES && st != syscall.ENOTSUP {
+		t.Fatalf("resolve f: %s", st)
+	}
+	if st := m.Resolve(ctx, parent, "/f/c", &inode, attr); st != syscall.ENOTDIR && st != syscall.ENOTSUP {
+		t.Fatalf("resolve f: %s", st)
+	}
+	if st := m.Resolve(ctx, parent, "/f2", &inode, attr); st != syscall.ENOENT && st != syscall.ENOTSUP {
+		t.Fatalf("resolve f2: %s", st)
+	}
+    */
+    
 }
 
 pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {

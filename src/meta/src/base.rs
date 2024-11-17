@@ -155,7 +155,7 @@ pub trait Engine {
         attr: &Attr,
     ) -> Result<()>;
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)>;
-    async fn do_resolve(&self, parent: Ino, path: String) -> Result<(Ino, Attr)>;
+    async fn do_resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)>;
     async fn do_mknod(
         &self,
         parent: Ino,
@@ -378,7 +378,7 @@ impl CommonMeta {
         }
     }
 
-    fn check_root(&self, ino: Ino) -> Ino {
+    pub fn check_root(&self, ino: Ino) -> Ino {
         match ino {
             RESERVED_INODE => ROOT_INODE,
             ROOT_INODE => self.root,
@@ -1330,7 +1330,7 @@ where
         }
     }
     
-    async fn resolve(&self, parent: Ino, path: String) -> FsResult<(Ino, Attr)> {
+    async fn resolve(&self, parent: Ino, path: &str) -> FsResult<(Ino, Attr)> {
         let (ino, attr) = self.do_resolve(parent, path).await?;
         Ok((ino, attr))
     }

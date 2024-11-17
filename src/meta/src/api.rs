@@ -334,7 +334,7 @@ pub trait Meta: Send + Sync + 'static {
     // if there are any symlink following involved.
     // The different between with lookup and resolve is that resolve deep search in path, 
     // but lookup only search in current directory.
-    async fn resolve(&self, parent: Ino, path: String) -> FsResult<(Ino, Attr)>;
+    async fn resolve(&self, parent: Ino, path: &str) -> FsResult<(Ino, Attr)>;
 
     // GetAttr returns the attributes for given node.
     async fn get_attr(&self, inode: Ino) -> FsResult<Attr>;
