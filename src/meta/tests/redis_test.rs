@@ -66,7 +66,7 @@ impl RedisDbOffer {
         }
     }
 
-    async fn take(&self, config: Config) -> (Box<Arc<dyn Meta>>, RedisDbHodler) {
+    async fn take(&self, config: Config) -> (Box<dyn Meta>, RedisDbHodler) {
         loop {
             for i in 0..self.db_nums {
                 let redis_url = format!("{}/{}", self.redis_url, i);

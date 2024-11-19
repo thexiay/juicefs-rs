@@ -11,6 +11,7 @@ repository = { workspace = true }
 juice-utils = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 redis = { workspace = true }
@@ -33,6 +34,8 @@ crc32fast = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
+dyn-clone = { workspace = true }
+nix = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

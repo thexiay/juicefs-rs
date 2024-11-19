@@ -11,14 +11,15 @@ use redis::{
 use regex::Regex;
 use snafu::{ensure, ResultExt};
 use tokio::sync::mpsc::Sender;
-use std::ops::DerefMut;
+use tokio_util::sync::CancellationToken;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::acl::{self, AclId, AclType, Rule};
 use crate::api::{
-    gids, uid, Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session,
+    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session,
     Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
@@ -26,6 +27,7 @@ use crate::base::{
     TrashSliceScan, NEXT_CHUNK, NEXT_INODE, TOTAL_INODES, USED_SPACE,
 };
 use crate::config::{Config, Format};
+use crate::context::{UserExt, WithContext};
 use crate::error::{
     ConnectionSnafu, FileExistSnafu, MyError, NotFoundInoSnafu, RedisDetailSnafu, Result, SysSnafu,
 };
@@ -367,47 +369,6 @@ impl RedisEngine {
 
     // For now only deleted files
     async fn cleanup_legacies(&self) {}
-}
-
-impl RedisEngine {
-    /// redis URL:
-    /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
-    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<Arc<dyn Meta>>> {
-        let url = format!("{}://{}", driver, addr);
-        let conn_info = url.into_connection_info()?;
-        let prefix = conn_info.redis.db.to_string();
-        // TODO: should merge conf into `ConnectionInfo`
-        let client = RedisClient::new(Client::open(conn_info.clone())?);
-        let mut conn = client.get_connection().await?;
-        let pool = Pool::builder(client).max_size(16).build().unwrap();
-        let lookup_script_sha = Script::new(LOOKUP_SCRIPT_CODE)
-            .prepare_invoke()
-            .load_async(&mut conn)
-            .await
-            .context(RedisDetailSnafu {
-                detail: "load scriptLookup",
-            })?;
-        let resolve_script_sha = Script::new(RESOLVE_SCRIPT_CODE)
-            .prepare_invoke()
-            .load_async(&mut conn)
-            .await
-            .context(RedisDetailSnafu {
-                detail: "load scriptResolve",
-            })?;
-
-        let meta = CommonMeta::new(addr, conf);
-        let engine = RedisEngine {
-            pool,
-            shared_conn: conn,
-            prefix,
-            lookup_script_sha,
-            resolve_script_sha,
-            meta,
-        };
-
-        engine.check_server_config().await?;
-        Ok(Box::new(Arc::new(engine)))
-    }
 
     async fn check_server_config(&self) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
@@ -521,6 +482,77 @@ impl RedisEngine {
     }
     */
 
+}
+
+/// Redis Engine with Context
+/// Context is independent execution context
+pub struct RedisEngineWithCtx {
+    engine: Arc<RedisEngine>,
+	uid: u32,
+	gid: u32,
+	gids: Vec<u32>,
+	token: CancellationToken,
+}
+
+impl Deref for RedisEngineWithCtx {
+	type Target = RedisEngine;
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl AsRef<CommonMeta> for RedisEngineWithCtx {
+    fn as_ref(&self) -> &CommonMeta {
+        &self.engine.meta
+    }
+}
+
+impl RedisEngineWithCtx {
+    /// redis URL:
+    /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
+    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
+        let url = format!("{}://{}", driver, addr);
+        let conn_info = url.into_connection_info()?;
+        let prefix = conn_info.redis.db.to_string();
+        // TODO: should merge conf into `ConnectionInfo`
+        let client = RedisClient::new(Client::open(conn_info.clone())?);
+        let mut conn = client.get_connection().await?;
+        let pool = Pool::builder(client).max_size(16).build().unwrap();
+        let lookup_script_sha = Script::new(LOOKUP_SCRIPT_CODE)
+            .prepare_invoke()
+            .load_async(&mut conn)
+            .await
+            .context(RedisDetailSnafu {
+                detail: "load scriptLookup",
+            })?;
+        let resolve_script_sha = Script::new(RESOLVE_SCRIPT_CODE)
+            .prepare_invoke()
+            .load_async(&mut conn)
+            .await
+            .context(RedisDetailSnafu {
+                detail: "load scriptResolve",
+            })?;
+
+        let meta = CommonMeta::new(addr, conf);
+        let engine = RedisEngine {
+            pool,
+            shared_conn: conn,
+            prefix,
+            lookup_script_sha,
+            resolve_script_sha,
+            meta,
+        };
+
+        engine.check_server_config().await?;
+        Ok(Box::new(RedisEngineWithCtx {
+            engine: Arc::new(engine),
+            uid: 0,
+            gid: 0,
+            gids: Vec::new(),
+            token: CancellationToken::new(),
+        }))
+    }
+
     async fn scan_iter<'a>(
         &self,
         conn: &'a mut impl AsyncCommands,
@@ -612,7 +644,7 @@ impl RedisEngine {
             let mut pipe = pipe();
             pipe.atomic().del(&key).ignore();
             slices.into_iter().filter(|s| s.id > 0).for_each(|slice| {
-                pipe.hincr(self.slice_refs(), Self::slice_key(slice.id, slice.size), -1);
+                pipe.hincr(self.slice_refs(), RedisEngine::slice_key(slice.id, slice.size), -1);
                 todel.push(slice);
             });
             let rs: Vec<i64> = pipe.query_async(conn).await?;
@@ -774,14 +806,45 @@ impl RedisEngine {
     }
 }
 
-impl AsRef<CommonMeta> for RedisEngine {
-    fn as_ref(&self) -> &CommonMeta {
-        &self.meta
+impl Clone for RedisEngineWithCtx {
+    fn clone(&self) -> Self {
+        RedisEngineWithCtx {
+            engine: self.engine.clone(),
+            uid: self.uid,
+            gid: self.gid,
+            gids: self.gids.clone(),
+            token: self.token.clone(),
+        }
+    }
+}
+
+impl WithContext for RedisEngineWithCtx {
+    fn with_login(&mut self, uid: u32, gids: Vec<u32>) {
+        assert!(gids.len() > 0);
+        self.uid = uid;
+        self.gid = gids[0];
+        self.gids = gids;
+    }
+
+	fn with_cancel(&mut self, token: CancellationToken) {
+        self.token = token;
+    }
+	fn uid(&self) -> &u32 {
+        &self.uid
+    }
+	fn gid(&self) -> &u32 {
+        &self.gid
+    }
+	fn gids(&self) -> &Vec<u32> {
+        &self.gids
+    }
+    fn token(&self) -> &CancellationToken {
+        &self.token
     }
 }
 
 #[async_trait]
-impl Engine for RedisEngine {
+impl Engine for RedisEngineWithCtx {
     async fn get_counter(&self, name: &str) -> Result<i64> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
@@ -842,7 +905,7 @@ impl Engine for RedisEngine {
         }
     }
 
-    async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()> {
+    async fn do_new_session(&self, sid: u64, sinfo: &[u8], update: bool) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         conn.zadd(self.all_sessions(), &sid, self.expire_time())
@@ -857,8 +920,10 @@ impl Engine for RedisEngine {
             })?;
 
         if self.meta.conf.enable_bg_job {
+            let mut engine = self.clone();
+            engine.with_cancel(self.token().child_token());
             tokio::spawn(async move {
-                self.cleanup_legacies().await;
+                engine.cleanup_legacies().await;
             });
         }
         Ok(())
@@ -1159,7 +1224,7 @@ impl Engine for RedisEngine {
                         .as_secs();
                     let mut pipe = pipe();
                     pipe.atomic()
-                        .zadd(self.del_files(), Self::to_delete(inode, attr.length), ts)
+                        .zadd(self.del_files(), RedisEngine::to_delete(inode, attr.length), ts)
                         .del(self.inode_key(inode))
                         .decr(self.used_space_key(), delete_space)
                         .decr(self.total_inodes_key(), 1)
@@ -1370,8 +1435,8 @@ impl Engine for RedisEngine {
             .arg(3)
             .arg(parent.to_string())
             .arg(path.to_string())
-            .arg(format!("{}", uid()));
-        for gid in gids() {
+            .arg(format!("{}", self.uid()));
+        for gid in self.gids() {
             cmd.arg(gid.to_string());
         }
         let res: Value = cmd.query_async(&mut conn).await?;
@@ -1527,7 +1592,7 @@ impl Engine for RedisEngine {
                 if attr.typ == INodeType::TypeDirectory {
                     pattr.mode |= 0o2000;
                 } else if pattr.mode & 0o2010 == 0o2010 && 0 != 0 {
-                    if let None = gids().iter().find(|gid| **gid == pattr.gid) {
+                    if let None = self.gids().iter().find(|gid| **gid == pattr.gid) {
                         pattr.mode &= !0o2000;
                     }
                 }
@@ -1564,7 +1629,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_unlink(
-        self: Arc<Self>,
+        &self,
         parent: Ino,
         name: &str,
         skip_check_trash: bool,
@@ -1575,7 +1640,7 @@ impl Engine for RedisEngine {
             None
         };
         info!("do unlink trash: {:?}", trash);
-        let base_meta = self.as_ref().as_ref();
+        let base_meta = self.as_ref();
         if let Some(trash_ino) = trash {
             base_meta
                 .open_files
@@ -1648,8 +1713,8 @@ impl Engine for RedisEngine {
                 let attr = match attr_bytes {
                     Some(attr_bytes) => {
                         let mut attr = bincode::deserialize::<Attr>(&attr_bytes)?;
-                        let uid = uid();
-                        if uid != 0
+                        let uid = self.uid().clone();
+                        if !uid.is_root()
                             && pattr.mode & 0o1000 != 0
                             && uid != pattr.uid
                             && uid != attr.uid
@@ -1740,7 +1805,7 @@ impl Engine for RedisEngine {
                                     .duration_since(SystemTime::UNIX_EPOCH)
                                     .expect("Time went backwards")
                                     .as_secs();
-                                pipe.zadd(self.del_files(), Self::to_delete(ino, attr.length), ts);
+                                pipe.zadd(self.del_files(), RedisEngine::to_delete(ino, attr.length), ts);
                                 pipe.del(self.inode_key(ino));
                                 let new_space = -utils::align_4k(attr.length);
                                 pipe.incr(self.used_space_key(), new_space);
@@ -1782,8 +1847,9 @@ impl Engine for RedisEngine {
 
         if trash.is_none() {
             if should_del {
-                self.clone()
-                    .try_spawn_delete_file(
+                let mut engine = dyn_clone::clone_box(self);
+                engine.with_cancel(self.token().child_token());
+                engine.try_spawn_delete_file(
                         ino,
                         attr.length,
                         parent.is_trash(),
@@ -1872,8 +1938,8 @@ impl Engine for RedisEngine {
             let attr = match attr_bytes {
                 Some(attr_bytes) => {
                     let mut attr = bincode::deserialize::<Attr>(&attr_bytes)?;
-                    let uid = uid();
-                    if uid != 0
+                    let uid = self.uid().clone();
+                    if !uid.is_root()
                         && pattr.mode & 0o1000 != 0
                         && uid != pattr.uid
                         && uid != attr.uid

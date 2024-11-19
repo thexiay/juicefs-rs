@@ -20,7 +20,7 @@ pub fn test_format() -> Format {
 }
 
 #[cfg(test)]
-pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
+pub async fn test_meta_client(m: Box<dyn Meta>) {
     use juice_meta::{
         api::{INodeType, ModeMask, ROOT_INODE},
         error::MyError,
@@ -51,7 +51,7 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
         panic!("load got volume name {} != test", format.name);
     }
     // begin session
-    m.clone().new_session(true).await.expect("new session: ");
+    m.new_session(true).await.expect("new session: ");
     let sessions = m.list_sessions().await.expect("list sessions: ");
     if sessions.len() != 1 {
         panic!("list sessions cnt should be 1");
@@ -75,7 +75,7 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
         .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
         .expect("mkdir d: ");
-    match m.clone().unlink(ROOT_INODE, "d", false).await {
+    match m.unlink(ROOT_INODE, "d", false).await {
         Err(errno) if errno == libc::EPERM => (),
         other => panic!("unlink d: {:?}", other),
     };
@@ -184,12 +184,12 @@ pub async fn test_meta_client(m: Box<Arc<dyn Meta>>) {
     
 }
 
-pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
+pub async fn test_truncate_and_delete(m: Box<dyn Meta>) {
     let mut format = m.load(false).await.unwrap().as_ref().clone();
     format.capacity = 0;
     m.init(format, false).await.unwrap();
 
-    m.clone().unlink(1, "f", false).await.expect("unlink f: ");
+    m.unlink(1, "f", false).await.expect("unlink f: ");
     let (inode, attr) = m
         .create(1, "f", 0650, 022, 0)
         .await
@@ -209,16 +209,13 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
     )
     .await
     .expect("write file: ");
-    m.clone()
-        .truncate(inode, 0, 200 << 20, false)
+    m.truncate(inode, 0, 200 << 20, false)
         .await
         .expect("truncate file: ");
-    m.clone()
-        .truncate(inode, 0, (10 << 40) + 10, false)
+    m.truncate(inode, 0, (10 << 40) + 10, false)
         .await
         .expect("truncate file: ");
     let attr = m
-        .clone()
         .truncate(inode, 0, (300 << 20) + 10, false)
         .await
         .expect("truncate file: ");
@@ -232,7 +229,7 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
         panic!("number of slices: {} != 1, {:?}", total_slices, slices);
     }
     m.close(inode).await.unwrap();
-    m.clone().unlink(1, "f", false).await.expect("unlink f: ");
+    m.unlink(1, "f", false).await.expect("unlink f: ");
     time::sleep(Duration::from_millis(100)).await;
 
     // unlink and list slices again
@@ -246,14 +243,14 @@ pub async fn test_truncate_and_delete(m: Box<Arc<dyn Meta>>) {
         panic!("number of slices: {} > 0, {:?}", total_slices, slices);
     }
 
-    m.clone().unlink(1, "f", false).await.expect("unlink f:")
+    m.unlink(1, "f", false).await.expect("unlink f:")
 }
 
-pub async fn test_trash(m: Box<Arc<dyn Meta>>) {}
+pub async fn test_trash(m: Box<dyn Meta>) {}
 
-pub async fn test_parents(m: Box<Arc<dyn Meta>>) {}
+pub async fn test_parents(m: Box<dyn Meta>) {}
 
-pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
+pub async fn test_remove(m: Box<dyn Meta>) {
     let (_, _) = m.create(1, "f", 0644, 0, 0).await.expect("create f: ");
 
     m.remove(1, "f", &mut 0).await.expect("rmr f: ");
@@ -290,42 +287,42 @@ pub async fn test_remove(m: Box<Arc<dyn Meta>>) {
     m.remove(1, "d", &mut 0).await.expect("rmr d: ");
 }
 
-async fn test_resolve(m: Box<Arc<dyn Meta>>) {}
+async fn test_resolve(m: Box<dyn Meta>) {}
 
-async fn test_sticky_bit(m: Box<Arc<dyn Meta>>) {}
+async fn test_sticky_bit(m: Box<dyn Meta>) {}
 
-async fn test_locks(m: Box<Arc<dyn Meta>>) {}
+async fn test_locks(m: Box<dyn Meta>) {}
 
-async fn test_list_locks(m: Box<Arc<dyn Meta>>) {}
+async fn test_list_locks(m: Box<dyn Meta>) {}
 
-async fn test_concurrent_write(m: Box<Arc<dyn Meta>>) {}
+async fn test_concurrent_write(m: Box<dyn Meta>) {}
 
 async fn test_compaction<M: Meta>(m: M, flag: bool) {}
 
-async fn test_copy_file_range(m: Box<Arc<dyn Meta>>) {}
+async fn test_copy_file_range(m: Box<dyn Meta>) {}
 
-async fn test_close_session(m: Box<Arc<dyn Meta>>) {}
+async fn test_close_session(m: Box<dyn Meta>) {}
 
-async fn test_concurrent_dir(m: Box<Arc<dyn Meta>>) {}
+async fn test_concurrent_dir(m: Box<dyn Meta>) {}
 
-async fn test_attr_flags(m: Box<Arc<dyn Meta>>) {}
+async fn test_attr_flags(m: Box<dyn Meta>) {}
 
-async fn test_quota(m: Box<Arc<dyn Meta>>) {}
+async fn test_quota(m: Box<dyn Meta>) {}
 
-async fn test_atime(m: Box<Arc<dyn Meta>>) {}
+async fn test_atime(m: Box<dyn Meta>) {}
 
-async fn test_access(m: Box<Arc<dyn Meta>>) {}
+async fn test_access(m: Box<dyn Meta>) {}
 
-async fn test_open_cache(m: Box<Arc<dyn Meta>>) {}
+async fn test_open_cache(m: Box<dyn Meta>) {}
 
-async fn test_case_incensi(m: Box<Arc<dyn Meta>>) {}
+async fn test_case_incensi(m: Box<dyn Meta>) {}
 
-async fn test_check_and_repair(m: Box<Arc<dyn Meta>>) {}
+async fn test_check_and_repair(m: Box<dyn Meta>) {}
 
-async fn test_dir_stat(m: Box<Arc<dyn Meta>>) {}
+async fn test_dir_stat(m: Box<dyn Meta>) {}
 
-async fn test_clone(m: Box<Arc<dyn Meta>>) {}
+async fn test_clone(m: Box<dyn Meta>) {}
 
-async fn test_acl(m: Box<Arc<dyn Meta>>) {}
+async fn test_acl(m: Box<dyn Meta>) {}
 
-async fn test_read_only(m: Box<Arc<dyn Meta>>) {}
+async fn test_read_only(m: Box<dyn Meta>) {}

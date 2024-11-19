@@ -8,17 +8,18 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bitflags::bitflags;
+use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
-use tracing::error;
 
 use crate::base::{
     CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
 };
 use crate::config::{Config, Format};
+use crate::context::{Gid, Uid, WithContext};
 use crate::error::{DriverSnafu, FsResult, Result};
 use crate::quota::Quota;
-use crate::rds::RedisEngine;
+use crate::rds::RedisEngineWithCtx;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
 pub const RESERVED_INODE: Ino = 0;
@@ -54,19 +55,6 @@ impl InoExt for Ino {
             _ => *self,
         }
     }
-}
-
-// TODO: encapsulated uid, gid
-pub fn uid() -> u32 {
-    0
-}
-
-pub fn gid() -> u32 {
-    0
-}
-
-pub fn gids() -> Vec<u32> {
-    vec![0]
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -178,8 +166,8 @@ pub struct Attr {
     pub flags: Flag,      // special flags
     pub typ: INodeType,   // type of a node
     pub mode: u16,        // permission mode
-    pub uid: u32,         // owner id
-    pub gid: u32,         // group id of owner
+    pub uid: Uid,         // owner id
+    pub gid: Gid,         // group id of owner
     pub rdev: u32,        // device number
     pub atime: u128,      // last access time, nacos time
     pub mtime: u128,      // last modified time, nacos time
@@ -195,7 +183,7 @@ pub struct Attr {
 
 // Meta is a interface for a meta service for file system.
 #[async_trait]
-pub trait Meta: Send + Sync + 'static {
+pub trait Meta: WithContext + Send + Sync + 'static {
     // Name of database
     fn name(&self) -> String;
 
@@ -236,7 +224,7 @@ pub trait Meta: Send + Sync + 'static {
     ///
     /// New session will start serveal different coroutine to do background job, those backgroud job no need to consider
     /// be closed, because once session close, this process exit.
-    async fn new_session(self: Arc<Self>, persist: bool) -> Result<()>;
+    async fn new_session(&self, persist: bool) -> Result<()>;
 
     // UnMount func.CloseSession does cleanup and close the session.
     async fn close_session(&self) -> Result<()>;
@@ -348,7 +336,7 @@ pub trait Meta: Send + Sync + 'static {
 
     // Truncate changes the length for given file.
     async fn truncate(
-        self: Arc<Self>,
+        &self,
         inode: Ino,
         flags: u8,
         attr_length: u64,
@@ -403,8 +391,7 @@ pub trait Meta: Send + Sync + 'static {
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
-    async fn unlink(self: Arc<Self>, parent: Ino, name: &str, skip_check_trash: bool)
-        -> FsResult<()>;
+    async fn unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<()>;
 
     // Rmdir removes an empty sub-directory.
     async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<Ino>;
@@ -563,7 +550,7 @@ pub trait Meta: Send + Sync + 'static {
     ) -> FsResult<()>;
 
     // Clone a file or directory
-    async fn clone(
+    async fn clone_ino(
         &self,
         src_ino: Ino,
         dst_parent_ino: Ino,
@@ -584,9 +571,10 @@ pub trait Meta: Send + Sync + 'static {
     // just for test
     fn get_base(&self) -> &CommonMeta;
 }
+clone_trait_object!(Meta);
 
 // NewClient creates a Meta client for given uri.
-pub async fn new_client(uri: String, conf: Config) -> Box<Arc<dyn Meta>> {
+pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
@@ -596,8 +584,8 @@ pub async fn new_client(uri: String, conf: Config) -> Box<Arc<dyn Meta>> {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
-    let res: Result<Box<Arc<dyn Meta>>> = match driver {
-        "redis" => RedisEngine::new(driver, addr, conf).await,
+    let res: Result<Box<dyn Meta>> = match driver {
+        "redis" => RedisEngineWithCtx::new(driver, addr, conf).await,
         _ => DriverSnafu {
             driver: driver.to_string(),
         }

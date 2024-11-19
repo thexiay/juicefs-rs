@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::ModeMask;
+use crate::{api::ModeMask, context::{Gid, Uid}};
 
 pub const NONE: u32 = 0;
 pub const ACL_COUNTER: &str = "acl_counter";
@@ -35,18 +35,18 @@ pub struct Rule {
 impl Rule {
     pub fn can_access(
         &self,
-        uid: u32,
-        gids: Vec<u32>,
-        f_uid: u32,
-        f_gid: u32,
+        uid: &Uid,
+        gids: &Vec<Gid>,
+        f_uid: Uid,
+        f_gid: Gid,
         m_mask: ModeMask,
     ) -> bool {
-        if uid == f_uid {
+        if *uid == f_uid {
             return ModeMask::FULL & ModeMask::from_bits_truncate(self.owner as u8) & m_mask
                 == m_mask;
         }
         for n_user in &self.named_users {
-            if uid == n_user.id {
+            if *uid == n_user.id {
                 return ModeMask::FULL
                     & ModeMask::from_bits_truncate((n_user.perm & self.mask) as u8)
                     & m_mask
@@ -55,7 +55,7 @@ impl Rule {
         }
 
         let mut is_grp_matched = false;
-        for gid in &gids {
+        for gid in gids {
             if *gid == f_gid {
                 if ModeMask::FULL
                     & ModeMask::from_bits_truncate((self.group & self.mask) as u8)

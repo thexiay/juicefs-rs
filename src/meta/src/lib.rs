@@ -9,6 +9,7 @@ pub mod error;
 pub mod api;
 pub mod quota;
 pub mod acl;
+pub mod context;
 
 pub(crate) mod rds;
 pub(crate) mod utils;

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -10,20 +11,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem, process};
 use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, TryAcquireError};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclCache, AclType, Rule};
 use crate::api::{
-    gid, gids, uid, Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo,
+    Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo,
     Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
+use crate::context::{UserExt, WithContext};
 use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
-use crate::openfile::{OpenFile, OpenFiles};
+use crate::openfile::OpenFiles;
 use crate::quota::Quota;
 use crate::utils::{access_mode, align_4k, sleep_with_jitter, FLockItem, FreeID, PLockItem};
 
@@ -99,7 +100,7 @@ pub struct InternalNode {
 }
 
 #[async_trait]
-pub trait Engine {
+pub trait Engine: WithContext + Send + Sync + 'static {
     // Get the value of counter name.
     async fn get_counter(&self, name: &str) -> Result<i64>;
     // Increase counter name by value. Do not use this if value is 0, use getCounter instead.
@@ -109,7 +110,7 @@ pub trait Engine {
     async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
     async fn do_load(&self) -> Result<Option<Format>>;
-    async fn do_new_session(self: Arc<Self>, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
+    async fn do_new_session(&self, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
     async fn do_refresh_session(&self, sid: u64) -> Result<()>;
     async fn do_list_sessions(&self) -> Result<Vec<Session>>;
     async fn do_get_session(&self, sid: u64, detail: bool) -> Result<Session>;
@@ -168,7 +169,7 @@ pub trait Engine {
     ) -> Result<Attr>;
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
     async fn do_unlink(
-        self: Arc<Self>,
+        &self,
         parent: Ino,
         name: &str,
         skip_check_trash: bool,
@@ -261,7 +262,7 @@ pub trait Engine {
 pub trait MetaOtherFunction {
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
-    async fn update_parent_stats(self: Arc<Self>, inode: Ino, parent: Ino, length: i64, space: i64);
+    async fn update_parent_stats(&self, inode: Ino, parent: Ino, length: i64, space: i64);
     async fn next_inode(&self) -> Result<Ino>;
     async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
 
@@ -275,7 +276,7 @@ pub trait MetaOtherFunction {
     /// force: wait unitl delete task has free handler
     /// delete_on_close: delete file when close
     async fn try_spawn_delete_file(
-        self: Arc<Self>,
+        &self,
         inode: Ino,
         length: u64,
         force: bool,
@@ -303,7 +304,7 @@ pub trait MetaOtherFunction {
 
     /// ------------------------------ session func ------------------------------
     /// do persist session info into meta persist layer periodly
-    async fn refresh_session(self: Arc<Self>);
+    async fn refresh_session(&self);
 
     /// cleanup trash which have not been deleted for days
     async fn cleanup_trash(&self, days: u8, force: bool);
@@ -419,7 +420,7 @@ impl CommonMeta {
 #[async_trait]
 impl<E> MetaOtherFunction for E
 where
-    E: Send + Sync + 'static + Engine + AsRef<CommonMeta>,
+    E: Engine + AsRef<CommonMeta>,
 {
     async fn check_quotas(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()> {
         if space <= 0 && inodes <= 0 {
@@ -548,7 +549,7 @@ where
     }
 
     async fn update_parent_stats(
-        self: Arc<Self>,
+        &self,
         inode: Ino,
         parent: Ino,
         length: i64,
@@ -567,34 +568,14 @@ where
             self.update_quota(parent, space, 0).await;
         } else {
             // spawn a task to shorten the time of updating parent stats
+            let meta = dyn_clone::clone_box(self);
             tokio::spawn(async move {
-                for (parent, _) in self.get_parents(inode).await {
-                    self.update_dir_stats(parent, length, space, 0);
-                    self.update_quota(parent, space, 0).await;
+                for (parent, _) in meta.get_parents(inode).await {
+                    meta.update_dir_stats(parent, length, space, 0);
+                    meta.update_quota(parent, space, 0).await;
                 }
             });
         }
-
-        /*
-            if length == 0 && space == 0 {
-            return
-        }
-        m.en.updateStats(space, 0)
-        if !m.getFormat().DirStats {
-            return
-        }
-        if parent > 0 {
-            m.updateDirStat(ctx, parent, length, space, 0)
-            m.updateDirQuota(ctx, parent, space, 0)
-        } else {
-            go func() {
-                for p := range m.en.doGetParents(ctx, inode) {
-                    m.updateDirStat(ctx, p, length, space, 0)
-                    m.updateDirQuota(ctx, p, space, 0)
-                }
-            }()
-        }
-             */
     }
 
     async fn update_quota(&self, mut inode: Ino, space: i64, inodes: i64) {
@@ -717,18 +698,19 @@ where
     }
 
     async fn try_spawn_delete_file(
-        self: Arc<Self>,
+        &self,
         inode: Ino,
         length: u64,
         force: bool,
         delete_on_close: bool,
     ) {
-        let base = self.as_ref().as_ref();
+        let base = self.as_ref();
         if delete_on_close {
             let mut remove_files = base.removed_files.lock();
             remove_files.insert(inode, true);
         } else {
-            let meta = self.clone();
+            let mut meta = dyn_clone::clone_box(self);
+            meta.with_cancel(self.token().child_token());
             let max_deleting = base.max_deleting.clone();
             tokio::spawn(async move {
                 let permit = match force {
@@ -749,12 +731,12 @@ where
         }
     }
 
-    async fn refresh_session(self: Arc<Self>) {
+    async fn refresh_session(&self) {
         loop {
-            let base = self.as_ref().as_ref();
+            let base = self.as_ref();
             sleep_with_jitter(base.conf.heartbeat).await;
             {
-                let unmounting = self.as_ref().as_ref().ses_umounting.lock().await;
+                let unmounting = self.as_ref().ses_umounting.lock().await;
                 if *unmounting {
                     return;
                 }
@@ -820,7 +802,8 @@ where
                 .await
             {
                 Ok(true) => {
-                    let meta = self.clone();
+                    let mut meta = dyn_clone::clone_box(self);
+                    meta.with_cancel(self.token().child_token());
                     tokio::spawn(async move {
                         meta.cleanup_stale_sessions().await;
                     });
@@ -901,7 +884,7 @@ where
 #[async_trait]
 impl<E> Meta for E
 where
-    E: Send + Sync + 'static + Engine + AsRef<CommonMeta>,
+    E: Engine + AsRef<CommonMeta>,
 {
     // Name of database
     fn name(&self) -> String {
@@ -948,13 +931,14 @@ where
 
     // NewSession creates or update client session.
     // TODO: 将部分需要new session修改的东西放在一个单独的结构体。还有比如在new session中启动的协程在close时进行关闭
-    async fn new_session(self: Arc<Self>, persist: bool) -> Result<()> {
-        let meta = self.clone();
-        tokio::spawn(async {
+    async fn new_session(&self, persist: bool) -> Result<()> {
+        let mut meta = dyn_clone::clone_box(self);
+        meta.with_cancel(self.token().child_token());
+        tokio::spawn(async move {
             meta.refresh_session().await;
         });
 
-        let base = self.as_ref().as_ref();
+        let base = self.as_ref();
         self.cache_acls().await?;
         if base.conf.read_only {
             // TODO: add version detail
@@ -987,13 +971,15 @@ where
         }
 
         self.load_quotas().await;
-        let meta = self.clone();
         // flush stats
+        let mut meta = dyn_clone::clone_box(self);
+        meta.with_cancel(self.token().child_token());
         tokio::spawn(async move {
             meta.flush_stats().await;
         });
-        let meta = self.clone();
         // flush dir stats
+        let mut meta = dyn_clone::clone_box(self);
+        meta.with_cancel(self.token().child_token());
         tokio::spawn(async move {
             let period = meta.as_ref().as_ref().conf.dir_stat_flush_period;
             loop {
@@ -1002,7 +988,8 @@ where
             }
         });
         // flush quota
-        let meta = self.clone();
+        let mut meta = dyn_clone::clone_box(self);
+        meta.with_cancel(self.token().child_token());
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(3)).await;
@@ -1012,7 +999,8 @@ where
 
         if base.conf.enable_bg_job {
             // cleanup deleted files
-            let meta = self.clone();
+            let mut meta = dyn_clone::clone_box(self);
+            meta.with_cancel(self.token().child_token());
             tokio::spawn(async move {
                 loop {
                     sleep_with_jitter(Duration::from_mins(1)).await;
@@ -1046,7 +1034,8 @@ where
                 }
             });
             // cleaup slices
-            let meta = self.clone();
+            let mut meta = dyn_clone::clone_box(self);
+            meta.with_cancel(self.token().child_token());
             tokio::spawn(async move {
                 loop {
                     sleep_with_jitter(Duration::from_hours(1)).await;
@@ -1066,7 +1055,8 @@ where
                 }
             });
             // cleanup trash
-            let meta = self.clone();
+            let mut meta = dyn_clone::clone_box(self);
+            meta.with_cancel(self.token().child_token());
             tokio::spawn(async move {
                 loop {
                     sleep_with_jitter(Duration::from_hours(1)).await;
@@ -1248,13 +1238,13 @@ where
             let rule = self
                 .do_get_facl(inode, AclType::Access, attr.access_acl)
                 .await?;
-            if rule.can_access(uid(), gids(), attr.uid, attr.gid, mode_mask) {
+            if rule.can_access(self.uid(), self.gids(), attr.uid, attr.gid, mode_mask) {
                 return Ok(());
             }
             return SysSnafu { code: libc::EACCES }.fail()?;
         }
 
-        let mode = access_mode(attr, uid(), gids());
+        let mode = access_mode(attr, self.uid(), self.gids());
         if mode & mode_mask != mode_mask {
             debug!(
                 "Access inode {} {:o}, mode {:o}, request mode {:o}",
@@ -1390,13 +1380,13 @@ where
 
     // Truncate changes the length for given file.
     async fn truncate(
-        self: Arc<Self>,
+        &self,
         inode: Ino,
         flags: u8,
         attr_length: u64,
         skip_perm_check: bool,
     ) -> FsResult<Attr> {
-        if let Some(file) = self.as_ref().as_ref().open_files.find(inode) {
+        if let Some(file) = self.as_ref().open_files.find(inode) {
             let _ = file.lock().await;
         }
 
@@ -1483,8 +1473,8 @@ where
             }
         }
         attr.typ = r#type.clone();
-        attr.uid = uid();
-        attr.gid = gid();
+        attr.uid = self.uid().clone();
+        attr.gid = self.gid().clone();
         attr.parent = parent;
         attr.full = true;
         let ino = self.next_inode().await?;
@@ -1526,23 +1516,22 @@ where
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
     async fn unlink(
-        self: Arc<Self>,
+        &self,
         parent: Ino,
         name: &str,
         skip_check_trash: bool,
     ) -> FsResult<()> {
-        if (parent == ROOT_INODE && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
+        if (parent == ROOT_INODE && name == TRASH_NAME) || (parent.is_trash() && !self.uid().is_root()) {
             return SysSnafu { code: libc::EPERM }.fail()?;
         }
 
-        let base = self.as_ref().as_ref();
+        let base = self.as_ref();
         if base.conf.read_only {
             return SysSnafu { code: libc::EROFS }.fail()?;
         }
 
         let parent = parent.transfer_root(base.root);
         let attr = self
-            .clone()
             .do_unlink(parent, name, skip_check_trash)
             .await?;
         let diff_length = if attr.typ == INodeType::TypeFile {
@@ -1563,7 +1552,7 @@ where
             ".." => return SysSnafu { code: libc::ENOTEMPTY }.fail()?,
             _ => {},
         }
-        if (parent.is_root() && name == TRASH_NAME) || (parent.is_trash() && uid() != 0) {
+        if (parent.is_root() && name == TRASH_NAME) || (parent.is_trash() && !self.uid().is_root()) {
             return SysSnafu { code: libc::EPERM }.fail()?;
         }
         let base = self.as_ref();
@@ -1842,7 +1831,7 @@ where
     }
 
     // Clone a file or directory
-    async fn clone(
+    async fn clone_ino(
         &self,
         src_ino: Ino,
         dst_parent_ino: Ino,
