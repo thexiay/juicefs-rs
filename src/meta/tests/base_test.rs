@@ -20,7 +20,7 @@ pub fn test_format() -> Format {
 }
 
 #[cfg(test)]
-pub async fn test_meta_client(m: Box<dyn Meta>) {
+pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     use juice_meta::{
         api::{INodeType, ModeMask, ROOT_INODE},
         error::MyError,
@@ -168,23 +168,25 @@ pub async fn test_meta_client(m: Box<dyn Meta>) {
         Err(errno) if errno == libc::ENOTSUP => (),
         other => panic!("resolve f: {:?}", other),
     }
-    // TODO: test different user and group
-    /*
-	var ctx2 = NewContext(0, 1, []uint32{1})
-	if st := m.Resolve(ctx2, parent, "/f", &inode, attr); st != syscall.EACCES && st != syscall.ENOTSUP {
-		t.Fatalf("resolve f: %s", st)
-	}
-	if st := m.Resolve(ctx, parent, "/f/c", &inode, attr); st != syscall.ENOTDIR && st != syscall.ENOTSUP {
-		t.Fatalf("resolve f: %s", st)
-	}
-	if st := m.Resolve(ctx, parent, "/f2", &inode, attr); st != syscall.ENOENT && st != syscall.ENOTSUP {
-		t.Fatalf("resolve f2: %s", st)
-	}
-    */
+    // test resolve with different user
+    m.with_login(1, vec![1]);
+    match m.resolve(parent, "/f").await {
+        Err(errno) if errno == libc::EACCES || errno == libc::ENOTSUP => (),
+        other => panic!("resolve f: {:?}", other),
+    }
+    match m.resolve(parent, "/f/c").await {
+        Err(errno) if errno == libc::ENOTDIR || errno == libc::ENOTSUP => (),
+        other => panic!("resolve d/f: {:?}", other),
+    }
+    match m.resolve(parent, "/f2").await {
+        Err(errno) if errno == libc::ENOENT || errno == libc::ENOTSUP => (),
+        other => panic!("resolve f2: {:?}", other),
+    }
+    
     
 }
 
-pub async fn test_truncate_and_delete(m: Box<dyn Meta>) {
+pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
     let mut format = m.load(false).await.unwrap().as_ref().clone();
     format.capacity = 0;
     m.init(format, false).await.unwrap();
@@ -246,11 +248,11 @@ pub async fn test_truncate_and_delete(m: Box<dyn Meta>) {
     m.unlink(1, "f", false).await.expect("unlink f:")
 }
 
-pub async fn test_trash(m: Box<dyn Meta>) {}
+pub async fn test_trash(mut m: Box<dyn Meta>) {}
 
-pub async fn test_parents(m: Box<dyn Meta>) {}
+pub async fn test_parents(mut m: Box<dyn Meta>) {}
 
-pub async fn test_remove(m: Box<dyn Meta>) {
+pub async fn test_remove(mut m: Box<dyn Meta>) {
     let (_, _) = m.create(1, "f", 0644, 0, 0).await.expect("create f: ");
 
     m.remove(1, "f", &mut 0).await.expect("rmr f: ");
@@ -287,42 +289,42 @@ pub async fn test_remove(m: Box<dyn Meta>) {
     m.remove(1, "d", &mut 0).await.expect("rmr d: ");
 }
 
-async fn test_resolve(m: Box<dyn Meta>) {}
+async fn test_resolve(mut m: Box<dyn Meta>) {}
 
-async fn test_sticky_bit(m: Box<dyn Meta>) {}
+async fn test_sticky_bit(mut m: Box<dyn Meta>) {}
 
-async fn test_locks(m: Box<dyn Meta>) {}
+async fn test_locks(mut m: Box<dyn Meta>) {}
 
-async fn test_list_locks(m: Box<dyn Meta>) {}
+async fn test_list_locks(mut m: Box<dyn Meta>) {}
 
-async fn test_concurrent_write(m: Box<dyn Meta>) {}
+async fn test_concurrent_write(mut m: Box<dyn Meta>) {}
 
 async fn test_compaction<M: Meta>(m: M, flag: bool) {}
 
-async fn test_copy_file_range(m: Box<dyn Meta>) {}
+async fn test_copy_file_range(mut m: Box<dyn Meta>) {}
 
-async fn test_close_session(m: Box<dyn Meta>) {}
+async fn test_close_session(mut m: Box<dyn Meta>) {}
 
-async fn test_concurrent_dir(m: Box<dyn Meta>) {}
+async fn test_concurrent_dir(mut m: Box<dyn Meta>) {}
 
-async fn test_attr_flags(m: Box<dyn Meta>) {}
+async fn test_attr_flags(mut m: Box<dyn Meta>) {}
 
-async fn test_quota(m: Box<dyn Meta>) {}
+async fn test_quota(mut m: Box<dyn Meta>) {}
 
-async fn test_atime(m: Box<dyn Meta>) {}
+async fn test_atime(mut m: Box<dyn Meta>) {}
 
-async fn test_access(m: Box<dyn Meta>) {}
+async fn test_access(mut m: Box<dyn Meta>) {}
 
-async fn test_open_cache(m: Box<dyn Meta>) {}
+async fn test_open_cache(mut m: Box<dyn Meta>) {}
 
-async fn test_case_incensi(m: Box<dyn Meta>) {}
+async fn test_case_incensi(mut m: Box<dyn Meta>) {}
 
-async fn test_check_and_repair(m: Box<dyn Meta>) {}
+async fn test_check_and_repair(mut m: Box<dyn Meta>) {}
 
-async fn test_dir_stat(m: Box<dyn Meta>) {}
+async fn test_dir_stat(mut m: Box<dyn Meta>) {}
 
-async fn test_clone(m: Box<dyn Meta>) {}
+async fn test_clone(mut m: Box<dyn Meta>) {}
 
-async fn test_acl(m: Box<dyn Meta>) {}
+async fn test_acl(mut m: Box<dyn Meta>) {}
 
-async fn test_read_only(m: Box<dyn Meta>) {}
+async fn test_read_only(mut m: Box<dyn Meta>) {}
