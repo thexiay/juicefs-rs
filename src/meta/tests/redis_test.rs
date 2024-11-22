@@ -18,7 +18,7 @@ use juice_meta::{
 use parking_lot::RwLock;
 use tokio::time::sleep;
 use tracing::info;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt::{self, time::OffsetTime}, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod base_test;
 
@@ -28,7 +28,21 @@ mod base_test;
 fn before_all() {
     let mut guard = REDIS_DB_HOLDER.write();
     *guard = Some(RedisDbOffer::new(16));
-    tracing_subscriber::registry().with(fmt::layer()).init();
+    // init logger
+    let default_timer = OffsetTime::local_rfc_3339().unwrap_or_else(|e| {
+        println!("failed to get local time offset, falling back to UTC: {}", e);
+        OffsetTime::new(
+            time::UtcOffset::UTC,
+            time::format_description::well_known::Rfc3339,
+        )
+    });
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_thread_names(true)
+        .with_timer(default_timer.clone())
+        .with_ansi(true)
+        .with_file(true)
+        .with_line_number(true);
+    tracing_subscriber::registry().with(fmt_layer).init();
 }
 
 #[dtor]

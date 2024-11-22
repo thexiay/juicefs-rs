@@ -47,14 +47,17 @@ pub fn access_mode(attr: &Attr, uid: &Uid, gids: &Vec<Gid>) -> ModeMask {
 		return ModeMask::FULL;
 	}
 	let mode = attr.mode;
+	// user permission
 	if *uid == attr.uid {
 		return ModeMask::FULL & ModeMask::from_bits_truncate((mode >> 6) as u8);
 	}
+	// group permission
 	for gid in gids {
 		if *gid == attr.gid {
 			return ModeMask::FULL & ModeMask::from_bits_truncate((mode >> 3) as u8);
 		}
 	}
+	// other permission
 	return ModeMask::FULL & ModeMask::from_bits_truncate(mode as u8);
 }
 

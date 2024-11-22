@@ -12,6 +12,7 @@ use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
 
+use crate::acl::AclId;
 use crate::base::{
     CommonMeta, DirStat, PendingFileScan, PendingSliceScan, TrashFileScan, TrashSliceScan,
 };
@@ -57,7 +58,7 @@ impl InoExt for Ino {
     }
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum INodeType {
     #[default]
     TypeFile = 1, // type for regular file
@@ -158,10 +159,23 @@ bitflags! {
         const IMMUTABLE  = 0b001;
         const APPEND     = 0b010;
     }
+
+    pub struct SetAttrMask: u16 {
+        const SET_MODE = 1 << 0;
+        const SET_UID  = 1 << 2;
+        const SET_GID  = 1 << 3;
+        const SET_SIZE = 1 << 4;
+        const SET_ATIME = 1 << 5;
+        const SET_MTIME = 1 << 6;
+        const SET_CTIME = 1 << 7;
+        const SET_ATIME_NOW = 1 << 8;
+        const SET_MTIME_NOW = 1 << 9;
+        const SET_FLAG = 1 << 15;
+    }
 }
 
 // Attr represents attributes of a node.
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Attr {
     pub flags: Flag,      // special flags
     pub typ: INodeType,   // type of a node
@@ -172,13 +186,13 @@ pub struct Attr {
     pub atime: u128,      // last access time, nacos time
     pub mtime: u128,      // last modified time, nacos time
     pub ctime: u128,      // last change time for meta, nacos time
-    pub nlink: u32,       // number of links (sub-directories or hardlinks)
+    pub nlink: u32,       // For symbol file, number of hardlinks; For directory, number of sub-directories
     pub length: u64,      // length of regular file
     pub parent: Ino,      // inode of parent; 0 means tracked by parentKey (for hardlinks)
     pub full: bool,       // the attributes are completed or not
     pub keep_cache: bool, // whether to keep the cached page or not
-    pub access_acl: u32,  // access ACL id (identical ACL rules share the same access ACL ID.)
-    pub default_acl: u32, // default ACL id (default ACL and the access ACL share the same cache and store)
+    pub access_acl: AclId,  // access ACL id (identical ACL rules share the same access ACL ID.)
+    pub default_acl: AclId, // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
 // Meta is a interface for a meta service for file system.
@@ -306,7 +320,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         iavail: AtomicU64,
     ) -> FsResult<()>;
 
-    // Access checks the access permission on given inode.
+    // Access checks the current user can access (mode)permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> FsResult<()>;
 
     // Lookup returns the inode and attributes for the given entry in a directory.
@@ -317,18 +331,21 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         check_permission: bool,
     ) -> FsResult<(Ino, Attr)>;
 
-    // Resolve fetches the inode and attributes for an entry identified by the given path.
-    // ENOTSUP will be returned if there's no natural implementation for this operation or
-    // if there are any symlink following involved.
-    // The different between with lookup and resolve is that resolve deep search in path, 
-    // but lookup only search in current directory.
+    /// Resolve fetches the inode and attributes for an entry identified by the given path.
+    /// 
+    /// ENOTSUP will be returned if there's no natural implementation for this operation or
+    /// if there are any symlink following involved.
+    /// The different between with lookup and resolve is that resolve deep search in path, 
+    /// but lookup only search in current directory.
     async fn resolve(&self, parent: Ino, path: &str) -> FsResult<(Ino, Attr)>;
 
-    // GetAttr returns the attributes for given node.
+    /// GetAttr returns the attributes for given node.
+    /// 
+    /// For root inode or trash inode, default attributes will be returned if request timieout
     async fn get_attr(&self, inode: Ino) -> FsResult<Attr>;
 
     // SetAttr updates the attributes for given node.
-    async fn set_attr(&self, inode: Ino, set: u16, sggid_clear_mode: u8, attr: &Attr)
+    async fn set_attr(&self, inode: Ino, set: SetAttrMask, sggid_clear_mode: u8, attr: &Attr)
         -> FsResult<()>;
 
     // Check setting attr is allowed or not
@@ -366,7 +383,9 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         attr: &Attr,
     ) -> FsResult<()>;
 
-    // Mknod creates a node in a directory with given name, type and permissions.
+    /// Mknod creates a node in a directory with given name, type and permissions.
+    ///
+    /// [`exists_node`]: represet the node is already exists or not, if exists, the node will return exists node.
     async fn mknod(
         &self,
         parent: Ino,
@@ -389,16 +408,22 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         copysgid: u8,
     ) -> FsResult<(Ino, Attr)>;
 
-    // Unlink removes a file entry from a directory.
-    // The file will be deleted if it's not linked by any entries and not open by any sessions.
+    /// Unlink removes a file [entry] (not dirctory) from a directory.
+    /// The file will be deleted if it's not linked by any entries and not open by any sessions.
+    /// 
+    /// EPERM: if current user has no permission 
+    /// 
+    /// [entry]: Entry
     async fn unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<()>;
 
-    // Rmdir removes an empty sub-directory.
+    /// Rmdir removes an empty sub-directory.
+    /// 
+    /// This will return ENOTEMPTY if the directory is not empty.
     async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<Ino>;
 
-    // Rename move an entry from a source directory to another with given name.
-    // The targeted entry will be overwrited if it's a file or empty directory.
-    // For Hadoop, the target should not be overwritten.
+    /// Rename move an entry from a source directory to another with given name.
+    /// The targeted entry will be overwrited if it's a file or empty directory.
+    /// For Hadoop, the target should not be overwritten.
     async fn rename(
         &self,
         parent_src: Ino,
@@ -526,9 +551,10 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         show_progress: Box<dyn Fn() + Send>,
     ) -> FsResult<HashMap<Ino, Vec<Slice>>>;
 
-    // Remove all files and directories recursively.
-    // count represents the number of attempted deletions of entries (even if failed).
-    async fn remove(&self, parent: Ino, name: &str, count: &mut u64) -> FsResult<()>;
+    /// Remove all files and directories recursively.
+    ///
+    /// Return count, represents the number of attempted deletions of entries (maybe delete failed)
+    async fn remove(&self, parent: Ino, name: &str) -> FsResult<u64>;
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(

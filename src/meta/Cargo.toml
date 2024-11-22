@@ -36,6 +36,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 dyn-clone = { workspace = true }
 nix = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

@@ -36,10 +36,12 @@ pub enum MyError {
         source: serde_json::Error,
         backtrace: Backtrace
     },
-    #[snafu(context(false))]
+    #[snafu(display("An bincode serde error occurred {}: {:?}", loc, source), context(false))]
     SerdeBincodeError {
         source: bincode::Error,
-        backtrace: Backtrace
+        backtrace: Backtrace,
+        #[snafu(implicit)]
+        loc: snafu::Location,
     },
 
     // ----------------- logic error  -------------------
@@ -49,19 +51,30 @@ pub enum MyError {
     NotIncompatibleClientError {
         version: i32,
     },
+    #[snafu(display("unknown driver: {driver}"))]
+    DriverError {
+        driver: String,
+    },
+    // not found key in db
     #[snafu(display("exist file ino: {ino}, attr: {attr:?}"))]
     FileExistError {
         ino: Ino,
         attr: Attr,
     },
-    #[snafu(display("unknown driver: {driver}"))]
-    DriverError {
-        driver: String,
-    },
-    #[snafu(display("ino cann't found in db: {ino}"))]
+    #[snafu(display("cann't found ino({ino}) in db, loc({loc})."))]
     NotFoundInoError {
         ino: Ino,
+        #[snafu(implicit)]
+        loc: snafu::Location,
     },
+    #[snafu(display("cann't found entry({parent} {name}) in db, loc({loc})."))]
+    NotFoundEntryError {
+        parent: Ino,
+        name: String,
+        #[snafu(implicit)]
+        loc: snafu::Location,
+    },
+    // other
     #[snafu(display("message queue closed"))]
     SemaphoraCloseError,
     #[snafu(display("cannot upgrade format: {detail}"))]
@@ -83,7 +96,7 @@ impl From<MyError> for Errno {
         match e {
             MyError::SysError { code } => code,
             other =>  {
-                error!("error: {:?}, stack: {:?}", other, Backtrace::capture());
+                error!("error: {}\nstack: {}", other, Backtrace::capture());
                 libc::EIO
             },
         }

@@ -14,7 +14,7 @@ pub const INVALIDATE_ATTR_ONLY: u32 = 0xFFFFFFFF;
 
 #[derive(Default)]
 pub struct OpenFile {
-    attr: Attr,
+    pub attr: Attr,
     refs: i32,
     last_check: Duration,
     first: Vec<Slice>,
@@ -154,7 +154,7 @@ impl OpenFiles {
         files.get(&ino).map(|file| file.clone())
     }
 
-    pub async fn invalid(&self, ino: Ino, indx: u32) {
+    pub async fn invalidate_chunk(&self, ino: Ino, indx: u32) {
         let file = {
             let files = self.files.lock();
             files.get(&ino).map(|file| file.clone())

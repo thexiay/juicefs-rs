@@ -5,21 +5,21 @@ use futures::StreamExt;
 use juice_utils::process::Bar;
 use redis::aio::{ConnectionLike, ConnectionManager};
 use redis::{
-    cmd, pipe, AsyncCommands, AsyncIter, Client, InfoDict, IntoConnectionInfo, Pipeline, RedisError,
-    ScanOptions, Script, Value,
+    cmd, from_redis_value, pipe, AsyncCommands, AsyncIter, Client, FromRedisValue, InfoDict,
+    IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, Value,
 };
 use regex::Regex;
 use snafu::{ensure, ResultExt};
-use tokio::sync::mpsc::Sender;
-use tokio_util::sync::CancellationToken;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::acl::{self, AclId, AclType, Rule};
+use crate::acl::{self, AclExt, AclId, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session,
+    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session, SetAttrMask,
     Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
@@ -29,7 +29,8 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{
-    ConnectionSnafu, FileExistSnafu, MyError, NotFoundInoSnafu, RedisDetailSnafu, Result, SysSnafu,
+    ConnectionSnafu, FileExistSnafu, FsResult, MyError, NotFoundEntrySnafu, NotFoundInoSnafu,
+    RedisDetailSnafu, Result, SysSnafu,
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::Quota;
@@ -294,7 +295,7 @@ impl RedisEngine {
     }
 
     /// Dir: {prefix}d{inode} -> {name -> {type,inode}}
-    fn dir_key(&self, inode: Ino) -> String {
+    fn entry_key(&self, inode: Ino) -> String {
         format!("{}d{}", self.prefix, inode)
     }
 
@@ -481,21 +482,20 @@ impl RedisEngine {
         Err(last_err.unwrap().into())
     }
     */
-
 }
 
 /// Redis Engine with Context
 /// Context is independent execution context
 pub struct RedisEngineWithCtx {
     engine: Arc<RedisEngine>,
-	uid: u32,
-	gid: u32,
-	gids: Vec<u32>,
-	token: CancellationToken,
+    uid: u32,
+    gid: u32,
+    gids: Vec<u32>,
+    token: CancellationToken,
 }
 
 impl Deref for RedisEngineWithCtx {
-	type Target = RedisEngine;
+    type Target = RedisEngine;
     fn deref(&self) -> &Self::Target {
         &self.engine
     }
@@ -551,22 +551,6 @@ impl RedisEngineWithCtx {
             gids: Vec::new(),
             token: CancellationToken::new(),
         }))
-    }
-
-    async fn scan_iter<'a>(
-        &self,
-        conn: &'a mut impl AsyncCommands,
-        pattern: String,
-    ) -> Result<redis::AsyncIter<'a, Vec<Vec<u8>>>> {
-        // redis-rs will auto fetch all data batch
-        let scan_options = ScanOptions::default()
-            .with_pattern(&pattern)
-            .with_count(10000);
-        conn.scan_options(scan_options)
-            .await
-            .context(RedisDetailSnafu {
-                detail: format!("scan {}", &pattern),
-            })
     }
 
     async fn do_delete_file_data_inner(&self, inode: Ino, length: u64, tracking: &str) {
@@ -644,7 +628,11 @@ impl RedisEngineWithCtx {
             let mut pipe = pipe();
             pipe.atomic().del(&key).ignore();
             slices.into_iter().filter(|s| s.id > 0).for_each(|slice| {
-                pipe.hincr(self.slice_refs(), RedisEngine::slice_key(slice.id, slice.size), -1);
+                pipe.hincr(
+                    self.slice_refs(),
+                    RedisEngine::slice_key(slice.id, slice.size),
+                    -1,
+                );
                 todel.push(slice);
             });
             let rs: Vec<i64> = pipe.query_async(conn).await?;
@@ -670,71 +658,69 @@ impl RedisEngineWithCtx {
 
     fn delete_slice(&self, id: u64, size: u32) {}
 
-    async fn get_acl(
-        &self,
-        pipe: &mut Pipeline,
-        conn: &mut impl ConnectionLike,
-        id: u32,
-    ) -> Result<Rule> {
-        // 这里必须拿到，拿不到就是有逻辑上的错误
+    async fn get_acl(&self, conn: &mut impl AsyncCommands, id: AclId) -> Result<Option<Rule>> {
+        if !id.is_valid_acl() {
+            return Ok(None);
+        }
         let mut cache = self.meta.acl_cache.lock().await;
         if let Some(rule) = cache.get(id) {
-            return Ok(rule);
+            return Ok(Some(rule));
         }
 
-        let cmds: Option<Vec<u8>> = pipe.hget(self.acl_key(), id).query_async(conn).await?;
+        let mut pipe = pipe();
+        pipe.atomic();
+        let res: Vec<Value> = pipe
+            .hget(self.acl_key(), id)
+            .query_async(conn)
+            .await
+            .context(RedisDetailSnafu {
+                detail: format!("get acl {}", id),
+            })?;
+        let cmds = from_redis_value::<Option<Vec<u8>>>(&res[0])?;
         match cmds {
-            None => SysSnafu { code: libc::EIO }.fail(),
+            None => {
+                error!("Missing acl id: {}", id);
+                SysSnafu { code: libc::EIO }.fail()
+            }
             Some(cmds) => {
                 let rule: Rule = bincode::deserialize(&cmds)?;
                 cache.put(id, rule.clone());
-                Ok(rule)
+                Ok(Some(rule))
             }
         }
     }
 
-    async fn insert_acl(
-        &self,
-        pipe: &mut Pipeline,
-        conn: &mut impl ConnectionLike,
-        rule: Rule,
-    ) -> Result<AclId> {
-        if rule.is_empty() {
-            return Ok(acl::NONE);
-        }
+    async fn insert_acl(&self, conn: &mut impl AsyncCommands, rule: Option<Rule>) -> Result<AclId> {
+        let rule = match rule {
+            Some(rule) if !rule.is_empty() => rule,
+            _ => return Ok(AclId::invalid_acl()),
+        };
 
-        self.load_miss_acls(pipe, conn)
+        self.load_miss_acls(conn)
             .await
-            .map_err(|e| warn!("SetFacl: load miss acls error: {}", e));
+            .unwrap_or_else(|e| warn!("SetFacl: load miss acls error: {}", e));
         // set acl
         let mut cache = self.meta.acl_cache.lock().await;
         match cache.get_id(&rule) {
             Some(acl_id) => Ok(acl_id),
             None => {
                 let new_id = self.incr_counter(acl::ACL_COUNTER, 1).await?;
-                pipe.hset_nx(self.acl_key(), new_id, bincode::serialize(&rule)?)
-                    .query_async::<()>(conn);
+                conn.hset_nx(self.acl_key(), new_id, bincode::serialize(&rule)?)
+                    .await?;
                 cache.put(new_id as u32, rule);
                 Ok(new_id as u32)
             }
         }
     }
 
-    async fn load_miss_acls(
-        &self,
-        pipe: &mut Pipeline,
-        conn: &mut impl ConnectionLike,
-    ) -> Result<()> {
+    async fn load_miss_acls(&self, conn: &mut impl AsyncCommands) -> Result<()> {
         let mut cache = self.meta.acl_cache.lock().await;
         let miss_ids = cache.get_miss_ids();
         match miss_ids.is_empty() {
             true => Ok(()),
             false => {
                 let miss_keys: Vec<String> = miss_ids.iter().map(|id| id.to_string()).collect();
-                let vals: Vec<Option<Vec<u8>>> = pipe
-                    .hget(self.acl_key(), miss_keys)
-                    .query_async(conn)
-                    .await?;
+                let vals: Vec<Option<Vec<u8>>> = conn.hget(self.acl_key(), miss_keys).await?;
                 for (i, data) in vals.iter().enumerate() {
                     match data {
                         Some(bytes) => {
@@ -804,6 +790,56 @@ impl RedisEngineWithCtx {
         }
         Ok(())
     }
+
+    fn handle_script_result(op: &str, result: RedisResult<Value>) -> FsResult<(Ino, Attr)> {
+        match result {
+            Ok(value) => match value {
+                Value::Array(res) => {
+                    if res.len() != 2 {
+                        error!("invalid script op({}) result: {:?}", op, res);
+                        return Err(libc::ENOTSUP);
+                    }
+                    if let Value::Int(ino) = res[0]
+                        && let Value::BulkString(ref attr) = res[1]
+                    {
+                        match bincode::deserialize(attr) {
+                            Ok(attr) => Ok((ino as u64, attr)),
+                            Err(err) => {
+                                error!("deserialize attr error for script op({}): {}", op, err);
+                                Err(libc::EIO)
+                            }
+                        }
+                    } else {
+                        error!("invalid script op({}) result: {:?}", op, res);
+                        Err(libc::ENOTSUP)
+                    }
+                }
+                other => {
+                    error!("invalid script op({}) result: {:?}", op, other);
+                    Err(libc::ENOTSUP)
+                }
+            },
+            Err(error) => {
+                if let Some(detail) = error.detail() {
+                    if detail.contains("ENOENT") {
+                        Err(libc::ENOENT)
+                    } else if detail.contains("ENOTSUP") {
+                        Err(libc::ENOTSUP)
+                    } else if detail.contains("EACCES") {
+                        Err(libc::EACCES)
+                    } else if detail.contains("ENOTDIR") {
+                        Err(libc::ENOTDIR)
+                    } else {
+                        warn!("unexpected error for script op({}), {}", op, error);
+                        Err(libc::ENOTSUP)
+                    }
+                } else {
+                    error!("invalid script op({}) result: {:?}", op, error);
+                    Err(libc::ENOTSUP)
+                }
+            }
+        }
+    }
 }
 
 impl Clone for RedisEngineWithCtx {
@@ -826,20 +862,23 @@ impl WithContext for RedisEngineWithCtx {
         self.gids = gids;
     }
 
-	fn with_cancel(&mut self, token: CancellationToken) {
+    fn with_cancel(&mut self, token: CancellationToken) {
         self.token = token;
     }
-	fn uid(&self) -> &u32 {
+    fn uid(&self) -> &u32 {
         &self.uid
     }
-	fn gid(&self) -> &u32 {
+    fn gid(&self) -> &u32 {
         &self.gid
     }
-	fn gids(&self) -> &Vec<u32> {
+    fn gids(&self) -> &Vec<u32> {
         &self.gids
     }
     fn token(&self) -> &CancellationToken {
         &self.token
+    }
+    fn check_permission(&self) -> bool {
+        true
     }
 }
 
@@ -1109,7 +1148,7 @@ impl Engine for RedisEngineWithCtx {
             ..Default::default()
         };
         if format.trash_days > 0 {
-            attr.mode = 0555;
+            attr.mode = 0o555;
             conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)
                 .await?;
         }
@@ -1124,7 +1163,7 @@ impl Engine for RedisEngineWithCtx {
             Some(_) => Ok(()),
             None => {
                 // root inode
-                attr.mode = 0777;
+                attr.mode = 0o777;
                 Ok(conn
                     .set(self.inode_key(ROOT_INODE), bincode::serialize(&attr)?)
                     .await?)
@@ -1136,9 +1175,9 @@ impl Engine for RedisEngineWithCtx {
         if !self.prefix.is_empty() {
             let mut conn = self.share_conn();
             let mut conn2 = conn.clone();
-            let mut iter = self.scan_iter(&mut conn, "*".to_string()).await?;
-            while let Some(key) = iter.next().await {
-                conn2.del(key).await?;
+            let mut iter = conn.scan_match::<&str, Vec<u8>>("*").await?.chunks(10000);
+            while let Some(keys) = iter.next().await {
+                conn2.del(keys).await?;
             }
             Ok(())
         } else {
@@ -1153,9 +1192,10 @@ impl Engine for RedisEngineWithCtx {
         let mut shared_conn = self.share_conn();
         let mut pipe = redis::pipe();
         let re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &self.prefix)).expect("error regex");
-        let mut iter = self
-            .scan_iter(&mut shared_conn, format!("{}{}", self.prefix, "c*_*"))
-            .await?;
+        let mut iter = shared_conn
+            .scan_match::<String, Vec<u8>>(format!("{}{}", self.prefix, "c*_*"))
+            .await?
+            .chunks(10000);
         while let Some(keys) = iter.next().await {
             let mut pool_conn = self.exclusive_conn().await?;
             let conn = pool_conn.deref_mut();
@@ -1224,7 +1264,11 @@ impl Engine for RedisEngineWithCtx {
                         .as_secs();
                     let mut pipe = pipe();
                     pipe.atomic()
-                        .zadd(self.del_files(), RedisEngine::to_delete(inode, attr.length), ts)
+                        .zadd(
+                            self.del_files(),
+                            RedisEngine::to_delete(inode, attr.length),
+                            ts,
+                        )
                         .del(self.inode_key(inode))
                         .decr(self.used_space_key(), delete_space)
                         .decr(self.total_inodes_key(), 1)
@@ -1320,14 +1364,14 @@ impl Engine for RedisEngineWithCtx {
 
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>> {
         let mut shared_conn = self.share_conn();
-        let mut iter = self
-            .scan_iter(&mut shared_conn, self.dir_quota_key())
-            .await?;
+        let mut iter = shared_conn
+            .hscan::<String, Vec<u8>>(self.dir_quota_key())
+            .await?
+            .chunks(10000);
         let mut quotas = HashMap::new();
         while let Some(keys) = iter.next().await {
             if keys.len() % 2 != 0 {
-                error!("Invalid key: {:?}", keys);
-                panic!("Invalid key for load quotas");
+                panic!("Invalid key: {} for load quotas", self.dir_quota_key());
             }
             let mut conn = self.share_conn();
             for i in (0..keys.len()).step_by(2) {
@@ -1396,35 +1440,95 @@ impl Engine for RedisEngineWithCtx {
     async fn do_set_attr(
         &self,
         inode: Ino,
-        set: u16,
-        sugidclearmode: u8,
+        set: SetAttrMask,
+        _sugidclearmode: u8,
         attr: &Attr,
-    ) -> Result<()> {
-        unimplemented!()
+    ) -> Result<Option<Attr>> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &[self.inode_key(inode)], {
+            let attr_bytes: Vec<u8> =
+                conn.get(self.inode_key(inode))
+                    .await
+                    .context(RedisDetailSnafu {
+                        detail: format!("get attr for inode {}", inode),
+                    })?;
+            let cur: Attr = bincode::deserialize(&attr_bytes)?;
+            if cur.parent > TRASH_INODE {
+                return SysSnafu { code: libc::EPERM }.fail();
+            }
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards");
+            let mut rule = self.get_acl(conn, attr.access_acl).await?;
+
+            if let Some(mut dirty_attr) = self
+                .merge_attr(inode, set, &cur, attr, now, &mut rule)
+                .await?
+            {
+                dirty_attr.access_acl = self.insert_acl(conn, rule).await?;
+                dirty_attr.ctime = now.as_nanos();
+                let mut pipe = pipe();
+                pipe.atomic();
+                pipe.set(self.inode_key(inode), bincode::serialize(&dirty_attr)?)
+                    .query_async(conn)
+                    .await?;
+                Ok(Some(Some(dirty_attr)))
+            } else {
+                Ok(Some(None))
+            }
+        })
     }
 
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)> {
         let mut conn = self.share_conn();
-        let buf: Vec<u8> = conn.hget(self.dir_key(parent), name).await?;
+        if !self.meta.conf.case_insensi && self.prefix.is_empty() {
+            let mut cmd = cmd("EVALSHA");
+            cmd.arg(&self.lookup_script_sha)
+                .arg(2)
+                .arg(self.entry_key(parent))
+                .arg(name);
+
+            // only handle ENOTSUP, fallback to normal lookup
+            match RedisEngineWithCtx::handle_script_result(
+                &format!("lookup parent: {parent} name: {name}"),
+                cmd.query_async(&mut conn).await,
+            ) {
+                Ok((ino, attr)) => return Ok((ino, attr)),
+                Err(errno) if errno != libc::ENOTSUP => return SysSnafu { code: errno }.fail(),
+                _ => (),
+            }
+        }
+
+        let buf: Vec<u8> = match conn.hget(self.entry_key(parent), name).await? {
+            Some(buf) => buf,
+            None => return NotFoundEntrySnafu { parent, name }.fail(),
+        };
         let (ino_type, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
         let attr_bytes: Option<Vec<u8>> = conn.get(self.inode_key(ino)).await?;
         match attr_bytes {
-            Some(attr_bytes) => {
-                Ok((ino, (bincode::deserialize(&attr_bytes))?))
-            },
-            None => { // corrupt entry
+            Some(attr_bytes) => Ok((ino, (bincode::deserialize(&attr_bytes))?)),
+            None => {
+                // corrupt entry
                 warn!("no attribute for inode {} ({}, {})", ino, parent, name);
-                Ok((ino, Attr { 
-                    typ: ino_type, 
-                    ..Default::default() 
-                }))
+                Ok((
+                    ino,
+                    Attr {
+                        typ: ino_type,
+                        ..Default::default()
+                    },
+                ))
             }
         }
     }
 
     async fn do_resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)> {
         if self.meta.conf.case_insensi || !self.prefix.is_empty() {
-            return SysSnafu { code: libc::ENOTSUP }.fail();
+            return SysSnafu {
+                code: libc::ENOTSUP,
+            }
+            .fail();
         }
 
         let mut conn = self.share_conn();
@@ -1439,45 +1543,17 @@ impl Engine for RedisEngineWithCtx {
         for gid in self.gids() {
             cmd.arg(gid.to_string());
         }
-        let res: Value = cmd.query_async(&mut conn).await?;
-        info!("return res: {:?}", res);
-        
-        
-        todo!()
-        /*
-        	if len(m.shaResolve) == 0 || m.conf.CaseInsensi || m.prefix != "" {
-		return syscall.ENOTSUP
-	}
-	defer m.timeit("Resolve", time.Now())
-	parent = m.checkRoot(parent)
-	keys := []string{parent.String(), path,
-		strconv.FormatUint(uint64(ctx.Uid()), 10)}
-	var gids []interface{}
-	for _, gid := range ctx.Gids() {
-		gids = append(gids, strconv.FormatUint(uint64(gid), 10))
-	}
-	res, err := m.rdb.EvalSha(ctx, m.shaResolve, keys, gids...).Result()
-	var returnedIno int64
-	var returnedAttr string
-	st := m.handleLuaResult("resolve", res, err, &returnedIno, &returnedAttr)
-	if st == 0 {
-		if inode != nil {
-			*inode = Ino(returnedIno)
-		}
-		m.parseAttr([]byte(returnedAttr), attr)
-	} else if st == syscall.EAGAIN {
-		return m.Resolve(ctx, parent, path, inode, attr)
-	}
-	return st
-         */
-       
+        let (ino, attr) = RedisEngineWithCtx::handle_script_result(
+            &format!("resolve parent: {parent}, pat: {path}"),
+            cmd.query_async(&mut conn).await,
+        )?;
+        Ok((ino, attr))
     }
 
     async fn do_mknod(
         &self,
         parent: Ino,
         name: &str,
-        mut mode: u16,
         cumask: u16,
         path: &str,
         inode: Ino,
@@ -1485,11 +1561,14 @@ impl Engine for RedisEngineWithCtx {
     ) -> Result<Attr> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
+        async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
             let pattr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
             let mut pattr: Attr = bincode::deserialize(&pattr_bytes)?;
             if pattr.typ != INodeType::TypeDirectory {
-                return SysSnafu { code: libc::ENOTDIR }.fail();
+                return SysSnafu {
+                    code: libc::ENOTDIR,
+                }
+                .fail();
             }
             if pattr.parent > TRASH_INODE {
                 return SysSnafu { code: libc::ENOENT }.fail();
@@ -1500,7 +1579,7 @@ impl Engine for RedisEngineWithCtx {
             }
 
             // check exists
-            let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+            let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
             let found_ino = match buf {
                 Some(buf) => {
                     let (ino_type, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
@@ -1540,27 +1619,30 @@ impl Engine for RedisEngineWithCtx {
             };
 
             // acl mode search
-            mode &= 0o7777;
+            attr.mode &= 0o7777;
             let mut pipe = pipe();
-            if pattr.default_acl != acl::NONE && attr.typ != INodeType::TypeSymlink {
+            if pattr.default_acl.is_valid_acl() && attr.typ != INodeType::TypeSymlink {
                 // inherit default acl
                 if attr.typ == INodeType::TypeDirectory {
-                    pattr.default_acl = pattr.default_acl;
+                    attr.default_acl = pattr.default_acl;
                 }
 
                 // set access acl by parent's default acl
-                let rule = self.get_acl(pipe.atomic(), conn, pattr.default_acl).await?;
+                let rule = match self.get_acl(conn, pattr.default_acl).await? {
+                    Some(rule) => rule,
+                    None => return SysSnafu { code: libc::EIO }.fail(),
+                };
                 if rule.is_minimal() {
-                    pattr.mode = mode & (0xFE00 | rule.get_mode());
+                    attr.mode &= 0xFE00 | rule.get_mode();
                 } else {
-                    let c_rule = rule.child_access_acl(mode);
+                    let c_rule = rule.child_access_acl(attr.mode);
                     let c_mode = c_rule.get_mode();
-                    let id = self.insert_acl(pipe.atomic(), conn, c_rule).await?;
-                    pattr.access_acl = id;
-                    pattr.mode = (mode & 0xFE00) | c_mode;
+                    let id = self.insert_acl(conn, Some(c_rule)).await?;
+                    attr.access_acl = id;
+                    attr.mode = (attr.mode & 0xFE00) | c_mode;
                 }
             } else {
-                pattr.mode = mode & !cumask;
+                attr.mode = attr.mode & !cumask;
             }
 
             // time set
@@ -1586,14 +1668,14 @@ impl Engine for RedisEngineWithCtx {
 
             // different os adapt
             if cfg!(target_os = "macos") {
-                pattr.gid = pattr.gid;
+                attr.gid = pattr.gid;
             } else if cfg!(target_os = "linux") && pattr.mode & 0o2000 != 0 {
-                pattr.gid = pattr.gid;
+                attr.gid = pattr.gid;
                 if attr.typ == INodeType::TypeDirectory {
-                    pattr.mode |= 0o2000;
-                } else if pattr.mode & 0o2010 == 0o2010 && 0 != 0 {
+                    attr.mode |= 0o2000;
+                } else if attr.mode & 0o2010 == 0o2010 && *self.uid() != 0 {
                     if let None = self.gids().iter().find(|gid| **gid == pattr.gid) {
-                        pattr.mode &= !0o2000;
+                        attr.mode &= !0o2000;
                     }
                 }
             }
@@ -1601,9 +1683,9 @@ impl Engine for RedisEngineWithCtx {
             // redis set kv
             let pipe = pipe.atomic();
             pipe.hset(
-                self.dir_key(parent),
+                self.entry_key(parent),
                 name,
-                bincode::serialize(&(&attr.typ, inode))?,
+                bincode::serialize(&(&attr.typ, inode)).unwrap(),
             );
             if update_parent {
                 pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
@@ -1628,31 +1710,26 @@ impl Engine for RedisEngineWithCtx {
         unimplemented!()
     }
 
-    async fn do_unlink(
-        &self,
-        parent: Ino,
-        name: &str,
-        skip_check_trash: bool,
-    ) -> Result<Attr> {
+    async fn do_unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Attr> {
         let mut trash = if !skip_check_trash {
             self.check_trash(parent).await?
         } else {
             None
         };
-        info!("do unlink trash: {:?}", trash);
+        info!("do unlink produce new trash: {:?}", trash);
         let base_meta = self.as_ref();
         if let Some(trash_ino) = trash {
             base_meta
                 .open_files
-                .invalid(trash_ino, INVALIDATE_ATTR_ONLY)
+                .invalidate_chunk(trash_ino, INVALIDATE_ATTR_ONLY)
                 .await;
         }
 
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let (space_guage, ino_cnt_guage, should_del, open_session_id, ino, attr) =
-            async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
-                let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+            async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
+                let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
                 let (buf, name) = match buf {
                     Some(entry) => (entry, name.to_owned()),
                     None if base_meta.conf.case_insensi => {
@@ -1682,7 +1759,7 @@ impl Engine for RedisEngineWithCtx {
                     .mget((self.inode_key(parent), self.inode_key(ino)))
                     .await?;
                 let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
-                // double check: parent mut be a dir and access mode 
+                // double check: parent mut be a dir and access mode
                 if pattr.typ != INodeType::TypeDirectory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
@@ -1731,7 +1808,7 @@ impl Engine for RedisEngineWithCtx {
                         {
                             if conn
                                 .hexists(
-                                    self.dir_key(trash_ino),
+                                    self.entry_key(trash_ino),
                                     self.trash_entry(parent, ino, &name),
                                 )
                                 .await?
@@ -1739,7 +1816,7 @@ impl Engine for RedisEngineWithCtx {
                                 trash.take();
                                 base_meta
                                     .open_files
-                                    .invalid(trash_ino, INVALIDATE_ATTR_ONLY)
+                                    .invalidate_chunk(trash_ino, INVALIDATE_ATTR_ONLY)
                                     .await;
                             }
                         }
@@ -1773,7 +1850,7 @@ impl Engine for RedisEngineWithCtx {
                 // make trascation
                 let mut pipe = pipe();
                 pipe.atomic();
-                pipe.hdel(self.dir_key(parent), &name);
+                pipe.hdel(self.entry_key(parent), &name);
                 if update_parent {
                     pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
                 }
@@ -1781,7 +1858,7 @@ impl Engine for RedisEngineWithCtx {
                     pipe.set(self.inode_key(ino), bincode::serialize(&attr)?);
                     if let Some(trash_ino) = trash {
                         pipe.hset(
-                            self.dir_key(trash_ino),
+                            self.entry_key(trash_ino),
                             self.trash_entry(parent, ino, &name),
                             buf,
                         );
@@ -1805,7 +1882,11 @@ impl Engine for RedisEngineWithCtx {
                                     .duration_since(SystemTime::UNIX_EPOCH)
                                     .expect("Time went backwards")
                                     .as_secs();
-                                pipe.zadd(self.del_files(), RedisEngine::to_delete(ino, attr.length), ts);
+                                pipe.zadd(
+                                    self.del_files(),
+                                    RedisEngine::to_delete(ino, attr.length),
+                                    ts,
+                                );
                                 pipe.del(self.inode_key(ino));
                                 let new_space = -utils::align_4k(attr.length);
                                 pipe.incr(self.used_space_key(), new_space);
@@ -1835,6 +1916,7 @@ impl Engine for RedisEngineWithCtx {
                     }
                     guaga
                 };
+                pipe.query_async(conn).await?;
                 Ok::<Option<_>, MyError>(Some((
                     guaga.0,
                     guaga.1,
@@ -1849,7 +1931,8 @@ impl Engine for RedisEngineWithCtx {
             if should_del {
                 let mut engine = dyn_clone::clone_box(self);
                 engine.with_cancel(self.token().child_token());
-                engine.try_spawn_delete_file(
+                engine
+                    .try_spawn_delete_file(
                         ino,
                         attr.length,
                         parent.is_trash(),
@@ -1862,12 +1945,7 @@ impl Engine for RedisEngineWithCtx {
         Ok(attr)
     }
 
-    async fn do_rmdir(
-        &self,
-        parent: Ino,
-        name: &str,
-        skip_check_trash: bool,
-    ) -> Result<Ino> {
+    async fn do_rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino> {
         let mut trash = if !skip_check_trash {
             self.check_trash(parent).await?
         } else {
@@ -1877,9 +1955,9 @@ impl Engine for RedisEngineWithCtx {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let base = self.as_ref();
-        let ino = async_transaction!(conn, &[self.inode_key(parent), self.dir_key(parent)], {
+        let ino = async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
             // TODO: here is same with unlink
-            let buf: Option<Vec<u8>> = conn.hget(self.dir_key(parent), name).await?;
+            let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
             let (buf, name) = match buf {
                 Some(entry) => (entry, name.to_owned()),
                 None if base.conf.case_insensi => {
@@ -1896,9 +1974,12 @@ impl Engine for RedisEngineWithCtx {
             };
 
             let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
-            
+
             if typ != INodeType::TypeDirectory {
-                return SysSnafu { code: libc::ENOTDIR }.fail();
+                return SysSnafu {
+                    code: libc::ENOTDIR,
+                }
+                .fail();
             }
             // first find ino by parent ino and son name, then watch it
             cmd("WATCH")
@@ -1909,7 +1990,7 @@ impl Engine for RedisEngineWithCtx {
                 .mget((self.inode_key(parent), self.inode_key(ino)))
                 .await?;
             let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
-            // double check: parent mut be a dir and access mode 
+            // double check: parent mut be a dir and access mode
             if pattr.typ != INodeType::TypeDirectory {
                 return SysSnafu {
                     code: libc::ENOTDIR,
@@ -1930,10 +2011,13 @@ impl Engine for RedisEngineWithCtx {
             pattr.nlink -= 1;
             pattr.mtime = now;
             pattr.ctime = now;
-            
-            let cnt: u64 = conn.hlen(self.dir_key(ino)).await?;
+
+            let cnt: u64 = conn.hlen(self.entry_key(ino)).await?;
             if cnt > 0 {
-                return SysSnafu { code: libc::ENOTEMPTY }.fail();
+                return SysSnafu {
+                    code: libc::ENOTEMPTY,
+                }
+                .fail();
             }
             let attr = match attr_bytes {
                 Some(attr_bytes) => {
@@ -1951,26 +2035,30 @@ impl Engine for RedisEngineWithCtx {
                         attr.parent = trash_ino;
                     }
                     attr
-                },
+                }
                 None => {
                     warn!("no attribute for inode {}  ({}, {})", ino, parent, name);
                     trash.take();
                     Attr::default()
                 }
             };
-            
+
             // make trascation
             let mut pipe = pipe();
             pipe.atomic();
-            pipe.hdel(self.dir_key(parent), &name);
+            pipe.hdel(self.entry_key(parent), &name);
             if !parent.is_trash() {
                 pipe.set(self.inode_key(parent), bincode::serialize(&pattr).unwrap());
             }
             match trash {
                 Some(trash_ino) => {
                     pipe.set(self.inode_key(ino), bincode::serialize(&attr).unwrap());
-                    pipe.hset(self.dir_key(trash_ino), self.trash_entry(parent, ino, &name), buf);
-                },
+                    pipe.hset(
+                        self.entry_key(trash_ino),
+                        self.trash_entry(parent, ino, &name),
+                        buf,
+                    );
+                }
                 None => {
                     pipe.del(self.inode_key(ino));
                     pipe.del(self.xattr_key(ino));
@@ -1997,8 +2085,78 @@ impl Engine for RedisEngineWithCtx {
         unimplemented!()
     }
 
-    async fn do_readdir(&self, inode: Ino, plus: u8, limit: i32) -> Result<Option<Vec<Entry>>> {
-        unimplemented!()
+    async fn do_readdir(&self, inode: Ino, plus: u8, limit: Option<usize>) -> Result<Vec<Entry>> {
+        let mut conn = self.share_conn();
+
+        let mut entries = Vec::new();
+        let mut iter = conn
+            .hscan::<String, Vec<u8>>(self.entry_key(inode))
+            .await?
+            .chunks(10000);
+        while let Some(datas) = iter.next().await {
+            if datas.len() % 2 != 0 {
+                panic!(
+                    "Invalid key: {} for readdir, len: {}",
+                    self.entry_key(inode),
+                    datas.len()
+                );
+            }
+            for i in (0..datas.len()).step_by(2) {
+                let (typ, ino): (INodeType, Ino) = bincode::deserialize(&datas[i + 1])?;
+                let name = match String::from_utf8(datas[i].clone()) {
+                    Ok(name) => {
+                        if name.is_empty() {
+                            warn!(
+                                "corrupt entry with empty name: inode {} parent {}",
+                                ino, inode
+                            );
+                            continue;
+                        } else {
+                            name
+                        }
+                    }
+                    Err(e) => {
+                        error!("Invalid key {} for {}", e, self.entry_key(inode));
+                        continue;
+                    }
+                };
+                let entry = Entry {
+                    inode: ino,
+                    name: name,
+                    attr: Attr {
+                        typ: typ,
+                        ..Default::default()
+                    },
+                };
+                entries.push(entry);
+                if let Some(limit_s) = limit
+                    && entries.len() >= limit_s
+                {
+                    break;
+                }
+            }
+        }
+
+        drop(iter);
+        if plus != 0 && !entries.is_empty() {
+            // TODO: multiple thread to fill attr
+            let keys = entries
+                .iter()
+                .map(|e| self.inode_key(e.inode))
+                .collect::<Vec<_>>();
+            let rs: Vec<Option<Vec<u8>>> = conn.mget(keys).await?;
+            for (idx, entry_buf) in rs.iter().enumerate() {
+                // only find those has attr
+                match entry_buf {
+                    Some(entry_buf) => {
+                        let attr: Attr = bincode::deserialize(entry_buf)?;
+                        entries[idx].attr = attr;
+                    }
+                    None => warn!("no attribute for inode {}", entries[idx].inode),
+                }
+            }
+        }
+        Ok(entries)
     }
 
     async fn do_rename(

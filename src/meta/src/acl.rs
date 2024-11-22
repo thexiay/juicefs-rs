@@ -3,11 +3,21 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{api::ModeMask, context::{Gid, Uid}};
-
-pub const NONE: u32 = 0;
 pub const ACL_COUNTER: &str = "acl_counter";
 
 pub type AclId = u32;
+pub trait AclExt {
+    fn is_valid_acl(&self) -> bool;
+    fn invalid_acl() -> AclId {
+        0
+    }
+}
+impl AclExt for AclId {
+    fn is_valid_acl(&self) -> bool {
+        *self != 0
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub id: AclId,
@@ -92,6 +102,21 @@ impl Rule {
         }
     }
 
+    pub fn set_mode(&mut self, mode: u16) {
+        self.owner &= 0xFFF8;
+        self.owner |= (mode >> 6) & 7;
+
+        if self.is_minimal() {
+            self.group &= 0xFFF8;
+            self.group |= (mode >> 3) & 7;
+        } else {
+            self.mask &= 0xFFF8;
+            self.mask |= (mode >> 3) & 7;
+        }
+        self.other &= 0xFFF8;
+        self.other |= mode & 7;
+    }
+
     pub fn child_access_acl(&self, mode: u16) -> Rule {
         let mut c_rule = Rule::default();
         c_rule.owner = (mode >> 6) & 7 & self.owner;
@@ -152,7 +177,7 @@ impl AclCache {
                     .find(|id| {
                         self.id_2_rule.get(id).map_or(false, |other| other == r)  
                     })
-                    .map_or(NONE, |id| *id)
+                    .map_or(AclId::invalid_acl(), |id| *id)
             })
     }
 

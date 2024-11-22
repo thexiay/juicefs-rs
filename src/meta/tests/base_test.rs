@@ -21,13 +21,10 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use juice_meta::{
-        api::{INodeType, ModeMask, ROOT_INODE},
-        error::MyError,
-    };
+    use juice_meta::api::{INodeType, ModeMask, SetAttrMask, ROOT_INODE};
 
     match m.get_attr(ROOT_INODE).await {
-        Ok(attr) if attr.mode != 0777 => panic!("getattr root mode err"),
+        Ok(attr) if attr.mode != 0o777 => panic!("getattr root mode err"),
         Err(err) => panic!("getattr root err {}", err),
         _ => {}
     }
@@ -50,7 +47,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     if format.name != "test" {
         panic!("load got volume name {} != test", format.name);
     }
-    // begin session
+    // test session lifetime
     m.new_session(true).await.expect("new session: ");
     let sessions = m.list_sessions().await.expect("list sessions: ");
     if sessions.len() != 1 {
@@ -70,7 +67,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         meta.cleanup_stale_sessions().await;
     });
 
-    // test mkdir rmdir
+    // test mkdir rmdir check
     let (parent, _) = m
         .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
@@ -107,12 +104,12 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.access(parent, ModeMask::READ, &attr)
         .await
         .expect("access d: ");
-    let (inode, attr) = m
+    let (inode, _) = m
         .create(parent, "f", 0o650, 0o22, 0)
         .await
         .expect("create f: ");
     let _ = m.close(inode).await;
-    let (tino, attr) = m.lookup(inode, ".", true).await.expect("lookup /d/f: ");
+    let (_, _) = m.lookup(inode, ".", true).await.expect("lookup /d/f: ");
     match m.lookup(inode, "..", true).await {
         Err(errno) if errno == libc::ENOTDIR => (),
         other => panic!("lookup /d/f/..: {:?}", other),
@@ -157,10 +154,10 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         Err(errno) if errno == libc::EEXIST => (),
         other => panic!("create f: {:?}", other),
     }
-    let (inode, attr) = m.lookup(parent, "f", true).await.expect("lookup f: ");
-    
+    let (_, _) = m.lookup(parent, "f", true).await.expect("lookup f: ");
+
     // test resolve
-    match m.resolve(1, "d/f").await {
+    match m.resolve(ROOT_INODE, "d/f").await {
         Err(errno) if errno == libc::ENOTSUP => (),
         other => panic!("resolve d/f: {:?}", other),
     }
@@ -169,7 +166,9 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         other => panic!("resolve f: {:?}", other),
     }
     // test resolve with different user
-    m.with_login(1, vec![1]);
+    let ctx = 0;
+    let ctx2 = 1;
+    m.with_login(ctx2, vec![ctx2]);
     match m.resolve(parent, "/f").await {
         Err(errno) if errno == libc::EACCES || errno == libc::ENOTSUP => (),
         other => panic!("resolve f: {:?}", other),
@@ -182,8 +181,122 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         Err(errno) if errno == libc::ENOENT || errno == libc::ENOTSUP => (),
         other => panic!("resolve f2: {:?}", other),
     }
-    
-    
+
+    // check owner permission
+    let (p1, mut attr) = m
+        .mkdir(ROOT_INODE, "d1", 0o2777, 0, 0)
+        .await
+        .expect("mkdir d1: ");
+    m.with_login(ctx, vec![ctx]); // login user root
+    attr.gid = 1;
+    m.set_attr(p1, SetAttrMask::empty(), 0, &attr)
+        .await
+        .expect("setattr d1: ");
+    if attr.mode & 0o2000 == 0 {
+        panic!("SGID is lost");
+    }
+    let ctx3 = 2;
+    m.with_login(ctx3, vec![ctx3]);
+    let (_, attr) = m.mkdir(p1, "d2", 0o777, 0o22, 0).await.expect("mkdir d2: ");
+    if attr.gid != ctx2 {
+        panic!("inherit gid: {} != {}", attr.gid, ctx2);
+    }
+    if cfg!(target_os = "linux") {
+        m.with_login(ctx2, vec![ctx2]);
+        if attr.mode & 0o2000 == 0 {
+            panic!("not inherit sgid");
+        }
+        let (_, attr) = m
+            .mknod(
+                p1,
+                "f1",
+                INodeType::TypeFile,
+                0o2777,
+                0o22,
+                0,
+                "",
+                &mut None,
+            )
+            .await
+            .expect("create f1: ");
+        if attr.mode & 0o2010 != 0o2010 {
+            panic!("sgid should not be cleared");
+        }
+
+        m.with_login(ctx3, vec![ctx3]);
+        let (_, attr) = m
+            .mknod(
+                p1,
+                "f2",
+                INodeType::TypeFile,
+                0o2777,
+                0o22,
+                0,
+                "",
+                &mut None,
+            )
+            .await
+            .expect("create f2: ");
+        if attr.mode & 0o2010 != 0o0010 {
+            panic!("sgid should be cleared");
+        }
+    }
+    m.with_login(ctx2, vec![ctx2]);
+    if let Err(errno) = m.resolve(ROOT_INODE, "/d1/d2").await
+        && errno != libc::ENOTSUP
+    {
+        panic!("resolve /d1/d2: {}", errno);
+    }
+    m.with_login(ctx, vec![ctx]);
+    m.remove(ROOT_INODE, "d1").await.expect("Remove d1: ");
+    let attr = &Attr {
+        atime: 2,
+        mtime: 2,
+        uid: 1,
+        gid: 1,
+        mode: 0o640,
+        ..Default::default()
+    };
+    m.set_attr(
+        inode,
+        SetAttrMask::SET_ATIME
+            .union(SetAttrMask::SET_MTIME)
+            .union(SetAttrMask::SET_UID)
+            .union(SetAttrMask::SET_GID)
+            .union(SetAttrMask::SET_MODE),
+        0,
+        attr,
+    )
+    .await
+    .expect("setattr f: ");
+    m.set_attr(inode, SetAttrMask::empty(), 0, attr) // change nothing
+        .await
+        .expect("setattr f: ");
+    let attr = m.get_attr(inode).await.expect("getattr f: ");
+    if attr.atime != 2 || attr.mtime != 2 || attr.uid != 1 || attr.gid != 1 || attr.mode != 0o640 {
+        panic!(
+            "atime:{} mtime:{} uid:{} gid:{} mode:{}",
+            attr.atime, attr.mtime, attr.uid, attr.gid, attr.mode
+        );
+    }
+    m.set_attr(
+        inode,
+        SetAttrMask::SET_ATIME_NOW.union(SetAttrMask::SET_MTIME_NOW),
+        0,
+        &attr,
+    )
+    .await
+    .expect("setattr f: ");
+    m.with_login(2, vec![2, 1]); // fake_ctx
+    match m.access(parent, ModeMask::WRITE, &Attr::default()).await {
+        Err(errno) if errno == libc::EACCES => (),
+        other => panic!("setattr f: {:?}", other),
+    }
+    m.access(inode, ModeMask::READ, &Attr::default())
+        .await
+        .expect("access f: ");
+
+    // test rename
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
@@ -255,7 +368,7 @@ pub async fn test_parents(mut m: Box<dyn Meta>) {}
 pub async fn test_remove(mut m: Box<dyn Meta>) {
     let (_, _) = m.create(1, "f", 0644, 0, 0).await.expect("create f: ");
 
-    m.remove(1, "f", &mut 0).await.expect("rmr f: ");
+    let _ = m.remove(1, "f").await.expect("rmr f: ");
     let (parent, _) = m.mkdir(1, "d", 0755, 0, 0).await.expect("mkdir d: ");
     let (_, _) = m
         .mkdir(parent, "d2", 0755, 0, 0)
@@ -286,7 +399,7 @@ pub async fn test_remove(mut m: Box<dyn Meta>) {
     if entries.len() != 4099 {
         panic!("entries: {}", entries.len());
     }
-    m.remove(1, "d", &mut 0).await.expect("rmr d: ");
+    let _ = m.remove(1, "d").await.expect("rmr d: ");
 }
 
 async fn test_resolve(mut m: Box<dyn Meta>) {}

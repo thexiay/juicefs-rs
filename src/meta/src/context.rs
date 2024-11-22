@@ -32,4 +32,7 @@ pub trait WithContext: DynClone {
 
 	/// Current gid list
 	fn token(&self) -> &CancellationToken;
+
+	/// Whether check permission
+	fn check_permission(&self) -> bool;
 }
