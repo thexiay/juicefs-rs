@@ -27,7 +27,9 @@ use crate::context::{UserExt, WithContext};
 use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFiles, INVALIDATE_ATTR_ONLY};
 use crate::quota::Quota;
-use crate::utils::{access_mode, align_4k, sleep_with_jitter, FLockItem, FreeID, PLockItem};
+use crate::utils::{
+    access_mode, align_4k, relation_need_update, sleep_with_jitter, FLockItem, FreeID, PLockItem,
+};
 
 pub const INODE_BATCH: i64 = 1 << 10;
 pub const SLICE_ID_BATCH: i64 = 1 << 10;
@@ -171,7 +173,12 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Attr>;
     async fn do_rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
-    async fn do_readdir(&self, inode: Ino, plus: u8, limit: Option<usize>) -> Result<Vec<Entry>>;
+    async fn do_readdir(
+        &self,
+        inode: Ino,
+        wantattr: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<Entry>>;
     async fn do_rename(
         &self,
         parent_src: Ino,
@@ -187,7 +194,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_set_xattr(&self, inode: Ino, name: String, value: Bytes, flags: u32) -> Result<()>;
     async fn do_remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()>;
-    async fn do_touch_atime(&self, inode: Ino, attr: Attr, ts: SystemTime) -> Result<bool>;
+    async fn do_touch_atime(&self, inode: Ino, attr: &mut Attr, ts: Duration) -> Result<bool>;
     async fn do_read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
     async fn do_write(
         &self,
@@ -274,6 +281,14 @@ pub trait MetaOtherFunction {
     );
 
     /// ------------------------------ remove func ------------------------------
+    /// Remove specific entry of name in dir recursivly
+    /// Caller should make should the parent's name's Ino is inode
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - parent inode
+    /// * `name` - entry name
+    /// * `inode` - entry inode
     async fn remove_entry(
         &self,
         parent: Ino,
@@ -284,6 +299,12 @@ pub trait MetaOtherFunction {
         max_removing: Arc<Semaphore>,
     ) -> Result<()>;
 
+    /// Remove all entry in dir, not include the dir inode itself
+    /// Caller should make should the inode is dir.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - dir inode
     async fn remove_dir(
         &self,
         inode: Ino,
@@ -294,6 +315,12 @@ pub trait MetaOtherFunction {
 
     /// ------------------------------ attr func ------------------------------
     fn clear_sugid(&self, cur: &mut Attr, set: &mut u16);
+
+    /// Alter attr atime
+    /// caller makes sure inode is not special inode.
+    async fn touch_attr_atime(&self, ino: Ino, attr: Option<Attr>);
+
+    fn atime_need_update(&self, attr: &Attr, now: Duration) -> bool;
 
     /// merge a incoming attr into a current attr
     ///
@@ -643,7 +670,7 @@ where
     }
 
     async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
-        let entries = self.do_readdir(parent, 0, None).await?;
+        let entries = self.do_readdir(parent, false, None).await?;
         Ok(entries
             .into_iter()
             .find(|e| e.name.eq_ignore_ascii_case(&name)))
@@ -794,7 +821,7 @@ where
         max_removing: Arc<Semaphore>,
     ) -> Result<()> {
         loop {
-            let mut entries = self.do_readdir(inode, 0, Some(1_0000)).await?;
+            let mut entries = self.do_readdir(inode, false, Some(1_0000)).await?;
             if entries.is_empty() {
                 return Ok(());
             }
@@ -828,6 +855,7 @@ where
                             let meta = dyn_clone::clone_box(self);
                             let max_removing = max_removing.clone();
                             let count = count.clone();
+                            // 这里如果多线程进入，会导致多个同时去删除，会抢占元素？
                             join_set.spawn(async move {
                                 let res = meta
                                     .remove_entry(
@@ -868,7 +896,12 @@ where
                     count.fetch_add(1, Ordering::SeqCst);
                     match self.unlink(inode, &entry.name, skip_check_trash).await {
                         Ok(_) => (),
-                        Err(errno) if errno == libc::ENOENT => (),
+                        Err(errno) if errno == libc::ENOENT => {
+                            info!(
+                                "entry({},{}) not found when remove, maybe other thread unlink it",
+                                inode, entry.name
+                            )
+                        }
                         Err(err) => {
                             self.token().cancel();
                             return SysSnafu { code: err }.fail();
@@ -883,7 +916,9 @@ where
                 match join_res {
                     Ok(remove_res) => match remove_res {
                         Ok(_) => (),
-                        Err(MyError::SysError { code }) if code == libc::ENOENT => (),
+                        Err(MyError::SysError { code }) if code == libc::ENOENT => {
+                            info!("entry not found when remove, maybe other thread remove it, ignore it.")
+                        },
                         Err(err) => {
                             return Err(err);
                         }
@@ -914,6 +949,50 @@ where
                 *set &= 0o3777;
             }
         }
+    }
+
+    async fn touch_attr_atime(&self, ino: Ino, attr: Option<Attr>) {
+        let base = self.as_ref();
+        if base.conf.atime_mode == "NoAtime" || base.conf.read_only {
+            return;
+        }
+
+        let mut attr = if attr.is_none() {
+            let of = base.open_files.find(ino);
+            if let Some(of) = of {
+                let of = of.lock().await;
+                of.attr.clone()
+            } else {
+                Attr::default()
+            }
+        } else {
+            attr.unwrap()
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        if attr.full && !self.atime_need_update(&attr, now) {
+            return;
+        }
+
+        match self.do_touch_atime(ino, &mut attr, now).await {
+            Ok(updated) => {
+                if updated {
+                    base.open_files.update_attr(ino, &mut attr);
+                }
+            }
+            Err(e) => {
+                warn!("Update atime of inode {}: {}", ino, e);
+            }
+        }
+    }
+
+    fn atime_need_update(&self, attr: &Attr, now: Duration) -> bool {
+        let base = self.as_ref();
+        // update atime only for > 1 second accesses
+        (base.conf.atime_mode != "NoAtime" && relation_need_update(attr, now))
+            || (base.conf.atime_mode == "StrictAtime"
+                && now.as_nanos() - attr.atime > Duration::from_secs(1).as_nanos())
     }
 
     async fn merge_attr(
@@ -1005,8 +1084,9 @@ where
             dirty_attr.atime = incoming.atime;
             changed = true;
         }
-        if set.intersects(SetAttrMask::SET_MTIME_NOW) 
-            || (set.intersects(SetAttrMask::SET_MTIME) && incoming.mtime == 0) {
+        if set.intersects(SetAttrMask::SET_MTIME_NOW)
+            || (set.intersects(SetAttrMask::SET_MTIME) && incoming.mtime == 0)
+        {
             if let Err(_) = self.access(inode, ModeMask::WRITE, current).await
                 && *self.uid() != current.uid
             {
@@ -1702,8 +1782,8 @@ where
                 })
             }
         } else {
-            let attr = self.do_get_attr(inode).await?;
-            base.open_files.update_attr(inode, attr.clone()).await;
+            let mut attr = self.do_get_attr(inode).await?;
+            base.open_files.update_attr(inode, &mut attr).await;
             if attr.typ == INodeType::TypeDirectory && inode.is_root() && !attr.parent.is_trash() {
                 base.dir_parents.lock().insert(inode, attr.parent);
             }
@@ -1968,8 +2048,45 @@ where
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> FsResult<()> {
-        todo!()
+    async fn readdir(&self, inode: Ino, wantattr: bool) -> FsResult<Vec<Entry>> {
+        let base = self.as_ref();
+        let inode = inode.transfer_root(base.root);
+        let mut attr = self.get_attr(inode).await?;
+        let mut mmask = ModeMask::READ;
+        if wantattr {
+            mmask.insert(ModeMask::EXECUTE);
+        }
+        self.access(inode, mmask, &attr).await?;
+        if inode == base.root {
+            attr.parent = base.root;
+        }
+        let mut base_entries = vec![
+            Entry {
+                inode,
+                name: ".".to_string(),
+                attr: Attr {
+                    typ: INodeType::TypeDirectory,
+                    ..Default::default()
+                }
+                .clone(),
+            },
+            Entry {
+                inode: attr.parent,
+                name: "..".to_string(),
+                attr: Attr {
+                    typ: INodeType::TypeDirectory,
+                    ..Default::default()
+                },
+            },
+        ];
+        //  TODO: why here ENOENT and trash return ok?
+        match self.do_readdir(inode, wantattr, None).await {
+            Ok(mut entries) => base_entries.append(&mut entries),
+            Err(MyError::SysError { code }) if code == libc::ENOENT && inode == TRASH_INODE => (),
+            Err(e) => return Err(e.into()),
+        }
+        self.touch_attr_atime(inode, Some(attr)).await;
+        Ok(base_entries)
     }
 
     // Create creates a file in a directory with given name.

@@ -128,7 +128,7 @@ impl OpenFiles {
     }
 
     /// update attr in openfiles cache
-    pub async fn update_attr(&self, ino: Ino, mut attr: Attr) {
+    pub async fn update_attr(&self, ino: Ino, attr: &mut Attr) {
         let file = {
             let files = self.files.lock();
             files.get(&ino).map(|file| file.clone())
@@ -140,7 +140,7 @@ impl OpenFiles {
             } else {
                 attr.keep_cache = of.attr.keep_cache;
             }
-            of.attr = attr;
+            of.attr = attr.clone();
             of.last_check = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time went backwards");

@@ -2085,7 +2085,7 @@ impl Engine for RedisEngineWithCtx {
         unimplemented!()
     }
 
-    async fn do_readdir(&self, inode: Ino, plus: u8, limit: Option<usize>) -> Result<Vec<Entry>> {
+    async fn do_readdir(&self, inode: Ino, wantattr: bool, limit: Option<usize>) -> Result<Vec<Entry>> {
         let mut conn = self.share_conn();
 
         let mut entries = Vec::new();
@@ -2138,7 +2138,7 @@ impl Engine for RedisEngineWithCtx {
         }
 
         drop(iter);
-        if plus != 0 && !entries.is_empty() {
+        if wantattr && !entries.is_empty() {
             // TODO: multiple thread to fill attr
             let keys = entries
                 .iter()
@@ -2186,7 +2186,7 @@ impl Engine for RedisEngineWithCtx {
         unimplemented!()
     }
 
-    async fn do_touch_atime(&self, inode: Ino, attr: Attr, ts: SystemTime) -> Result<bool> {
+    async fn do_touch_atime(&self, inode: Ino, attr: &mut Attr, ts: Duration) -> Result<bool> {
         unimplemented!()
     }
 

@@ -71,6 +71,7 @@ pub enum INodeType {
 }
 
 // Entry is an entry inside a directory.
+#[derive(Debug)]
 pub struct Entry {
     pub inode: Ino,
     pub name: String,
@@ -440,8 +441,9 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // parent + name: dst inode, parent is dst inode's parent inode, name is the link name
     async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> FsResult<()>;
 
-    // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: u8, entries: &mut Vec<Entry>) -> FsResult<()>;
+    /// Readdir returns all entries for given directory, which include attributes if wantattr is true.
+    /// This func will return "." and ".." entry as well.
+    async fn readdir(&self, inode: Ino, wantattr: bool) -> FsResult<Vec<Entry>>;
 
     // Create creates a file in a directory with given name.
     async fn create(

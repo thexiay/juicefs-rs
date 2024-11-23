@@ -22,6 +22,7 @@ pub fn test_format() -> Format {
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     use juice_meta::api::{INodeType, ModeMask, SetAttrMask, ROOT_INODE};
+    use tracing::info;
 
     match m.get_attr(ROOT_INODE).await {
         Ok(attr) if attr.mode != 0o777 => panic!("getattr root mode err"),
@@ -296,7 +297,66 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("access f: ");
 
-    // test rename
+    // test readdir result, mut have at least 2 entries
+    m.with_login(ctx, vec![ctx]);
+    let entries = m.readdir(parent, false).await.expect("readdir: ");
+    if entries.len() != 3 {
+        panic!("entries: {}", entries.len());
+    }
+    if entries[0].name != "." || entries[1].name != ".." || entries[2].name != "f" {
+        panic!("entries: {:?}", entries);
+    }
+    /*
+    var entries []*Entry
+	if st := m.Readdir(ctx, parent, 0, &entries); st != 0 {
+		t.Fatalf("readdir: %s", st)
+	} else if len(entries) != 3 {
+		t.Fatalf("entries: %d", len(entries))
+	} else if string(entries[0].Name) != "." || string(entries[1].Name) != ".." || string(entries[2].Name) != "f" {
+		t.Fatalf("entries: %+v", entries)
+	}
+	if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != syscall.ENOTSUP {
+		t.Fatalf("rename d/f -> f2: %s", st)
+	}
+	if st := m.Rename(ctx, parent, "f", 1, "f2", 0, &inode, attr); st != 0 {
+		t.Fatalf("rename d/f -> f2: %s", st)
+	}
+	defer func() {
+		_ = m.Unlink(ctx, 1, "f2")
+	}()
+	if st := m.Rename(ctx, 1, "f2", 1, "f2", 0, &inode, attr); st != 0 {
+		t.Fatalf("rename f2 -> f2: %s", st)
+	}
+	if st := m.Rename(ctx, 1, "f2", 1, "f", RenameExchange, &inode, attr); st != syscall.ENOENT {
+		t.Fatalf("rename f2 -> f: %s", st)
+	}
+	if st := m.Create(ctx, 1, "f", 0644, 022, 0, &inode, attr); st != 0 {
+		t.Fatalf("create f: %s", st)
+	}
+	_ = m.Close(ctx, inode)
+	defer m.Unlink(ctx, 1, "f")
+	if st := m.Rename(ctx, 1, "f2", 1, "f", RenameNoReplace, &inode, attr); st != syscall.EEXIST {
+		t.Fatalf("rename f2 -> f: %s", st)
+	}
+	if st := m.Rename(ctx, 1, "f2", 1, "f", 0, &inode, attr); st != 0 {
+		t.Fatalf("rename f2 -> f: %s", st)
+	}
+	if st := m.Rename(ctx, 1, "f", 1, "d", RenameExchange, &inode, attr); st != 0 {
+		t.Fatalf("rename f <-> d: %s", st)
+	}
+	if st := m.Rename(ctx, 1, "d", 1, "f", 0, &inode, attr); st != 0 {
+		t.Fatalf("rename d -> f: %s", st)
+	}
+	if st := m.GetAttr(ctx, 1, attr); st != 0 {
+		t.Fatalf("getattr f: %s", st)
+	}
+	if attr.Nlink != 2 {
+		t.Fatalf("nlink expect 2, but got %d", attr.Nlink)
+	}
+	if st := m.Mkdir(ctx, 1, "d", 0640, 022, 0, &parent, attr); st != 0 {
+		t.Fatalf("mkdir d: %s", st)
+	}
+     */
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
@@ -394,8 +454,7 @@ pub async fn test_remove(mut m: Box<dyn Meta>) {
             .expect(&format!("create {name}"));
     }
 
-    let mut entries = Vec::new();
-    m.readdir(1, 1, &mut entries).await.expect("readdir: ");
+    let entries = m.readdir(1, true).await.expect("readdir: ");
     if entries.len() != 4099 {
         panic!("entries: {}", entries.len());
     }
