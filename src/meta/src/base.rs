@@ -19,8 +19,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, Session, SessionInfo, SetAttrMask, Slice,
-    Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, RenameMask, Session, SessionInfo,
+    SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE,
+    TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -28,7 +29,7 @@ use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFiles, INVALIDATE_ATTR_ONLY};
 use crate::quota::Quota;
 use crate::utils::{
-    access_mode, align_4k, relation_need_update, sleep_with_jitter, FLockItem, FreeID, PLockItem,
+    access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem, FreeID, PLockItem
 };
 
 pub const INODE_BATCH: i64 = 1 << 10;
@@ -92,8 +93,11 @@ impl FsStat {
 
 #[derive(Default)]
 pub struct DirStat {
+    // length of all files
     length: i64,
+    // length of all files aligned
     space: i64,
+    // number of inodes
     inodes: i64,
 }
 
@@ -182,15 +186,11 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_rename(
         &self,
         parent_src: Ino,
-        name_src: String,
+        name_src: &str,
         parent_dst: Ino,
-        name_dst: String,
-        flags: u32,
-        inode: &mut Ino,
-        tinode: &mut Ino,
-        attr: &mut Attr,
-        tattr: &mut Attr,
-    ) -> Result<()>;
+        name_dst: &str,
+        flags: RenameMask,
+    ) -> Result<(Ino, Attr, Option<(Ino, Attr)>)>;
     async fn do_set_xattr(&self, inode: Ino, name: String, value: Bytes, flags: u32) -> Result<()>;
     async fn do_remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()>;
@@ -270,14 +270,17 @@ pub trait MetaOtherFunction {
     async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>>;
 
     /// Immediately spawn a task to delete task
-    /// force: wait unitl delete task has free handler
-    /// delete_on_close: delete file when close
+    /// 
+    /// # Arguments
+    /// 
+    /// * `inode` - the inode to be delete  
+    /// * `length` - the length this file shrink to
+    /// * `delete_option` - the delete options, e.g. immerate or defer delete
     async fn try_spawn_delete_file(
         &self,
         inode: Ino,
         length: u64,
-        force: bool,
-        delete_on_close: bool,
+        delete_option: DeleteFileOption,
     );
 
     /// ------------------------------ remove func ------------------------------
@@ -356,6 +359,12 @@ pub trait MetaOtherFunction {
     /// flush dir stats once
     async fn flush_dir_stat(&self);
 
+    /// get inode of the first parent (or myself) with quota
+    async fn get_quota_parent(&self, ino: Ino) -> Option<Ino>;
+
+    /// Get summary of a dir ino
+    async fn get_dir_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary>;
+
     /// ------------------------------ session func ------------------------------
     /// do persist session info into meta persist layer periodly
     async fn refresh_session(&self);
@@ -384,7 +393,7 @@ pub struct CommonMeta {
     pub fs_stat: FsStat,
     pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
     // dir quotas, it storage every inode(dir type)'s quota
-    pub quotas: RwLock<HashMap<Ino, Quota>>,
+    pub dir_quotas: RwLock<HashMap<Ino, Quota>>,
     pub free_inodes: AsyncMutex<FreeID>,
     pub free_slices: AsyncMutex<FreeID>,
     pub conf: Config,
@@ -421,7 +430,7 @@ impl CommonMeta {
             dir_stats_batch: Mutex::new(HashMap::new()),
             fs_stat: FsStat::default(),
             dir_parents: Mutex::new(HashMap::new()),
-            quotas: RwLock::new(HashMap::new()),
+            dir_quotas: RwLock::new(HashMap::new()),
             free_inodes: AsyncMutex::new(FreeID::default()),
             free_slices: AsyncMutex::new(FreeID::default()),
             conf,
@@ -519,7 +528,7 @@ where
         let mut inode = ino;
         loop {
             {
-                let guard = self.as_ref().quotas.read();
+                let guard = self.as_ref().dir_quotas.read();
                 if let Some(quota) = guard.get(&inode)
                     && quota.check(space, inodes)
                 {
@@ -551,7 +560,7 @@ where
         match self.do_load_quotas().await {
             Ok(loaded_quotas) => {
                 let base = self.as_ref();
-                let mut quotas = base.quotas.write();
+                let mut quotas = base.dir_quotas.write();
 
                 quotas.iter().for_each(|(ino, _)| {
                     if !loaded_quotas.contains_key(ino) {
@@ -634,7 +643,7 @@ where
         // recursively update the quota of the parent node until the root node is encountered
         loop {
             {
-                let dir_quota = self.as_ref().quotas.read();
+                let dir_quota = self.as_ref().dir_quotas.read();
                 if let Some(quota) = dir_quota.get(&inode) {
                     quota.update(space, inodes);
                 }
@@ -749,33 +758,35 @@ where
         &self,
         inode: Ino,
         length: u64,
-        force: bool,
-        delete_on_close: bool,
+        delete_option: DeleteFileOption,
     ) {
         let base = self.as_ref();
-        if delete_on_close {
-            let mut remove_files = base.removed_files.lock();
-            remove_files.insert(inode, true);
-        } else {
-            let mut meta = dyn_clone::clone_box(self);
-            meta.with_cancel(self.token().child_token());
-            let max_deleting = base.max_deleting.clone();
-            tokio::spawn(async move {
-                let permit = match force {
-                    // TODO: 这里如果拿不到被关闭了，是不是要处理下
-                    true => Some(max_deleting.acquire().await.unwrap()),
-                    false => max_deleting
-                        .try_acquire()
-                        .inspect_err(|err| {
-                            warn!("try acquire delete inode({}) permit failed: {}", inode, err);
-                        })
-                        .ok(),
-                };
-                if let Some(permit) = permit {
-                    meta.do_delete_file_data(inode, length).await;
-                    drop(permit);
-                }
-            });
+        match delete_option {
+            DeleteFileOption::Deferred => {
+                let mut remove_files = base.removed_files.lock();
+                remove_files.insert(inode, true);
+            }
+            DeleteFileOption::Immediate{ force } => {
+                let mut meta = dyn_clone::clone_box(self);
+                meta.with_cancel(self.token().child_token());
+                let max_deleting = base.max_deleting.clone();
+                tokio::spawn(async move {
+                    let permit = match force {
+                        // TODO: 这里如果拿不到被关闭了，是不是要处理下
+                        true => Some(max_deleting.acquire().await.unwrap()),
+                        false => max_deleting
+                            .try_acquire()
+                            .inspect_err(|err| {
+                                warn!("try acquire delete inode({}) permit failed: {}", inode, err);
+                            })
+                            .ok(),
+                    };
+                    if let Some(permit) = permit {
+                        meta.do_delete_file_data(inode, length).await;
+                        drop(permit);
+                    }
+                });
+            }
         }
     }
 
@@ -918,7 +929,7 @@ where
                         Ok(_) => (),
                         Err(MyError::SysError { code }) if code == libc::ENOENT => {
                             info!("entry not found when remove, maybe other thread remove it, ignore it.")
-                        },
+                        }
                         Err(err) => {
                             return Err(err);
                         }
@@ -1237,7 +1248,7 @@ where
 
         let base = self.as_ref();
         let stage_map = {
-            let quotas = base.quotas.read();
+            let quotas = base.dir_quotas.read();
             let mut stage_map = HashMap::new();
             for (ino, quota) in quotas.iter() {
                 let new_space = quota.new_space.load(Ordering::SeqCst);
@@ -1254,7 +1265,7 @@ where
 
         match self.do_flush_quotas(&stage_map).await {
             Ok(_) => {
-                let mut quotas = base.quotas.write();
+                let mut quotas = base.dir_quotas.write();
                 for (ino, snap) in stage_map {
                     let q = quotas.get_mut(&ino);
                     if let Some(q) = q {
@@ -1282,6 +1293,81 @@ where
         if !dir_stats.is_empty() {
             self.do_flush_dir_stat(dir_stats).await;
         }
+    }
+
+    async fn get_quota_parent(&self, mut ino: Ino) -> Option<Ino> {
+        if !self.get_format().enable_dir_stats {
+            return None;
+        }
+        let base = self.as_ref();
+        loop {
+            {
+                let dir_quotas = base.dir_quotas.read();
+                if dir_quotas.contains_key(&ino) {
+                    return Some(ino);
+                }
+            }
+            if ino <= ROOT_INODE {
+                break;
+            }
+            let last_ino = ino;
+            ino = match self.get_dir_parent(ino).await {
+                Ok(ino) => ino,
+                Err(e) => {
+                    warn!("Get directory parent of inode {}: {}", last_ino, e);
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    async fn get_dir_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary> {
+        // TODO: do it parallel
+        // find all entry first, then collect summary
+        let base = self.as_ref();
+        let format = base.get_format();
+        let mut summary = Summary::default();
+        let entries = if strict || !format.enable_dir_stats {
+            self.do_readdir(ino, true, None).await?
+        } else {
+            let dir_stat = self.get_dir_stat(ino).await?;
+            let attr = self.do_get_attr(ino).await?;
+            summary.size += dir_stat.space as u64;
+            summary.length += dir_stat.length as u64;
+            // TODO: here can not feagure why > 2 readdir
+            if attr.nlink > 2 {
+                self.do_readdir(ino, false, None).await?
+            } else {
+                summary.files += dir_stat.inodes as u64;
+                Vec::new()
+            }
+        };
+
+        for entry in entries {
+            if entry.attr.typ == INodeType::TypeDirectory {
+                summary.dirs += 1;
+            } else {
+                summary.files += 1;
+            }
+            if strict || !format.enable_dir_stats {
+                summary.size += align_4k(entry.attr.length) as u64;
+                if entry.attr.typ == INodeType::TypeFile {
+                    summary.length += entry.attr.length as u64;
+                }
+            }
+            if entry.attr.typ != INodeType::TypeDirectory || !recursive {
+                continue;
+            }
+            match self.get_dir_summary(entry.inode, recursive, strict).await {
+                Err(MyError::SysError { code }) if code == libc::ENOENT => {
+                    info!("inode({}) not found at collect summary", entry.inode);
+                }
+                Ok(sum) => summary += sum,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(summary)
     }
 
     async fn cleanup_trash(&self, days: u8, force: bool) {
@@ -2032,14 +2118,154 @@ where
     async fn rename(
         &self,
         parent_src: Ino,
-        name_src: String,
+        name_src: &str,
         parent_dst: Ino,
-        name_dst: String,
-        flags: u32,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> FsResult<()> {
-        todo!()
+        name_dst: &str,
+        flags: RenameMask,
+    ) -> FsResult<Option<(Ino, Attr)>> {
+        let base = self.as_ref();
+        if parent_src.is_root() && name_src == TRASH_NAME
+            || parent_dst.is_root() && name_dst == TRASH_NAME
+        {
+            return Err(libc::EPERM);
+        }
+        if parent_src.is_trash() || (parent_dst.is_trash() && !self.uid().is_root()) {
+            return Err(libc::EPERM);
+        }
+        if base.conf.read_only {
+            return Err(libc::EROFS);
+        }
+        if name_dst.is_empty() {
+            return Err(libc::ENOENT);
+        }
+
+        match flags {
+            flag if flag.is_empty()
+                || flag == RenameMask::NOREPLACE
+                || flag == RenameMask::EXCHANGE
+                || flag == RenameMask::NOREPLACE.union(RenameMask::RESTORE) =>
+            {
+                ()
+            }
+            flag if flag == RenameMask::WHITEOUT
+                || flag == RenameMask::NOREPLACE.union(RenameMask::WHITEOUT) =>
+            {
+                return Err(libc::ENOTSUP)
+            }
+            _ => return Err(libc::EINVAL),
+        }
+
+        let parent_src = parent_src.transfer_root(base.root);
+        let parent_dst = parent_dst.transfer_root(base.root);
+        let quota_src = if parent_src.is_trash() {
+            None
+        } else {
+            self.get_quota_parent(parent_src).await
+        };
+        let quota_dst = if parent_src == parent_dst {
+            quota_src
+        } else {
+            self.get_quota_parent(parent_dst).await
+        };
+        let (space, inodes) = if quota_src != quota_dst {
+            let (src_ino, src_attr) = self.lookup(parent_src, name_src, false).await?;
+            let (space, inodes) = if src_attr.typ == INodeType::TypeDirectory {
+                let quota = {
+                    let quotas = base.dir_quotas.read();
+                    quotas.get(&src_ino).map(|quota| {
+                        (
+                            quota.used_space.load(Ordering::Relaxed),
+                            quota.used_inodes.load(Ordering::Relaxed),
+                        )
+                    })
+                };
+                if let Some(quota) = quota {
+                    (quota.0 + align_4k(0), quota.1 + 1)
+                } else {
+                    debug!("Start to get summary of inode {}", src_ino);
+                    let sum = self
+                        .get_summary(src_ino, true, false)
+                        .await
+                        .inspect_err(|err| {
+                            warn!("Get summary of inode {}: {}", src_ino, err);
+                        })?;
+                    (sum.size as i64, (sum.dirs + sum.files) as i64)
+                }
+            } else {
+                (align_4k(src_attr.length), 1)
+            };
+            // TODO: dst exists and is replaced or exchanged
+            if quota_dst.is_some() && self.check_quota(parent_src, space, inodes).await {
+                return Err(libc::EDQUOT);
+            }
+            (space, inodes)
+        } else {
+            (0, 0)
+        };
+
+        // do rename, return (renamed_before_ino, renamed_before_ino_attr, exists_entry))
+        // maybe dst alread exists, t_entry is the target entry if exists
+        let (ino, attr, t_entry) = match self
+            .do_rename(parent_src, name_src, parent_dst, name_dst, flags)
+            .await
+        {
+            Ok((ino, attr, t_entry)) => (ino, attr, t_entry),
+            Err(MyError::RenameSameInoError) => {
+                info!("rename same ino({},{})", parent_src, name_src);
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let diff_length = match attr.typ {
+            INodeType::TypeDirectory => {
+                let mut dir_parents = base.dir_parents.lock();
+                dir_parents.insert(ino, parent_dst);
+                0
+            }
+            INodeType::TypeFile => attr.length,
+            _ => 0,
+        };
+        if parent_src != parent_dst {
+            self.update_dir_stats(
+                parent_src,
+                -(diff_length as i64),
+                -(align_4k(diff_length)),
+                -1,
+            );
+            self.update_dir_stats(parent_dst, diff_length as i64, align_4k(diff_length), 1);
+            if quota_src != quota_dst {
+                if quota_src.is_some() {
+                    self.update_quota(parent_src, -(space), -(inodes)).await;
+                }
+                if quota_dst.is_some() {
+                    self.update_quota(parent_dst, space, inodes).await;
+                }
+            }
+        }
+        if let Some((tino, tattr)) = t_entry
+            && flags != RenameMask::EXCHANGE
+        {
+            let diff_length = match tattr.typ {
+                INodeType::TypeDirectory => {
+                    let mut dir_parents = base.dir_parents.lock();
+                    dir_parents.remove(&tino);
+                    0
+                }
+                INodeType::TypeFile => tattr.length,
+                _ => 0,
+            };
+            self.update_dir_stats(
+                parent_dst,
+                -(diff_length as i64),
+                -(align_4k(diff_length)),
+                -1,
+            );
+            if quota_dst.is_some() {
+                self.update_quota(parent_dst, -(align_4k(diff_length)), -1)
+                    .await;
+            }
+        }
+        Ok(Some((ino, attr)))
     }
 
     // Link creates an entry for node.
@@ -2335,14 +2561,22 @@ where
     }
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
-    async fn get_summary(
-        &self,
-        inode: Ino,
-        summary: &Summary,
-        recursive: bool,
-        strict: bool,
-    ) -> FsResult<()> {
-        todo!()
+    async fn get_summary(&self, ino: Ino, recursive: bool, strict: bool) -> FsResult<Summary> {
+        let attr = self.get_attr(ino).await?;
+        if attr.typ != INodeType::TypeDirectory {
+            Ok(Summary {
+                dirs: 0,
+                files: 1,
+                size: align_4k(0) as u64,
+                length: attr.length,
+            })
+        } else {
+            let inode = ino.transfer_root(self.as_ref().root);
+            let mut summary = self.get_dir_summary(inode, recursive, strict).await?;
+            summary.dirs += 1;
+            summary.size += align_4k(0) as u64;
+            Ok(summary)
+        }
     }
 
     // GetTreeSummary returns a summary in tree structure

@@ -45,6 +45,7 @@ pub enum MyError {
     },
 
     // ----------------- logic error  -------------------
+    // init error
     #[snafu(display("database is not formatted, please run `juicefs format ...` first"))]
     NotInitializedError,
     #[snafu(display("incompatible metadata version: {version}, please upgrade the client"))]
@@ -54,6 +55,10 @@ pub enum MyError {
     #[snafu(display("unknown driver: {driver}"))]
     DriverError {
         driver: String,
+    },
+    #[snafu(display("cannot upgrade format: {detail}"))]
+    UpgradeFormatError {
+        detail: String,
     },
     // not found key in db
     #[snafu(display("exist file ino: {ino}, attr: {attr:?}"))]
@@ -75,16 +80,21 @@ pub enum MyError {
         loc: snafu::Location,
     },
     // other
+    #[snafu(display("Rename same error"))]
+    RenameSameInoError,
     #[snafu(display("message queue closed"))]
     SemaphoraCloseError,
-    #[snafu(display("cannot upgrade format: {detail}"))]
-    UpgradeFormatError {
-        detail: String,
+    #[snafu(whatever, display("{loc}: {message}, cause: {source:?}"))]
+    GenericError {
+        message: String,
+
+        // Having a `source` is optional, but if it is present, it must
+        // have this specific attribute and type:
+        #[snafu(source(from(Box<dyn std::error::Error + Send + Sync>, Some)))]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        #[snafu(implicit)]
+        loc: snafu::Location,
     },
-    #[snafu(display("cannot deserialize rightfully from data, detail: {detail}"))]
-    IllegalDataFormatError {
-        detail: String,
-    }
 }
 
 pub type Result<T> = std::result::Result<T, MyError>;

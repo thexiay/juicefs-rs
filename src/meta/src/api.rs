@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::ops::BitAnd;
+use std::ops::{Add, AddAssign, BitAnd};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -90,7 +90,7 @@ pub struct Slice {
 
 pub struct Slices(pub Vec<Slice>);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 pub struct Summary {
@@ -98,6 +98,15 @@ pub struct Summary {
     pub size: u64,
     pub files: u64,
     pub dirs: u64,
+}
+
+impl AddAssign<Summary> for Summary {
+    fn add_assign(&mut self, other: Self) {
+        self.length += other.length;
+        self.size += other.size;
+        self.files += other.files;
+        self.dirs += other.dirs;
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +181,13 @@ bitflags! {
         const SET_ATIME_NOW = 1 << 8;
         const SET_MTIME_NOW = 1 << 9;
         const SET_FLAG = 1 << 15;
+    }
+
+    pub struct RenameMask: u32 {
+        const NOREPLACE = 1 << 0;
+        const EXCHANGE = 1 << 1;
+        const WHITEOUT = 1 << 2;
+        const RESTORE = 1 << 5;
     }
 }
 
@@ -425,16 +441,31 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// Rename move an entry from a source directory to another with given name.
     /// The targeted entry will be overwrited if it's a file or empty directory.
     /// For Hadoop, the target should not be overwritten.
+    /// 
+    /// # Error:
+    /// 
+    /// * `EPERM`: name_src or name_src is trash
+    /// * `EPERM`: parent_src is trash
+    /// * `EPERM`: non root user want to move to trash dir
+    /// 
+    /// # Arguments: 
+    /// 
+    /// * `parent_src`: source dir inode
+    /// * `name_src`: source entry name
+    /// * `parent_dst`: destination dir inode
+    /// * `name_dst`: destination entry name
+    /// 
+    /// # Return 
+    /// 
+    /// if renamed happen(if src equals dst, it would't happen), return the inode and attributes of the renamed entry.
     async fn rename(
         &self,
         parent_src: Ino,
-        name_src: String,
+        name_src: &str,
         parent_dst: Ino,
-        name_dst: String,
-        flags: u32,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> FsResult<()>;
+        name_dst: &str,
+        flags: RenameMask,
+    ) -> FsResult<Option<(Ino, Attr)>>;
 
     // Link creates an entry for node.
     // inode_src: source inode
@@ -561,11 +592,10 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(
         &self,
-        inode: Ino,
-        summary: &Summary,
+        ino: Ino,
         recursive: bool,
         strict: bool,
-    ) -> FsResult<()>;
+    ) -> FsResult<Summary>;
 
     // GetTreeSummary returns a summary in tree structure
     async fn get_tree_summary(

@@ -9,7 +9,7 @@ use redis::{
     IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, Value,
 };
 use regex::Regex;
-use snafu::{ensure, ResultExt};
+use snafu::{ensure, FromString, ResultExt};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use tracing::{error, info, warn};
 
 use crate::acl::{self, AclExt, AclId, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, Session, SetAttrMask,
-    Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask, Session,
+    SetAttrMask, Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
@@ -30,11 +30,11 @@ use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{
     ConnectionSnafu, FileExistSnafu, FsResult, MyError, NotFoundEntrySnafu, NotFoundInoSnafu,
-    RedisDetailSnafu, Result, SysSnafu,
+    RedisDetailSnafu, RenameSameInoSnafu, Result, SysSnafu,
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::Quota;
-use crate::utils;
+use crate::utils::{self, DeleteFileOption};
 use std::collections::HashMap;
 
 use std::time::{Duration, SystemTime};
@@ -756,11 +756,13 @@ impl RedisEngineWithCtx {
                 let is_flock = lock.starts_with("lockf");
                 let inode = lock[self.prefix.len() + 5..]
                     .parse::<u64>()
-                    .map_err(|err| MyError::IllegalDataFormatError {
-                        detail: format!(
-                            "parse int err {}. fill session {}, semember {}",
-                            err, sid, lock
-                        ),
+                    .with_whatever_context::<_, String, MyError>(|err| {
+                        format!(
+                            "SMEMBERS {}. fill session {}, semember {}",
+                            self.locked(sid),
+                            sid,
+                            lock
+                        )
                     })?;
                 for (k, v) in owners {
                     let parts: Vec<&str> = k.split('_').collect();
@@ -789,6 +791,47 @@ impl RedisEngineWithCtx {
             (session.flocks, session.plocks) = (Some(flocks), Some(plocks));
         }
         Ok(())
+    }
+
+    /// find inode by parent and name first, then find it by resolve second
+    /// return (ino, attr), name could be different if case insensitive
+    async fn do_fallback_resolve(
+        &self,
+        conn: &mut impl AsyncCommands,
+        parent: Ino,
+        name: &str,
+    ) -> Result<(INodeType, Ino, String)> {
+        match conn
+            .hget::<_, _, Option<Vec<u8>>>(self.entry_key(parent), name)
+            .await?
+        {
+            Some(buf) => {
+                let (typ, ino) = bincode::deserialize(&buf)
+                    .with_whatever_context::<_, _, MyError>(|_| {
+                        format!("HGET {} {}", self.entry_key(parent), name)
+                    })?;
+                Ok((typ, ino, name.to_owned()))
+            }
+            None => {
+                if self.meta.conf.case_insensi {
+                    if let Some(entry) = self.resolve_case(parent, name).await? {
+                        Ok((entry.attr.typ, entry.inode, entry.name.to_string()))
+                    } else {
+                        NotFoundEntrySnafu {
+                            parent: parent,
+                            name: name.to_string(),
+                        }
+                        .fail()
+                    }
+                } else {
+                    NotFoundEntrySnafu {
+                        parent: parent,
+                        name: name.to_string(),
+                    }
+                    .fail()
+                }
+            }
+        }
     }
 
     fn handle_script_result(op: &str, result: RedisResult<Value>) -> FsResult<(Ino, Attr)> {
@@ -1929,16 +1972,14 @@ impl Engine for RedisEngineWithCtx {
 
         if trash.is_none() {
             if should_del {
-                let mut engine = dyn_clone::clone_box(self);
-                engine.with_cancel(self.token().child_token());
-                engine
-                    .try_spawn_delete_file(
-                        ino,
-                        attr.length,
-                        parent.is_trash(),
-                        open_session_id.is_some(),
-                    )
-                    .await
+                let option = if open_session_id.is_some() {
+                    DeleteFileOption::Deferred
+                } else {
+                    DeleteFileOption::Immediate {
+                        force: parent.is_trash(),
+                    }
+                };
+                self.try_spawn_delete_file(ino, attr.length, option).await
             }
             self.update_stats(space_guage, ino_cnt_guage).await;
         }
@@ -2085,7 +2126,12 @@ impl Engine for RedisEngineWithCtx {
         unimplemented!()
     }
 
-    async fn do_readdir(&self, inode: Ino, wantattr: bool, limit: Option<usize>) -> Result<Vec<Entry>> {
+    async fn do_readdir(
+        &self,
+        inode: Ino,
+        wantattr: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<Entry>> {
         let mut conn = self.share_conn();
 
         let mut entries = Vec::new();
@@ -2162,16 +2208,374 @@ impl Engine for RedisEngineWithCtx {
     async fn do_rename(
         &self,
         parent_src: Ino,
-        name_src: String,
+        name_src: &str,
         parent_dst: Ino,
-        name_dst: String,
-        flags: u32,
-        inode: &mut Ino,
-        tinode: &mut Ino,
-        attr: &mut Attr,
-        tattr: &mut Attr,
-    ) -> Result<()> {
-        unimplemented!()
+        name_dst: &str,
+        flags: RenameMask,
+    ) -> Result<(Ino, Attr, Option<(Ino, Attr)>)> {
+        let mut watch_keys = vec![
+            self.inode_key(parent_src),
+            self.entry_key(parent_src),
+            self.inode_key(parent_dst),
+            self.entry_key(parent_dst),
+        ];
+        if parent_src.is_trash() {
+            watch_keys.swap(0, 2);
+        }
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+
+        let (ino_src, attr_src, exists_entry, trash, delete_option, new_space, new_inode) =
+            async_transaction!(conn, &watch_keys, {
+                let (typ_src, ino_src, name_src) =
+                    self.do_fallback_resolve(conn, parent_src, name_src).await?;
+                // because maybe case insensitive, so we need to check after lookup
+                if parent_src == parent_dst && name_src == name_dst {
+                    return RenameSameInoSnafu.fail();
+                }
+                let mut watch_keys = vec![self.inode_key(ino_src)];
+                let exists_dst = match self.do_fallback_resolve(conn, parent_dst, name_dst).await {
+                    Ok((typ, ino, name)) => Some((typ, ino, name)),
+                    Err(MyError::NotFoundEntryError { .. }) => None,
+                    Err(e) => return Err(e),
+                };
+                let mut trash = None;
+                // check if dst inode exists
+                if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst {
+                    if flags.intersects(RenameMask::NOREPLACE) {
+                        return SysSnafu { code: libc::EEXIST }.fail();
+                    }
+                    watch_keys.push(self.inode_key(*ino_dst));
+                    if *typ_dst == INodeType::TypeDirectory {
+                        watch_keys.push(self.entry_key(*ino_dst));
+                    }
+                    if !flags.intersects(RenameMask::EXCHANGE) {
+                        self.check_trash(parent_dst)
+                            .await?
+                            .map(|t| trash.replace(t));
+                    }
+                }
+                cmd("WATCH").arg(watch_keys).query_async(conn).await?;
+
+                // data check
+                let mut keys = vec![
+                    self.inode_key(parent_src),
+                    self.inode_key(parent_dst),
+                    self.inode_key(ino_src),
+                ];
+                exists_dst
+                    .iter()
+                    .for_each(|dst| keys.push(self.inode_key(dst.1)));
+                let rs = conn.mget::<_, Vec<Option<Vec<u8>>>>(&keys).await?;
+                if rs.len() != keys.len() {
+                    error!("no attribute for inodes");
+                    return SysSnafu { code: libc::ENOENT }.fail();
+                }
+                for (r, ino) in rs.iter().zip(keys.iter()) {
+                    if r.is_none() {
+                        error!("no attribute for inode {}", ino);
+                        return SysSnafu { code: libc::ENOENT }.fail();
+                    }
+                }
+                let mut pattr_src: Attr = bincode::deserialize(rs[0].as_ref().unwrap())?;
+                if pattr_src.typ != INodeType::TypeDirectory {
+                    return SysSnafu {
+                        code: libc::ENOTDIR,
+                    }
+                    .fail();
+                }
+                self.access(
+                    parent_src,
+                    ModeMask::WRITE.union(ModeMask::EXECUTE),
+                    &pattr_src,
+                )
+                .await?;
+                let mut pattr_dst: Attr = bincode::deserialize(rs[1].as_ref().unwrap())?;
+                if pattr_dst.typ != INodeType::TypeDirectory {
+                    return SysSnafu {
+                        code: libc::ENOTDIR,
+                    }
+                    .fail();
+                }
+                if flags.intersects(RenameMask::RESTORE) && pattr_dst.parent > TRASH_INODE {
+                    return SysSnafu { code: libc::ENOENT }.fail();
+                }
+                self.access(
+                    parent_dst,
+                    ModeMask::WRITE.union(ModeMask::EXECUTE),
+                    &pattr_dst,
+                )
+                .await?;
+                // TODO: check parentDst is a subdir of source node
+                if ino_src == parent_dst || ino_src == pattr_dst.parent {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+                let mut attr_src: Attr = bincode::deserialize(rs[2].as_ref().unwrap())?;
+                if pattr_src
+                    .flags
+                    .intersects(Flag::APPEND.union(Flag::IMMUTABLE))
+                    || pattr_dst.flags.intersects(Flag::IMMUTABLE)
+                    || attr_src
+                        .flags
+                        .intersects(Flag::APPEND.union(Flag::IMMUTABLE))
+                {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+                if parent_src != parent_dst
+                    && pattr_src.mode & 0o1000 != 0
+                    && !self.uid().is_root()
+                    && *self.uid() != attr_src.uid
+                    && (*self.uid() != pattr_src.uid || attr_src.typ == INodeType::TypeDirectory)
+                {
+                    return SysSnafu { code: libc::EACCES }.fail();
+                }
+
+                // exchange exists inode
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("Time went backwards");
+                let mut opended = false;
+                let mut update_dst = false;
+                let mut update_src = false;
+                let mut delete_option = None;
+                let exists_attr_dst = if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst {
+                    let mut attr_dst: Attr = bincode::deserialize(rs[3].as_ref().unwrap())?;
+                    if attr_dst
+                        .flags
+                        .intersects(Flag::APPEND.union(Flag::IMMUTABLE))
+                    {
+                        return SysSnafu { code: libc::EPERM }.fail();
+                    }
+                    attr_dst.ctime = now.as_nanos();
+                    if flags.intersects(RenameMask::EXCHANGE) {
+                        if parent_src != parent_dst {
+                            if *typ_dst == INodeType::TypeDirectory {
+                                attr_dst.parent = parent_src;
+                                pattr_src.nlink += 1;
+                                pattr_dst.nlink -= 1;
+                            } else if attr_dst.parent > 0 {
+                                attr_dst.parent = parent_src;
+                            }
+                        } else {
+                            if *typ_dst == INodeType::TypeDirectory {
+                                let cnt: u64 = conn.hlen(self.entry_key(*ino_dst)).await?;
+                                if cnt != 0 {
+                                    return SysSnafu {
+                                        code: libc::ENOTEMPTY,
+                                    }
+                                    .fail();
+                                }
+                                pattr_dst.nlink -= 1;
+                                update_dst = true;
+                                trash.iter().for_each(|t| attr_dst.parent = *t);
+                            } else {
+                                if let Some(trash_ino) = trash {
+                                    if attr_dst.parent > 0 {
+                                        attr_dst.parent = trash_ino;
+                                    }
+                                } else {
+                                    attr_dst.nlink -= 1;
+                                    if *typ_dst == INodeType::TypeFile && attr_dst.nlink == 0 {
+                                        opended = self.meta.open_files.is_open(*ino_dst).await;
+                                        delete_option = if opended && self.meta.sid.read().is_some()
+                                        {
+                                            Some(DeleteFileOption::Deferred)
+                                        } else {
+                                            Some(DeleteFileOption::Immediate { force: false })
+                                        };
+                                    }
+                                    self.meta
+                                        .open_files
+                                        .invalidate_chunk(*ino_dst, INVALIDATE_ATTR_ONLY)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    if !self.uid().is_root()
+                        && pattr_dst.mode & 0o1000 != 0
+                        && *self.uid() != pattr_dst.uid
+                        && *self.uid() != attr_dst.uid
+                    {
+                        return SysSnafu { code: libc::EACCES }.fail();
+                    }
+                    Some(attr_dst)
+                } else {
+                    if flags.intersects(RenameMask::EXCHANGE) {
+                        return SysSnafu { code: libc::ENOENT }.fail();
+                    }
+                    None
+                };
+
+                // check src inode
+                if !self.uid().is_root()
+                    && pattr_src.mode & 0o1000 != 0
+                    && *self.uid() != pattr_src.uid
+                    && *self.uid() != attr_src.uid
+                {
+                    return SysSnafu { code: libc::EACCES }.fail();
+                }
+                if parent_src != parent_dst {
+                    if typ_src == INodeType::TypeDirectory {
+                        attr_src.parent = parent_dst;
+                        pattr_src.nlink -= 1;
+                        pattr_dst.nlink += 1;
+                        (update_src, update_dst) = (true, true);
+                    } else if attr_src.parent > 0 {
+                        attr_src.parent = parent_dst;
+                    }
+                }
+
+                // change time
+                if update_src
+                    || now.as_nanos() - pattr_src.mtime >= self.meta.conf.skip_dir_mtime.as_nanos()
+                {
+                    pattr_src.mtime = now.as_nanos();
+                    pattr_src.ctime = now.as_nanos();
+                    update_src = true;
+                }
+                if update_dst
+                    || now.as_nanos() - pattr_dst.mtime >= self.meta.conf.skip_dir_mtime.as_nanos()
+                {
+                    pattr_dst.mtime = now.as_nanos();
+                    pattr_dst.ctime = now.as_nanos();
+                    update_dst = true;
+                }
+                attr_src.ctime = now.as_nanos();
+
+                // atomic pipe
+                let (mut new_space, mut new_inode) = (0, 0);
+                let mut pipe = pipe();
+                pipe.atomic();
+                if flags.intersects(RenameMask::EXCHANGE)
+                    && let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
+                    && let Some(ref attr_dst) = exists_attr_dst
+                {
+                    // exchange
+                    pipe.hset(
+                        self.entry_key(parent_src),
+                        name_src,
+                        bincode::serialize(&(typ_dst, ino_dst)).unwrap(),
+                    );
+                    pipe.set(
+                        self.entry_key(ino_src),
+                        bincode::serialize(attr_dst).unwrap(),
+                    );
+                    if parent_src != parent_dst && attr_dst.parent == 0 {
+                        pipe.hincr(self.parent_key(*ino_dst), parent_src, 1);
+                        pipe.hincr(self.parent_key(*ino_dst), parent_dst, -1);
+                    }
+                } else {
+                    // replace or insert
+                    pipe.hdel(self.entry_key(parent_src), name_src);
+                    if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
+                        && let Some(ref attr_dst) = exists_attr_dst
+                    {
+                        let (typ_dst, ino_dst) = (typ_dst.clone(), ino_dst.clone());
+                        if let Some(trash_ino) = trash {
+                            pipe.set(
+                                self.inode_key(trash_ino),
+                                bincode::serialize(attr_dst).unwrap(),
+                            );
+                            pipe.hset(
+                                self.entry_key(trash_ino),
+                                self.trash_entry(parent_dst, ino_dst, name_dst),
+                                bincode::serialize(&(&typ_dst, ino_dst)).unwrap(),
+                            );
+                            if attr_dst.parent == 0 {
+                                pipe.hincr(self.parent_key(ino_dst), trash_ino, 1);
+                                pipe.hincr(self.parent_key(ino_dst), parent_dst, -1);
+                            }
+                        } else if typ_dst != INodeType::TypeDirectory && attr_dst.nlink > 0 {
+                            pipe.set(
+                                self.inode_key(ino_dst),
+                                bincode::serialize(&attr_dst).unwrap(),
+                            );
+                            if attr_dst.parent == 0 {
+                                pipe.hincr(self.parent_key(ino_dst), parent_dst, -1);
+                            }
+                        } else {
+                            if typ_dst == INodeType::TypeFile {
+                                if opended {
+                                    pipe.set(
+                                        self.inode_key(ino_dst),
+                                        bincode::serialize(&attr_dst).unwrap(),
+                                    );
+                                    self.meta
+                                        .sid
+                                        .read()
+                                        .map(|sid| pipe.sadd(self.sustained(sid), ino_dst));
+                                } else {
+                                    pipe.zadd(
+                                        self.del_files(),
+                                        RedisEngine::to_delete(ino_dst, attr_dst.length),
+                                        now.as_secs(),
+                                    );
+                                    pipe.del(self.inode_key(ino_dst));
+                                    (new_space, new_inode) =
+                                        (-utils::align_4k(attr_dst.length), -1);
+                                    pipe.incr(self.used_space_key(), new_space);
+                                    pipe.decr(self.total_inodes_key(), new_inode);
+                                }
+                            } else {
+                                if typ_dst == INodeType::TypeSymlink {
+                                    pipe.del(self.sym_key(ino_dst));
+                                }
+                                pipe.del(self.inode_key(ino_dst));
+                                (new_space, new_inode) = (-utils::align_4k(0), -1);
+                                pipe.incr(self.used_space_key(), new_space);
+                                pipe.decr(self.total_inodes_key(), new_inode);
+                            }
+                            pipe.del(self.xattr_key(ino_dst));
+                            if attr_dst.parent == 0 {
+                                pipe.del(self.parent_key(ino_dst));
+                            }
+                        }
+                        if typ_dst == INodeType::TypeDirectory {
+                            pipe.hdel(self.dir_quota_key(), ino_dst);
+                            pipe.hdel(self.dir_quota_used_space_key(), ino_dst);
+                            pipe.hdel(self.dir_quota_used_inodes_key(), ino_dst);
+                        }
+                    }
+                }
+                pipe.set(
+                    self.inode_key(ino_src),
+                    bincode::serialize(&attr_src).unwrap(),
+                );
+                pipe.hset(
+                    self.entry_key(parent_dst),
+                    name_dst,
+                    bincode::serialize(&(typ_src, ino_src)).unwrap(),
+                );
+                if update_dst {
+                    pipe.set(
+                        self.inode_key(parent_dst),
+                        bincode::serialize(&pattr_dst).unwrap(),
+                    );
+                }
+                pipe.query_async(conn).await?;
+                Ok::<_, MyError>(Some((
+                    ino_src,
+                    attr_src,
+                    exists_dst.map(|dst| (dst.1, exists_attr_dst.unwrap())),
+                    trash,
+                    delete_option,
+                    new_space,
+                    new_inode,
+                )))
+            })?;
+
+        // trash is none and not exchange, should delete file.
+        if !flags.intersects(RenameMask::EXCHANGE) && trash.is_none() {
+            if let Some(ref entry) = exists_entry
+                && let Some(delete_option) = delete_option
+            {
+                self.try_spawn_delete_file(entry.0, entry.1.length, delete_option)
+                    .await
+            }
+            self.update_stats(new_space, new_inode).await;
+        }
+        Ok((ino_src, attr_src, exists_entry))
     }
 
     async fn do_set_xattr(&self, inode: Ino, name: String, value: Bytes, flags: u32) -> Result<()> {

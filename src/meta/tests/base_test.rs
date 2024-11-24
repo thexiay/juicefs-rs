@@ -1,9 +1,6 @@
 #![feature(let_chains)]
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 
 use juice_meta::{
     api::{Attr, Ino, Meta, Slice},
@@ -21,7 +18,7 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use juice_meta::api::{INodeType, ModeMask, SetAttrMask, ROOT_INODE};
+    use juice_meta::api::{INodeType, ModeMask, RenameMask, SetAttrMask, ROOT_INODE};
     use tracing::info;
 
     match m.get_attr(ROOT_INODE).await {
@@ -306,57 +303,53 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     if entries[0].name != "." || entries[1].name != ".." || entries[2].name != "f" {
         panic!("entries: {:?}", entries);
     }
-    /*
-    var entries []*Entry
-	if st := m.Readdir(ctx, parent, 0, &entries); st != 0 {
-		t.Fatalf("readdir: %s", st)
-	} else if len(entries) != 3 {
-		t.Fatalf("entries: %d", len(entries))
-	} else if string(entries[0].Name) != "." || string(entries[1].Name) != ".." || string(entries[2].Name) != "f" {
-		t.Fatalf("entries: %+v", entries)
-	}
-	if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != syscall.ENOTSUP {
-		t.Fatalf("rename d/f -> f2: %s", st)
-	}
-	if st := m.Rename(ctx, parent, "f", 1, "f2", 0, &inode, attr); st != 0 {
-		t.Fatalf("rename d/f -> f2: %s", st)
-	}
-	defer func() {
-		_ = m.Unlink(ctx, 1, "f2")
-	}()
-	if st := m.Rename(ctx, 1, "f2", 1, "f2", 0, &inode, attr); st != 0 {
-		t.Fatalf("rename f2 -> f2: %s", st)
-	}
-	if st := m.Rename(ctx, 1, "f2", 1, "f", RenameExchange, &inode, attr); st != syscall.ENOENT {
-		t.Fatalf("rename f2 -> f: %s", st)
-	}
-	if st := m.Create(ctx, 1, "f", 0644, 022, 0, &inode, attr); st != 0 {
-		t.Fatalf("create f: %s", st)
-	}
-	_ = m.Close(ctx, inode)
-	defer m.Unlink(ctx, 1, "f")
-	if st := m.Rename(ctx, 1, "f2", 1, "f", RenameNoReplace, &inode, attr); st != syscall.EEXIST {
-		t.Fatalf("rename f2 -> f: %s", st)
-	}
-	if st := m.Rename(ctx, 1, "f2", 1, "f", 0, &inode, attr); st != 0 {
-		t.Fatalf("rename f2 -> f: %s", st)
-	}
-	if st := m.Rename(ctx, 1, "f", 1, "d", RenameExchange, &inode, attr); st != 0 {
-		t.Fatalf("rename f <-> d: %s", st)
-	}
-	if st := m.Rename(ctx, 1, "d", 1, "f", 0, &inode, attr); st != 0 {
-		t.Fatalf("rename d -> f: %s", st)
-	}
-	if st := m.GetAttr(ctx, 1, attr); st != 0 {
-		t.Fatalf("getattr f: %s", st)
-	}
-	if attr.Nlink != 2 {
-		t.Fatalf("nlink expect 2, but got %d", attr.Nlink)
-	}
-	if st := m.Mkdir(ctx, 1, "d", 0640, 022, 0, &parent, attr); st != 0 {
-		t.Fatalf("mkdir d: %s", st)
-	}
-     */
+    // -------------------------------- test rename -------------------------------- 
+    match m
+        .rename(parent, "f", ROOT_INODE, "f2", RenameMask::WHITEOUT)
+        .await
+    {
+        Err(errno) if errno == libc::ENOTSUP => (),
+        other => panic!("rename d/f -> f2: {:?}", other),
+    }
+    m.rename(parent, "f", ROOT_INODE, "f2", RenameMask::empty())
+        .await
+        .expect("rename d/f -> f2: ");
+    m.rename(ROOT_INODE, "f2", ROOT_INODE, "f2", RenameMask::empty())
+        .await
+        .expect("rename f2 -> f2: ");
+    match m.rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::EXCHANGE)
+        .await
+    {
+        Err(errno) if errno == libc::ENOENT => (),
+        other => panic!("rename f2 -> f2: {:?}", other),
+    }
+    m.create(ROOT_INODE, "f", 0o644, 0o22, 0)
+        .await
+        .expect("create f: ");
+    m.close(inode).await.expect("close f: ");
+    match m.rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::NOREPLACE)
+        .await
+    {
+        Err(errno) if errno == libc::EEXIST => (),
+        other => panic!("rename f2 -> f: {:?}", other),
+    }
+    m.rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::empty())
+        .await
+        .expect("rename f2 -> f: ");
+    m.rename(ROOT_INODE, "f", ROOT_INODE, "d", RenameMask::EXCHANGE)
+        .await
+        .expect("rename f -> d: ");
+    m.rename(ROOT_INODE, "d", ROOT_INODE, "f", RenameMask::empty())
+        .await
+        .expect("rename d -> f: ");
+    let attr = m.get_attr(ROOT_INODE).await.expect("getattr root: ");
+    if attr.nlink != 2 {
+        panic!("nlink expect 2, but got {}", attr.nlink);
+    }
+    m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
+        .await
+        .expect("mkdir d: ");
+    // Test rename with parent change
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {

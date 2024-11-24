@@ -38,6 +38,13 @@ pub struct FLockItem {
     pub r#type: String,
 }
 
+pub enum DeleteFileOption {
+    Deferred,
+    Immediate {
+        force: bool,
+    },
+}
+
 pub fn align_4k(length: u64) -> i64 {
     if length == 0 {
         return 1 << 12;
