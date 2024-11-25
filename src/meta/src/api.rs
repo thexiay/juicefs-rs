@@ -61,13 +61,13 @@ impl InoExt for Ino {
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum INodeType {
     #[default]
-    TypeFile = 1, // type for regular file
-    TypeDirectory = 2, // type for directory
-    TypeSymlink = 3,   // type for symlink
-    TypeFIFO = 4,      // type for FIFO node
-    TypeBlockDev = 5,  // type for block device
-    TypeCharDev = 6,   // type for character device
-    TypeSocket = 7,    // type for socket
+    File = 1,      // type for regular file
+    Directory = 2, // type for directory
+    Symlink = 3,   // type for symlink
+    FIFO = 4,      // type for FIFO node
+    BlockDev = 5,  // type for block device
+    CharDev = 6,   // type for character device
+    Socket = 7,    // type for socket
 }
 
 // Entry is an entry inside a directory.
@@ -184,9 +184,13 @@ bitflags! {
     }
 
     pub struct RenameMask: u32 {
+        /// NOREPLCAE: not allow to overwride the destination entry if the destination exists
         const NOREPLACE = 1 << 0;
+        /// EXCHANGE: will exchange the two entry content if the destination exists, 
+        /// but name retains the same, will not exchange
         const EXCHANGE = 1 << 1;
         const WHITEOUT = 1 << 2;
+        /// RESTORE: TODO: ????
         const RESTORE = 1 << 5;
     }
 }

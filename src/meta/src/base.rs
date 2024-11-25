@@ -517,7 +517,7 @@ where
                     "",
                     trash.unwrap(),
                     Attr {
-                        typ: INodeType::TypeDirectory,
+                        typ: INodeType::Directory,
                         nlink: 2,
                         length: 4 << 10,
                         mode: 0o555,
@@ -648,14 +648,14 @@ where
             // try directories first to increase parallel
             let mut dirs = 0;
             for i in 0..entries.len() {
-                if entries[i].attr.typ == INodeType::TypeDirectory {
+                if entries[i].attr.typ == INodeType::Directory {
                     entries.swap(dirs, i);
                     dirs += 1;
                 }
             }
             let mut join_set = JoinSet::new();
             for entry in entries {
-                if entry.attr.typ == INodeType::TypeDirectory {
+                if entry.attr.typ == INodeType::Directory {
                     let removing_limit = max_removing.clone();
                     match removing_limit.try_acquire_owned() {
                         Ok(permit) => {
@@ -745,7 +745,7 @@ where
     // ------------------------------ attr func ------------------------------
     fn clear_sugid(&self, cur: &mut Attr, set: &mut u16) {
         // TODO: support darwin
-        if cur.typ != INodeType::TypeDirectory {
+        if cur.typ != INodeType::Directory {
             if !self.uid().is_root() || (cur.mode >> 3) & 1 != 0 {
                 // clear SUID and SGID
                 cur.mode &= 0o1777;
@@ -1454,7 +1454,7 @@ where
         match name {
             ".." => {
                 let par_attr = self.get_attr(parent).await?;
-                if par_attr.typ != INodeType::TypeDirectory {
+                if par_attr.typ != INodeType::Directory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
                     }
@@ -1492,7 +1492,7 @@ where
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    if attr.typ == INodeType::TypeDirectory && !parent.is_trash() {
+                    if attr.typ == INodeType::Directory && !parent.is_trash() {
                         let mut dir_parents = base.dir_parents.lock();
                         dir_parents.insert(inode, parent);
                     }
@@ -1525,7 +1525,7 @@ where
                 Ok(attr)
             } else {
                 Ok(Attr {
-                    typ: INodeType::TypeDirectory,
+                    typ: INodeType::Directory,
                     mode: if inode.is_trash() { 0o555 } else { 0o777 },
                     nlink: 2,
                     length: 4 << 10,
@@ -1537,7 +1537,7 @@ where
         } else {
             let mut attr = self.do_get_attr(inode).await?;
             base.open_files.update_attr(inode, &mut attr).await;
-            if attr.typ == INodeType::TypeDirectory && inode.is_root() && !attr.parent.is_trash() {
+            if attr.typ == INodeType::Directory && inode.is_root() && !attr.parent.is_trash() {
                 base.dir_parents.lock().insert(inode, attr.parent);
             }
             Ok(attr)
@@ -1653,11 +1653,11 @@ where
 
         let mut attr = Attr::default();
         match typ {
-            INodeType::TypeDirectory => {
+            INodeType::Directory => {
                 attr.nlink = 2;
                 attr.length = 4 << 10;
             }
-            INodeType::TypeSymlink => {
+            INodeType::Symlink => {
                 attr.nlink = 1;
                 attr.length = path.len() as u64;
             }
@@ -1701,7 +1701,7 @@ where
         self.mknod(
             parent,
             name,
-            INodeType::TypeDirectory,
+            INodeType::Directory,
             mode,
             cumask,
             0,
@@ -1732,7 +1732,7 @@ where
 
         let parent = parent.transfer_root(base.root);
         let attr = self.do_unlink(parent, name, skip_check_trash).await?;
-        let diff_length = if attr.typ == INodeType::TypeFile {
+        let diff_length = if attr.typ == INodeType::File {
             attr.length
         } else {
             0
@@ -1836,7 +1836,7 @@ where
         };
         let (space, inodes) = if quota_src != quota_dst {
             let (src_ino, src_attr) = self.lookup(parent_src, name_src, false).await?;
-            let (space, inodes) = if src_attr.typ == INodeType::TypeDirectory {
+            let (space, inodes) = if src_attr.typ == INodeType::Directory {
                 let quota = {
                     let quotas = base.dir_quotas.read();
                     quotas.get(&src_ino).map(|quota| {
@@ -1884,12 +1884,12 @@ where
             Err(e) => return Err(e.into()),
         };
         let diff_length = match attr.typ {
-            INodeType::TypeDirectory => {
+            INodeType::Directory => {
                 let mut dir_parents = base.dir_parents.lock();
                 dir_parents.insert(ino, parent_dst);
                 0
             }
-            INodeType::TypeFile => attr.length,
+            INodeType::File => attr.length,
             _ => 0,
         };
         if parent_src != parent_dst {
@@ -1913,12 +1913,12 @@ where
             && flags != RenameMask::EXCHANGE
         {
             let diff_length = match tattr.typ {
-                INodeType::TypeDirectory => {
+                INodeType::Directory => {
                     let mut dir_parents = base.dir_parents.lock();
                     dir_parents.remove(&tino);
                     0
                 }
-                INodeType::TypeFile => tattr.length,
+                INodeType::File => tattr.length,
                 _ => 0,
             };
             self.update_dir_stats(
@@ -1958,7 +1958,7 @@ where
                 inode,
                 name: ".".to_string(),
                 attr: Attr {
-                    typ: INodeType::TypeDirectory,
+                    typ: INodeType::Directory,
                     ..Default::default()
                 }
                 .clone(),
@@ -1967,7 +1967,7 @@ where
                 inode: attr.parent,
                 name: "..".to_string(),
                 attr: Attr {
-                    typ: INodeType::TypeDirectory,
+                    typ: INodeType::Directory,
                     ..Default::default()
                 },
             },
@@ -1996,7 +1996,7 @@ where
             .mknod(
                 parent,
                 name,
-                INodeType::TypeFile,
+                INodeType::File,
                 mode,
                 cumask,
                 0,
@@ -2011,7 +2011,7 @@ where
             }
             Err(libc::EEXIST) => {
                 if let Some((ino, mut attr)) = exist_node
-                    && (flags & libc::O_EXCL == 0 && attr.typ == INodeType::TypeFile)
+                    && (flags & libc::O_EXCL == 0 && attr.typ == INodeType::File)
                 {
                     self.as_ref().open_files.open(ino, &mut attr).await;
                     Ok((ino, attr))
@@ -2206,7 +2206,7 @@ where
         .await?;
         let (inode, attr) = self.lookup(parent, name, false).await?;
         let mut count = 0;
-        if attr.typ != INodeType::TypeDirectory {
+        if attr.typ != INodeType::Directory {
             count += 1;
             self.unlink(parent, name, false).await?;
         } else {
@@ -2230,7 +2230,7 @@ where
     // Get summary of a node; for a directory it will accumulate all its child nodes
     async fn get_summary(&self, ino: Ino, recursive: bool, strict: bool) -> FsResult<Summary> {
         let attr = self.get_attr(ino).await?;
-        if attr.typ != INodeType::TypeDirectory {
+        if attr.typ != INodeType::Directory {
             Ok(Summary {
                 dirs: 0,
                 files: 1,

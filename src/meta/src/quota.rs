@@ -370,18 +370,18 @@ where
         };
 
         for entry in entries {
-            if entry.attr.typ == INodeType::TypeDirectory {
+            if entry.attr.typ == INodeType::Directory {
                 summary.dirs += 1;
             } else {
                 summary.files += 1;
             }
             if strict || !format.enable_dir_stats {
                 summary.size += align_4k(entry.attr.length) as u64;
-                if entry.attr.typ == INodeType::TypeFile {
+                if entry.attr.typ == INodeType::File {
                     summary.length += entry.attr.length as u64;
                 }
             }
-            if entry.attr.typ != INodeType::TypeDirectory || !recursive {
+            if entry.attr.typ != INodeType::Directory || !recursive {
                 continue;
             }
             match self.get_dir_summary(entry.inode, recursive, strict).await {

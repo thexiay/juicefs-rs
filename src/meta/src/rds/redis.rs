@@ -1181,7 +1181,7 @@ impl Engine for RedisEngineWithCtx {
             .expect("Time went backwards")
             .as_nanos();
         let mut attr = Attr {
-            typ: INodeType::TypeDirectory,
+            typ: INodeType::Directory,
             atime: ts,
             mtime: ts,
             ctime: ts,
@@ -1607,7 +1607,7 @@ impl Engine for RedisEngineWithCtx {
         async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
             let pattr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
             let mut pattr: Attr = bincode::deserialize(&pattr_bytes)?;
-            if pattr.typ != INodeType::TypeDirectory {
+            if pattr.typ != INodeType::Directory {
                 return SysSnafu {
                     code: libc::ENOTDIR,
                 }
@@ -1637,7 +1637,7 @@ impl Engine for RedisEngineWithCtx {
             if let Some((found_type, found_ino)) = found_ino {
                 let found_attr = match found_type {
                     // file for create, directory for subTrash
-                    INodeType::TypeFile | INodeType::TypeDirectory => {
+                    INodeType::File | INodeType::Directory => {
                         let exists_attr_bytes: Option<Vec<u8>> =
                             conn.get(self.inode_key(found_ino)).await?;
                         match exists_attr_bytes {
@@ -1664,9 +1664,9 @@ impl Engine for RedisEngineWithCtx {
             // acl mode search
             attr.mode &= 0o7777;
             let mut pipe = pipe();
-            if pattr.default_acl.is_valid_acl() && attr.typ != INodeType::TypeSymlink {
+            if pattr.default_acl.is_valid_acl() && attr.typ != INodeType::Symlink {
                 // inherit default acl
-                if attr.typ == INodeType::TypeDirectory {
+                if attr.typ == INodeType::Directory {
                     attr.default_acl = pattr.default_acl;
                 }
 
@@ -1695,7 +1695,7 @@ impl Engine for RedisEngineWithCtx {
                 .as_nanos();
             let mut update_parent = false;
             if parent != TRASH_INODE {
-                if attr.typ == INodeType::TypeDirectory {
+                if attr.typ == INodeType::Directory {
                     pattr.nlink += 1;
                     update_parent = true;
                 }
@@ -1714,7 +1714,7 @@ impl Engine for RedisEngineWithCtx {
                 attr.gid = pattr.gid;
             } else if cfg!(target_os = "linux") && pattr.mode & 0o2000 != 0 {
                 attr.gid = pattr.gid;
-                if attr.typ == INodeType::TypeDirectory {
+                if attr.typ == INodeType::Directory {
                     attr.mode |= 0o2000;
                 } else if attr.mode & 0o2010 == 0o2010 && *self.uid() != 0 {
                     if let None = self.gids().iter().find(|gid| **gid == pattr.gid) {
@@ -1734,10 +1734,10 @@ impl Engine for RedisEngineWithCtx {
                 pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
             }
             pipe.set(self.inode_key(inode), bincode::serialize(&attr)?);
-            if attr.typ == INodeType::TypeSymlink {
+            if attr.typ == INodeType::Symlink {
                 pipe.set(self.sym_key(inode), path);
             }
-            if attr.typ == INodeType::TypeDirectory {
+            if attr.typ == INodeType::Directory {
                 pipe.hset(self.dir_used_inodes_key(), inode, "0");
                 pipe.hset(self.dir_data_length_key(), inode, "0");
                 pipe.hset(self.dir_used_space_key(), inode, "0");
@@ -1789,7 +1789,7 @@ impl Engine for RedisEngineWithCtx {
                 };
 
                 let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
-                if typ == INodeType::TypeDirectory {
+                if typ == INodeType::Directory {
                     return SysSnafu { code: libc::EPERM }.fail();
                 }
 
@@ -1803,7 +1803,7 @@ impl Engine for RedisEngineWithCtx {
                     .await?;
                 let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
                 // double check: parent mut be a dir and access mode
-                if pattr.typ != INodeType::TypeDirectory {
+                if pattr.typ != INodeType::Directory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
                     }
@@ -1869,7 +1869,7 @@ impl Engine for RedisEngineWithCtx {
                             Some(trash_ino) if attr.parent > 0 => attr.parent = trash_ino,
                             None => {
                                 attr.nlink -= 1;
-                                if typ == INodeType::TypeFile && attr.nlink == 0 {
+                                if typ == INodeType::File && attr.nlink == 0 {
                                     should_del = true;
                                     let sid = { self.meta.sid.read().clone() };
                                     if let Some(sid) = sid
@@ -1915,7 +1915,7 @@ impl Engine for RedisEngineWithCtx {
                     (0, 0)
                 } else {
                     let guaga = match typ {
-                        INodeType::TypeFile => {
+                        INodeType::File => {
                             if let Some(sid) = open_session_id {
                                 pipe.set(self.inode_key(ino), bincode::serialize(&attr)?);
                                 pipe.sadd(self.sustained(sid), &ino);
@@ -1937,7 +1937,7 @@ impl Engine for RedisEngineWithCtx {
                                 (new_space, -1)
                             }
                         }
-                        INodeType::TypeSymlink => {
+                        INodeType::Symlink => {
                             pipe.del(self.inode_key(ino));
                             pipe.del(self.inode_key(ino));
                             let new_space = -utils::align_4k(0);
@@ -2016,7 +2016,7 @@ impl Engine for RedisEngineWithCtx {
 
             let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
 
-            if typ != INodeType::TypeDirectory {
+            if typ != INodeType::Directory {
                 return SysSnafu {
                     code: libc::ENOTDIR,
                 }
@@ -2032,7 +2032,7 @@ impl Engine for RedisEngineWithCtx {
                 .await?;
             let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
             // double check: parent mut be a dir and access mode
-            if pattr.typ != INodeType::TypeDirectory {
+            if pattr.typ != INodeType::Directory {
                 return SysSnafu {
                     code: libc::ENOTDIR,
                 }
@@ -2246,7 +2246,7 @@ impl Engine for RedisEngineWithCtx {
                         return SysSnafu { code: libc::EEXIST }.fail();
                     }
                     watch_keys.push(self.inode_key(*ino_dst));
-                    if *typ_dst == INodeType::TypeDirectory {
+                    if *typ_dst == INodeType::Directory {
                         watch_keys.push(self.entry_key(*ino_dst));
                     }
                     if !flags.intersects(RenameMask::EXCHANGE) {
@@ -2278,7 +2278,7 @@ impl Engine for RedisEngineWithCtx {
                     }
                 }
                 let mut pattr_src: Attr = bincode::deserialize(rs[0].as_ref().unwrap())?;
-                if pattr_src.typ != INodeType::TypeDirectory {
+                if pattr_src.typ != INodeType::Directory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
                     }
@@ -2291,7 +2291,7 @@ impl Engine for RedisEngineWithCtx {
                 )
                 .await?;
                 let mut pattr_dst: Attr = bincode::deserialize(rs[1].as_ref().unwrap())?;
-                if pattr_dst.typ != INodeType::TypeDirectory {
+                if pattr_dst.typ != INodeType::Directory {
                     return SysSnafu {
                         code: libc::ENOTDIR,
                     }
@@ -2325,18 +2325,18 @@ impl Engine for RedisEngineWithCtx {
                     && pattr_src.mode & 0o1000 != 0
                     && !self.uid().is_root()
                     && *self.uid() != attr_src.uid
-                    && (*self.uid() != pattr_src.uid || attr_src.typ == INodeType::TypeDirectory)
+                    && (*self.uid() != pattr_src.uid || attr_src.typ == INodeType::Directory)
                 {
                     return SysSnafu { code: libc::EACCES }.fail();
                 }
 
-                // exchange exists inode
+                // move dst inode to src inode if exchange
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .expect("Time went backwards");
                 let mut opended = false;
-                let mut update_dst = false;
-                let mut update_src = false;
+                let mut update_parent_dst = false;
+                let mut update_parent_src = false;
                 let mut delete_option = None;
                 let exists_attr_dst = if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst {
                     let mut attr_dst: Attr = bincode::deserialize(rs[3].as_ref().unwrap())?;
@@ -2349,7 +2349,7 @@ impl Engine for RedisEngineWithCtx {
                     attr_dst.ctime = now.as_nanos();
                     if flags.intersects(RenameMask::EXCHANGE) {
                         if parent_src != parent_dst {
-                            if *typ_dst == INodeType::TypeDirectory {
+                            if *typ_dst == INodeType::Directory {
                                 attr_dst.parent = parent_src;
                                 pattr_src.nlink += 1;
                                 pattr_dst.nlink -= 1;
@@ -2357,7 +2357,7 @@ impl Engine for RedisEngineWithCtx {
                                 attr_dst.parent = parent_src;
                             }
                         } else {
-                            if *typ_dst == INodeType::TypeDirectory {
+                            if *typ_dst == INodeType::Directory {
                                 let cnt: u64 = conn.hlen(self.entry_key(*ino_dst)).await?;
                                 if cnt != 0 {
                                     return SysSnafu {
@@ -2366,7 +2366,7 @@ impl Engine for RedisEngineWithCtx {
                                     .fail();
                                 }
                                 pattr_dst.nlink -= 1;
-                                update_dst = true;
+                                update_parent_dst = true;
                                 trash.iter().for_each(|t| attr_dst.parent = *t);
                             } else {
                                 if let Some(trash_ino) = trash {
@@ -2375,7 +2375,7 @@ impl Engine for RedisEngineWithCtx {
                                     }
                                 } else {
                                     attr_dst.nlink -= 1;
-                                    if *typ_dst == INodeType::TypeFile && attr_dst.nlink == 0 {
+                                    if *typ_dst == INodeType::File && attr_dst.nlink == 0 {
                                         opended = self.meta.open_files.is_open(*ino_dst).await;
                                         delete_option = if opended && self.meta.sid.read().is_some()
                                         {
@@ -2415,31 +2415,32 @@ impl Engine for RedisEngineWithCtx {
                 {
                     return SysSnafu { code: libc::EACCES }.fail();
                 }
+                // move src inode to dst
                 if parent_src != parent_dst {
-                    if typ_src == INodeType::TypeDirectory {
+                    if typ_src == INodeType::Directory {
                         attr_src.parent = parent_dst;
                         pattr_src.nlink -= 1;
                         pattr_dst.nlink += 1;
-                        (update_src, update_dst) = (true, true);
+                        (update_parent_src, update_parent_dst) = (true, true);
                     } else if attr_src.parent > 0 {
                         attr_src.parent = parent_dst;
                     }
                 }
 
                 // change time
-                if update_src
+                if update_parent_src
                     || now.as_nanos() - pattr_src.mtime >= self.meta.conf.skip_dir_mtime.as_nanos()
                 {
                     pattr_src.mtime = now.as_nanos();
                     pattr_src.ctime = now.as_nanos();
-                    update_src = true;
+                    update_parent_src = true;
                 }
-                if update_dst
+                if update_parent_dst
                     || now.as_nanos() - pattr_dst.mtime >= self.meta.conf.skip_dir_mtime.as_nanos()
                 {
                     pattr_dst.mtime = now.as_nanos();
                     pattr_dst.ctime = now.as_nanos();
-                    update_dst = true;
+                    update_parent_dst = true;
                 }
                 attr_src.ctime = now.as_nanos();
 
@@ -2447,18 +2448,19 @@ impl Engine for RedisEngineWithCtx {
                 let (mut new_space, mut new_inode) = (0, 0);
                 let mut pipe = pipe();
                 pipe.atomic();
+                // update dst ino
                 if flags.intersects(RenameMask::EXCHANGE)
                     && let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
                     && let Some(ref attr_dst) = exists_attr_dst
                 {
-                    // exchange
+                    // do exchange
                     pipe.hset(
                         self.entry_key(parent_src),
                         name_src,
                         bincode::serialize(&(typ_dst, ino_dst)).unwrap(),
                     );
                     pipe.set(
-                        self.entry_key(ino_src),
+                        self.inode_key(*ino_dst),
                         bincode::serialize(attr_dst).unwrap(),
                     );
                     if parent_src != parent_dst && attr_dst.parent == 0 {
@@ -2470,7 +2472,7 @@ impl Engine for RedisEngineWithCtx {
                     pipe.hdel(self.entry_key(parent_src), name_src);
                     if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
                         && let Some(ref attr_dst) = exists_attr_dst
-                    {
+                    {  // do replace
                         let (typ_dst, ino_dst) = (typ_dst.clone(), ino_dst.clone());
                         if let Some(trash_ino) = trash {
                             pipe.set(
@@ -2486,7 +2488,7 @@ impl Engine for RedisEngineWithCtx {
                                 pipe.hincr(self.parent_key(ino_dst), trash_ino, 1);
                                 pipe.hincr(self.parent_key(ino_dst), parent_dst, -1);
                             }
-                        } else if typ_dst != INodeType::TypeDirectory && attr_dst.nlink > 0 {
+                        } else if typ_dst != INodeType::Directory && attr_dst.nlink > 0 {
                             pipe.set(
                                 self.inode_key(ino_dst),
                                 bincode::serialize(&attr_dst).unwrap(),
@@ -2495,7 +2497,7 @@ impl Engine for RedisEngineWithCtx {
                                 pipe.hincr(self.parent_key(ino_dst), parent_dst, -1);
                             }
                         } else {
-                            if typ_dst == INodeType::TypeFile {
+                            if typ_dst == INodeType::File {
                                 if opended {
                                     pipe.set(
                                         self.inode_key(ino_dst),
@@ -2518,7 +2520,7 @@ impl Engine for RedisEngineWithCtx {
                                     pipe.decr(self.total_inodes_key(), new_inode);
                                 }
                             } else {
-                                if typ_dst == INodeType::TypeSymlink {
+                                if typ_dst == INodeType::Symlink {
                                     pipe.del(self.sym_key(ino_dst));
                                 }
                                 pipe.del(self.inode_key(ino_dst));
@@ -2531,13 +2533,25 @@ impl Engine for RedisEngineWithCtx {
                                 pipe.del(self.parent_key(ino_dst));
                             }
                         }
-                        if typ_dst == INodeType::TypeDirectory {
+                        if typ_dst == INodeType::Directory {
                             pipe.hdel(self.dir_quota_key(), ino_dst);
                             pipe.hdel(self.dir_quota_used_space_key(), ino_dst);
                             pipe.hdel(self.dir_quota_used_inodes_key(), ino_dst);
                         }
                     }
                 }
+
+                // update parent src ino
+                if parent_dst != parent_src {
+                    if parent_src.is_trash() && update_parent_src {
+                        pipe.set(self.inode_key(parent_src), bincode::serialize(&pattr_src).unwrap());
+                    }
+                    if attr_src.parent == 0 {
+                        pipe.hincr(self.parent_key(ino_src), parent_dst, 1);
+                        pipe.hincr(self.parent_key(ino_src), parent_src, -1);
+                    }
+                }
+                // update src ino
                 pipe.set(
                     self.inode_key(ino_src),
                     bincode::serialize(&attr_src).unwrap(),
@@ -2547,7 +2561,8 @@ impl Engine for RedisEngineWithCtx {
                     name_dst,
                     bincode::serialize(&(typ_src, ino_src)).unwrap(),
                 );
-                if update_dst {
+                // update parent dst ino
+                if update_parent_dst {
                     pipe.set(
                         self.inode_key(parent_dst),
                         bincode::serialize(&pattr_dst).unwrap(),

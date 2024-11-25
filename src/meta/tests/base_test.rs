@@ -124,7 +124,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .mknod(
             inode,
             "df",
-            INodeType::TypeDirectory,
+            INodeType::Directory,
             0o650,
             0o22,
             0,
@@ -137,16 +137,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         other => panic!("create fd: {:?}", other),
     }
     match m
-        .mknod(
-            parent,
-            "f",
-            INodeType::TypeFile,
-            0o650,
-            0o22,
-            0,
-            "",
-            &mut None,
-        )
+        .mknod(parent, "f", INodeType::File, 0o650, 0o22, 0, "", &mut None)
         .await
     {
         Err(errno) if errno == libc::EEXIST => (),
@@ -205,16 +196,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
             panic!("not inherit sgid");
         }
         let (_, attr) = m
-            .mknod(
-                p1,
-                "f1",
-                INodeType::TypeFile,
-                0o2777,
-                0o22,
-                0,
-                "",
-                &mut None,
-            )
+            .mknod(p1, "f1", INodeType::File, 0o2777, 0o22, 0, "", &mut None)
             .await
             .expect("create f1: ");
         if attr.mode & 0o2010 != 0o2010 {
@@ -223,16 +205,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
 
         m.with_login(ctx3, vec![ctx3]);
         let (_, attr) = m
-            .mknod(
-                p1,
-                "f2",
-                INodeType::TypeFile,
-                0o2777,
-                0o22,
-                0,
-                "",
-                &mut None,
-            )
+            .mknod(p1, "f2", INodeType::File, 0o2777, 0o22, 0, "", &mut None)
             .await
             .expect("create f2: ");
         if attr.mode & 0o2010 != 0o0010 {
@@ -303,7 +276,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     if entries[0].name != "." || entries[1].name != ".." || entries[2].name != "f" {
         panic!("entries: {:?}", entries);
     }
-    // -------------------------------- test rename -------------------------------- 
+    // -------------------------------- test rename --------------------------------
     match m
         .rename(parent, "f", ROOT_INODE, "f2", RenameMask::WHITEOUT)
         .await
@@ -317,7 +290,8 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.rename(ROOT_INODE, "f2", ROOT_INODE, "f2", RenameMask::empty())
         .await
         .expect("rename f2 -> f2: ");
-    match m.rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::EXCHANGE)
+    match m
+        .rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::EXCHANGE)
         .await
     {
         Err(errno) if errno == libc::ENOENT => (),
@@ -327,7 +301,8 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("create f: ");
     m.close(inode).await.expect("close f: ");
-    match m.rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::NOREPLACE)
+    match m
+        .rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::NOREPLACE)
         .await
     {
         Err(errno) if errno == libc::EEXIST => (),
@@ -350,6 +325,114 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("mkdir d: ");
     // Test rename with parent change
+    let (parent2, _) = m
+        .mkdir(ROOT_INODE, "d4", 0o777, 0, 0)
+        .await
+        .expect("mkdir d4: ");
+    m.mkdir(parent2, "d5", 0o777, 0, 0)
+        .await
+        .expect("mkdir d5: ");
+    let res = m
+        .rename(parent2, "d5", ROOT_INODE, "d5", RenameMask::NOREPLACE)
+        .await
+        .expect("rename d4/d5 -> d5: ");
+    match res {
+        None => panic!("after rename d4/d5 -> d5 expect some"),
+        Some((_, attr)) => {
+            if attr.parent != ROOT_INODE {
+                panic!("after rename d4/d5 -> d5 parent {} expect 1", attr.parent);
+            }
+        }
+    }
+    m.mknod(
+        parent2,
+        "f6",
+        INodeType::File,
+        0o650,
+        0o22,
+        0,
+        "",
+        &mut None,
+    )
+    .await
+    .expect("create file d4/f6: ");
+    let res = m  // 打断点发现已经走到了交换的位置，并且也设置了。但是为什么父节点不对还是得看下，是不是lookup寻址不对还是咋地。
+        .rename(ROOT_INODE, "d5", parent2, "f6", RenameMask::EXCHANGE)
+        .await
+        .expect("rename d5 <-> d4/f6: ");
+    match res {
+        None => panic!("after exchange d5 <-> d4/f6 expect some"),
+        Some((_, attr)) => {
+            if attr.parent != parent2 {
+                panic!(
+                    "after exchange d5 <-> d4/f6 parent {} expect {}",
+                    attr.parent, parent2
+                );
+            } else if attr.typ != INodeType::Directory {
+                panic!(
+                    "after exchange d5 <-> d4/f6 type {:?} expect {:?}",
+                    attr.typ,
+                    INodeType::Directory
+                );
+            }
+        }
+    }
+    let (_, attr) = m.lookup(ROOT_INODE, "d5", true).await.expect("lookip d5: ");
+    if attr.parent != ROOT_INODE {
+        panic!(
+            "lookup d5 after exchange parent {} expect {}",
+            attr.parent, ROOT_INODE
+        );
+    } else if attr.typ != INodeType::File {
+        panic!(
+            "lookup d5 after exchange type {:?} expect {:?}",
+            attr.typ,
+            INodeType::Directory
+        );
+    }
+    m.rmdir(parent2, "f6", false).await.expect("rmdir d4/f6: ");
+    m.rmdir(ROOT_INODE, "d4", false).await.expect("rmdir d4: ");
+    m.unlink(ROOT_INODE, "d5", false)
+        .await
+        .expect("unlink d5: ");
+    /*
+    if st := m.Lookup(ctx, 1, "f", &inode, attr, true); st != 0 {
+        t.Fatalf("lookup f: %s", st)
+    }
+    if st := m.Link(ctx, inode, 1, "f3", attr); st != 0 {
+        t.Fatalf("link f3 -> f: %s", st)
+    }
+    defer m.Unlink(ctx, 1, "f3")
+    if st := m.Link(ctx, inode, 1, "F3", attr); st != 0 { // CaseInsensi = false
+        t.Fatalf("link F3 -> f: %s", st)
+    }
+    if st := m.Link(ctx, parent, 1, "d2", attr); st != syscall.EPERM {
+        t.Fatalf("link d2 -> d: %s", st)
+    }
+    if st := m.Symlink(ctx, 1, "s", "/f", &inode, attr); st != 0 {
+        t.Fatalf("symlink s -> /f: %s", st)
+    }
+    if attr.Mode&0777 != 0777 {
+        t.Fatalf("mode of symlink should be 0777")
+    }
+    defer m.Unlink(ctx, 1, "s")
+    var target1, target2 []byte
+    if st := m.ReadLink(ctx, inode, &target1); st != 0 {
+        t.Fatalf("readlink s: %s", st)
+    }
+    if st := m.ReadLink(ctx, inode, &target2); st != 0 { // cached
+        t.Fatalf("readlink s: %s", st)
+    }
+    if !bytes.Equal(target1, target2) || !bytes.Equal(target1, []byte("/f")) {
+        t.Fatalf("readlink got %s %s, expected %s", target1, target2, "/f")
+    }
+    if st := m.ReadLink(ctx, parent, &target1); st != syscall.EINVAL {
+        t.Fatalf("readlink d: %s", st)
+    }
+    if st := m.Lookup(ctx, 1, "f", &inode, attr, true); st != 0 {
+        t.Fatalf("lookup f: %s", st)
+    }
+     */
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
