@@ -402,17 +402,25 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> FsResult<()>;
 
     // ReadLink returns the target of a symlink.
-    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> FsResult<()>;
+    ///
+    /// # Arguments
+    /// 
+    /// * `inode` - the symbol inode
+    async fn read_symlink(&self, inode: Ino) -> FsResult<String>;
 
-    // Symlink creates a symlink in a directory with given name.
+    /// Symlink creates a symlink in a directory with given name.
+    ///
+    /// # Arguments
+    /// 
+    /// * `parent`: parent inode
+    /// * `name`: symlink name
+    /// * `target_path`: target path of symlink
     async fn symlink(
         &self,
         parent: Ino,
-        name: String,
-        path: String,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> FsResult<()>;
+        name: &str,
+        target_path: &str,
+    ) -> FsResult<(Ino, Attr)>;
 
     /// Mknod creates a node in a directory with given name, type and permissions.
     ///

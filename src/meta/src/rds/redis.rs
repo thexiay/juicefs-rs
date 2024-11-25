@@ -2195,8 +2195,54 @@ impl Engine for RedisEngineWithCtx {
         Ok(ino)
     }
 
-    async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)> {
-        unimplemented!()
+    async fn do_read_symlink(&self, inode: Ino, no_atime: bool) -> Result<(Option<u128>, String)> {
+        let mut share_conn = self.exclusive_conn().await?;
+        let conn = share_conn.deref_mut();
+        if no_atime {
+            let path: Option<String> = conn.get(self.sym_key(inode)).await?;
+            return Ok((None, path.unwrap_or(String::from(""))));
+        }
+        
+        async_transaction!(conn, &[self.inode_key(inode)], {
+            let keys = [self.inode_key(inode), self.sym_key(inode)];
+            let rs: Vec<Option<Vec<u8>>> = conn.get(&keys).await?;
+            if rs.len() != 2 {
+                error!("no attribute for inodes {keys:?}");
+                return SysSnafu { code: libc::ENOENT }.fail();
+            }
+            if rs[0].is_none() {
+                return SysSnafu { code: libc::ENOENT }.fail();
+            }
+            let mut attr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
+            if attr.typ != INodeType::Symlink {
+                return SysSnafu { code: libc::EINVAL }.fail();
+            }
+            let path = match &rs[1] {
+                Some(path) => {
+                    match String::from_utf8(path.clone()) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            error!("Invalid symbol path: {:?}", e);
+                            continue;
+                        }
+                    }
+                },
+                None => return SysSnafu { code: libc::EIO }.fail(),  
+            };
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards");
+            if !self.atime_need_update(&attr, now) {
+                return Ok((None, path));
+            }
+            
+            attr.atime = now.as_nanos();
+            let mut pipe = pipe();
+            pipe.atomic();
+            pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
+            pipe.query_async(conn).await?;
+            Ok(Some((Some(attr.atime), path)))
+        })
     }
 
     async fn do_readdir(

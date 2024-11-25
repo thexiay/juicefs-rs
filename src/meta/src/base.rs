@@ -38,6 +38,7 @@ pub const N_LOCK: usize = 1 << 10;
 pub const CHANNEL_BUFFER: usize = 1024;
 const SEGMENT_LOCK: Mutex<()> = Mutex::new(());
 const UMOUNT_EXIT_CODE: i32 = 11;
+const MAX_SYMLINK: usize = 4096;
 
 pub const NEXT_INODE: &str = "nextinode";
 pub const NEXT_CHUNK: &str = "nextchunk";
@@ -176,7 +177,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str) -> Result<Attr>;
     async fn do_unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Attr>;
     async fn do_rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino>;
-    async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
+    async fn do_read_symlink(&self, inode: Ino, no_atime: bool) -> Result<(Option<u128>, String)>;
     async fn do_readdir(
         &self,
         inode: Ino,
@@ -358,7 +359,7 @@ pub struct CommonMeta {
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
     pub max_deleting: Arc<Semaphore>,
-    pub symlinks: HashMap<Ino, String>,
+    pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>,  // ino -> (atime, path)
     pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
     pub acl_cache: AsyncMutex<AclCache>,
     pub dir_stats_batch: Mutex<HashMap<Ino, DirStat>>,
@@ -395,7 +396,7 @@ impl CommonMeta {
             removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
             max_deleting,
-            symlinks: HashMap::new(),
+            symlinks: Mutex::new(HashMap::new()),
             reload_format_callbacks: Vec::new(),
             ses_umounting: AsyncMutex::new(false),
             acl_cache: AsyncMutex::new(AclCache::default()),
@@ -1606,20 +1607,58 @@ where
     }
 
     // ReadLink returns the target of a symlink.
-    async fn read_link(&self, inode: Ino, path: &Vec<u8>) -> FsResult<()> {
-        todo!()
+    async fn read_symlink(&self, inode: Ino) -> FsResult<String> {
+        let base = self.as_ref();
+        let no_atime = self.as_ref().conf.atime_mode == "NoAtime" || self.as_ref().conf.read_only;
+
+        {
+            let symlinks = base.symlinks.lock();
+            if let Some((atime, path)) = symlinks.get(&inode) {
+                if let Some(atime) = atime {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+                    let attr = Attr {
+                        atime: *atime,
+                        ..Attr::default()
+                    };
+                    // ctime and mtime are ignored since symlink can't be modified
+                    let need_update_atime = self.atime_need_update(&attr, now);
+                    if no_atime || !need_update_atime {
+                        return Ok(path.clone());
+                    }
+                }
+            }
+        }
+        let (atime, path) = self.do_read_symlink(inode, no_atime).await?;
+        if path.is_empty() {
+            let attr = self.get_attr(inode).await?;
+            if attr.typ != INodeType::Symlink {
+                return Err(libc::EINVAL);
+            }
+            return Err(libc::EIO);
+        }
+        base.symlinks.lock().insert(inode, (atime, path.clone()));
+        Ok(path)
     }
 
     // Symlink creates a symlink in a directory with given name.
     async fn symlink(
         &self,
         parent: Ino,
-        name: String,
-        path: String,
-        inode: &Ino,
-        attr: &Attr,
-    ) -> FsResult<()> {
-        todo!()
+        name: &str,
+        target_path: &str,
+    ) -> FsResult<(Ino, Attr)> {
+        if target_path.is_empty() || target_path.len() > MAX_SYMLINK {
+            return SysSnafu { code: libc::ENOENT }.fail()?;
+        }
+        // ' ' is illegal in posix path
+        if target_path.chars().any(|c| c == '\0') {
+            return SysSnafu { code: libc::ENOENT }.fail()?;
+        }
+
+        // mode of symlink is ignored in POSIX
+        // do not care exists inode
+        self.mknod(parent, name, INodeType::Symlink, 0o777, 0, 0, target_path, &mut None).await
     }
 
     // Mknod creates a node in a directory with given name, type and permissions.

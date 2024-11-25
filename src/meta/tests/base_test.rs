@@ -321,7 +321,8 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     if attr.nlink != 2 {
         panic!("nlink expect 2, but got {}", attr.nlink);
     }
-    let (parent, _) = m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
+    let (parent, _) = m
+        .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
         .expect("mkdir d: ");
     // Test rename with parent change
@@ -395,7 +396,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.unlink(ROOT_INODE, "d5", false)
         .await
         .expect("unlink d5: ");
-    // test link, unlink, symlink
+    // test hardlink
     let (inode, _) = m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
     m.link(inode, ROOT_INODE, "f3")
         .await
@@ -407,31 +408,26 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         Err(errno) if errno == libc::EPERM => (),
         other => panic!("link d2 -> d: {:?}", other),
     }
-    /*
-    if st := m.Symlink(ctx, 1, "s", "/f", &inode, attr); st != 0 {
-        t.Fatalf("symlink s -> /f: %s", st)
+    // test softlink
+    let (inode, attr) = m
+        .symlink(ROOT_INODE, "s", "/f")
+        .await
+        .expect("symlink s -> /f: ");
+    if attr.mode & 0o777 != 0o777 {
+        panic!("mode of symlink should be 0o777");
     }
-    if attr.Mode&0777 != 0777 {
-        t.Fatalf("mode of symlink should be 0777")
+    let target1 = m.read_symlink(inode).await.expect("readlink s: ");
+    let target2 = m.read_symlink(inode).await.expect("readlink s: "); // cached
+    if target1 != target2 || target1.as_bytes() != "/f".as_bytes() {
+        panic!("readlink got {} {:?}, expected /f", target1, target2);
     }
-    defer m.Unlink(ctx, 1, "s")
-    var target1, target2 []byte
-    if st := m.ReadLink(ctx, inode, &target1); st != 0 {
-        t.Fatalf("readlink s: %s", st)
+    match m.read_symlink(parent).await {
+        Err(errno) if errno == libc::EINVAL => (),
+        other => panic!("readlink d: {:?}", other),
     }
-    if st := m.ReadLink(ctx, inode, &target2); st != 0 { // cached
-        t.Fatalf("readlink s: %s", st)
-    }
-    if !bytes.Equal(target1, target2) || !bytes.Equal(target1, []byte("/f")) {
-        t.Fatalf("readlink got %s %s, expected %s", target1, target2, "/f")
-    }
-    if st := m.ReadLink(ctx, parent, &target1); st != syscall.EINVAL {
-        t.Fatalf("readlink d: %s", st)
-    }
-    if st := m.Lookup(ctx, 1, "f", &inode, attr, true); st != 0 {
-        t.Fatalf("lookup f: %s", st)
-    }
-     */
+    m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
+
+    // data test
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
