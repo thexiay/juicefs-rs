@@ -321,7 +321,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     if attr.nlink != 2 {
         panic!("nlink expect 2, but got {}", attr.nlink);
     }
-    m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
+    let (parent, _) = m.mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
         .expect("mkdir d: ");
     // Test rename with parent change
@@ -356,7 +356,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     )
     .await
     .expect("create file d4/f6: ");
-    let res = m  // 打断点发现已经走到了交换的位置，并且也设置了。但是为什么父节点不对还是得看下，是不是lookup寻址不对还是咋地。
+    let res = m
         .rename(ROOT_INODE, "d5", parent2, "f6", RenameMask::EXCHANGE)
         .await
         .expect("rename d5 <-> d4/f6: ");
@@ -395,20 +395,19 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.unlink(ROOT_INODE, "d5", false)
         .await
         .expect("unlink d5: ");
+    // test link, unlink, symlink
+    let (inode, _) = m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
+    m.link(inode, ROOT_INODE, "f3")
+        .await
+        .expect("link f3 -> f: ");
+    m.link(inode, ROOT_INODE, "F3")
+        .await
+        .expect("link F3 -> f: ");
+    match m.link(parent, ROOT_INODE, "d2").await {
+        Err(errno) if errno == libc::EPERM => (),
+        other => panic!("link d2 -> d: {:?}", other),
+    }
     /*
-    if st := m.Lookup(ctx, 1, "f", &inode, attr, true); st != 0 {
-        t.Fatalf("lookup f: %s", st)
-    }
-    if st := m.Link(ctx, inode, 1, "f3", attr); st != 0 {
-        t.Fatalf("link f3 -> f: %s", st)
-    }
-    defer m.Unlink(ctx, 1, "f3")
-    if st := m.Link(ctx, inode, 1, "F3", attr); st != 0 { // CaseInsensi = false
-        t.Fatalf("link F3 -> f: %s", st)
-    }
-    if st := m.Link(ctx, parent, 1, "d2", attr); st != syscall.EPERM {
-        t.Fatalf("link d2 -> d: %s", st)
-    }
     if st := m.Symlink(ctx, 1, "s", "/f", &inode, attr); st != 0 {
         t.Fatalf("symlink s -> /f: %s", st)
     }

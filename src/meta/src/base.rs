@@ -173,7 +173,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         inode: Ino,
         attr: Attr,
     ) -> Result<Attr>;
-    async fn do_link(&self, inode: Ino, parent: Ino, name: &str, attr: &Attr) -> Result<()>;
+    async fn do_link(&self, inode: Ino, parent: Ino, name: &str) -> Result<Attr>;
     async fn do_unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Attr>;
     async fn do_rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino>;
     async fn do_readlink(&self, inode: Ino, noatime: bool) -> Result<(i64, Vec<u8>)>;
@@ -1936,8 +1936,39 @@ where
     }
 
     // Link creates an entry for node.
-    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> FsResult<()> {
-        todo!()
+    async fn link(&self, inode: Ino, parent: Ino, name: &str) -> FsResult<Attr> {
+        if parent.is_trash() {
+            return Err(libc::EPERM);
+        }
+        if parent.is_root() && name == TRASH_NAME {
+            return Err(libc::EPERM);
+        }
+        if self.as_ref().conf.read_only {
+            return Err(libc::EROFS);
+        }
+        if name.is_empty() {
+            return Err(libc::ENOENT);
+        }
+        if name == "." || name == ".." {
+            return Err(libc::EEXIST);
+        }
+
+        let parent = parent.transfer_root(self.as_ref().root);
+        let attr = self.get_attr(inode).await?;
+        if attr.typ == INodeType::Directory {
+            return Err(libc::EPERM);
+        }
+        if self.check_quota(parent, align_4k(attr.length), 1).await {
+            return Err(libc::EDQUOT);
+        }
+        let res = self.do_link(inode, parent, name).await;
+        if let Ok(_) = res {
+            self.update_dir_stats(parent, attr.length as i64, align_4k(attr.length), 1);
+            self.update_quota(parent, align_4k(attr.length), 1).await;
+        }
+        self.as_ref().open_files.invalidate_chunk(inode, INVALIDATE_ATTR_ONLY).await;
+        let attr = res?;
+        Ok(attr)
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.

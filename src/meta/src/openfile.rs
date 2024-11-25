@@ -154,6 +154,7 @@ impl OpenFiles {
         files.get(&ino).map(|file| file.clone())
     }
 
+    // TODO: encapsulation it with drop call this function
     pub async fn invalidate_chunk(&self, ino: Ino, indx: u32) {
         let file = {
             let files = self.files.lock();

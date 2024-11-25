@@ -103,12 +103,16 @@ pub type FsResult<T> = std::result::Result<T, Errno>;
 
 impl From<MyError> for Errno {
     fn from(e: MyError) -> Self {
+        if let MyError::SysError { code } = e {
+            return code;
+        }
+        
+        error!("error: {}\nstack: {}", e, Backtrace::capture());
         match e {
-            MyError::SysError { code } => code,
-            other =>  {
-                error!("error: {}\nstack: {}", other, Backtrace::capture());
-                libc::EIO
-            },
+            MyError::NotFoundEntryError { .. } => libc::ENOENT,
+            MyError::NotFoundInoError { .. } => libc::ENOENT,
+            MyError::FileExistError { .. } => libc::EEXIST,
+            _ => libc::EIO,
         }
     }
 }

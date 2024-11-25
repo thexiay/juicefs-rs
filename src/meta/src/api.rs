@@ -36,6 +36,8 @@ pub type Ino = u64;
 
 pub trait InoExt {
     fn is_trash(&self) -> bool;
+    fn is_root_trash(&self) -> bool;
+    fn is_sub_trash(&self) -> bool;
     fn is_root(&self) -> bool;
     fn transfer_root(&self, real_root: Ino) -> Ino;
 }
@@ -43,6 +45,14 @@ pub trait InoExt {
 impl InoExt for Ino {
     fn is_trash(&self) -> bool {
         *self >= TRASH_INODE
+    }
+
+    fn is_root_trash(&self) -> bool {
+        *self == TRASH_INODE
+    }
+
+    fn is_sub_trash(&self) -> bool {
+        *self > TRASH_INODE
     }
 
     fn is_root(&self) -> bool {
@@ -432,7 +442,9 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// Unlink removes a file [entry] (not dirctory) from a directory.
     /// The file will be deleted if it's not linked by any entries and not open by any sessions.
     /// 
-    /// EPERM: if current user has no permission 
+    /// # Erorr
+    /// 
+    /// * `EPERM` - if current user has no permission 
     /// 
     /// [entry]: Entry
     async fn unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<()>;
@@ -471,10 +483,18 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         flags: RenameMask,
     ) -> FsResult<Option<(Ino, Attr)>>;
 
-    // Link creates an entry for node.
-    // inode_src: source inode
-    // parent + name: dst inode, parent is dst inode's parent inode, name is the link name
-    async fn link(&self, inode_src: Ino, parent: Ino, name: String, attr: &Attr) -> FsResult<()>;
+    /// Link create an hardlink (not dirctory) from a directory.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `inode`: source inode to be hard link
+    /// * `parent`: destination inode
+    /// * `name`: hard link name
+    /// 
+    /// # Return
+    /// 
+    /// return the inode and attributes of the new hard link entry.
+    async fn link(&self, inode: Ino, parent: Ino, name: &str) -> FsResult<Attr>;
 
     /// Readdir returns all entries for given directory, which include attributes if wantattr is true.
     /// This func will return "." and ".." entry as well.
