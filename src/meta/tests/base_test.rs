@@ -18,7 +18,7 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use juice_meta::api::{INodeType, ModeMask, RenameMask, SetAttrMask, ROOT_INODE};
+    use juice_meta::api::{INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE};
     use tracing::info;
 
     match m.get_attr(ROOT_INODE).await {
@@ -425,9 +425,32 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         Err(errno) if errno == libc::EINVAL => (),
         other => panic!("readlink d: {:?}", other),
     }
-    m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
+    let (inode, _) = m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
 
     // data test
+    // try to open a file that does not exist
+    match m.open(99999, OFlag::O_RDWR).await {
+        Err(errno) if errno == libc::ENOENT => (),
+        other => panic!("open not exist inode got {:?}, expected {}", other, libc::ENOENT),
+    }
+    let _ = m.open(inode, OFlag::O_RDWR).await.expect("open f: ");
+    /*
+    
+	if st := m.Open(ctx, 99999, syscall.O_RDWR, &Attr{}); st != syscall.ENOENT {
+		t.Fatalf("open not exist inode got %d, expected %d", st, syscall.ENOENT)
+	}
+	if st := m.Open(ctx, inode, syscall.O_RDWR, attr); st != 0 {
+		t.Fatalf("open f: %s", st)
+	}
+	_ = m.Close(ctx, inode)
+	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+		t.Fatalf("write chunk: %s", st)
+	}
+	var s = Slice{Id: sliceId, Size: 100, Len: 100}
+	if st := m.Write(ctx, inode, 0, 100, s, time.Now()); st != 0 {
+		t.Fatalf("write end: %s", st)
+	}
+     */
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {

@@ -19,17 +19,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, INodeType, Ino, InoExt, Meta, ModeMask, RenameMask, Session, SessionInfo,
-    SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE,
-    TRASH_NAME,
+    Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
 use crate::openfile::{OpenFiles, INVALIDATE_ATTR_ONLY};
-use crate::quota::{Quota, MetaQuota};
+use crate::quota::{MetaQuota, Quota};
 use crate::utils::{
-    access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem, FreeID, PLockItem
+    access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem,
+    FreeID, PLockItem,
 };
 
 pub const INODE_BATCH: i64 = 1 << 10;
@@ -268,18 +267,13 @@ pub trait MetaOtherFunction {
     async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>>;
 
     /// Immediately spawn a task to delete task
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `inode` - the inode to be delete  
     /// * `length` - the length this file shrink to
     /// * `delete_option` - the delete options, e.g. immerate or defer delete
-    async fn try_spawn_delete_file(
-        &self,
-        inode: Ino,
-        length: u64,
-        delete_option: DeleteFileOption,
-    );
+    async fn try_spawn_delete_file(&self, inode: Ino, length: u64, delete_option: DeleteFileOption);
 
     /// ------------------------------ remove func ------------------------------
     /// Remove specific entry of name in dir recursivly
@@ -359,7 +353,7 @@ pub struct CommonMeta {
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
     pub max_deleting: Arc<Semaphore>,
-    pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>,  // ino -> (atime, path)
+    pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>, // ino -> (atime, path)
     pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
     pub acl_cache: AsyncMutex<AclCache>,
     pub dir_stats_batch: Mutex<HashMap<Ino, DirStat>>,
@@ -563,7 +557,7 @@ where
                 let mut remove_files = base.removed_files.lock();
                 remove_files.insert(inode, true);
             }
-            DeleteFileOption::Immediate{ force } => {
+            DeleteFileOption::Immediate { force } => {
                 let mut meta = dyn_clone::clone_box(self);
                 meta.with_cancel(self.token().child_token());
                 let max_deleting = base.max_deleting.clone();
@@ -765,16 +759,17 @@ where
             return;
         }
 
-        let mut attr = if attr.is_none() {
-            let of = base.open_files.find(ino);
-            if let Some(of) = of {
-                let of = of.lock().await;
-                of.attr.clone()
-            } else {
-                Attr::default()
-            }
-        } else {
-            attr.unwrap()
+        let mut attr = match attr {
+            None => {
+                let of = base.open_files.find(ino);
+                if let Some(of) = of {
+                    let of = of.lock().await;
+                    of.attr.clone()
+                } else {
+                    Attr::default()
+                }
+            },
+            Some(attr) => attr,
         };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1615,7 +1610,8 @@ where
             let symlinks = base.symlinks.lock();
             if let Some((atime, path)) = symlinks.get(&inode) {
                 if let Some(atime) = atime {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
                         .expect("Time went backwards");
                     let attr = Attr {
                         atime: *atime,
@@ -1642,12 +1638,7 @@ where
     }
 
     // Symlink creates a symlink in a directory with given name.
-    async fn symlink(
-        &self,
-        parent: Ino,
-        name: &str,
-        target_path: &str,
-    ) -> FsResult<(Ino, Attr)> {
+    async fn symlink(&self, parent: Ino, name: &str, target_path: &str) -> FsResult<(Ino, Attr)> {
         if target_path.is_empty() || target_path.len() > MAX_SYMLINK {
             return SysSnafu { code: libc::ENOENT }.fail()?;
         }
@@ -1658,7 +1649,17 @@ where
 
         // mode of symlink is ignored in POSIX
         // do not care exists inode
-        self.mknod(parent, name, INodeType::Symlink, 0o777, 0, 0, target_path, &mut None).await
+        self.mknod(
+            parent,
+            name,
+            INodeType::Symlink,
+            0o777,
+            0,
+            0,
+            target_path,
+            &mut None,
+        )
+        .await
     }
 
     // Mknod creates a node in a directory with given name, type and permissions.
@@ -2005,7 +2006,10 @@ where
             self.update_dir_stats(parent, attr.length as i64, align_4k(attr.length), 1);
             self.update_quota(parent, align_4k(attr.length), 1).await;
         }
-        self.as_ref().open_files.invalidate_chunk(inode, INVALIDATE_ATTR_ONLY).await;
+        self.as_ref()
+            .open_files
+            .invalidate_chunk(inode, INVALIDATE_ATTR_ONLY)
+            .await;
         let attr = res?;
         Ok(attr)
     }
@@ -2094,8 +2098,47 @@ where
     }
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> FsResult<()> {
-        todo!()
+    async fn open(&self, inode: Ino, flags: OFlag) -> FsResult<Attr> {
+        if self.as_ref().conf.read_only
+            && flags.intersects(
+                OFlag::O_WRONLY
+                    .union(OFlag::O_RDWR)
+                    .union(OFlag::O_TRUNC)
+                    .union(OFlag::O_APPEND),
+            )
+        {
+            return Err(libc::EROFS);
+        }
+        // use cache if has cache
+        if let Some(attr) = self.as_ref().open_files.open_with_cache(inode).await {
+            self.touch_attr_atime(inode, Some(attr.clone())).await;
+            return Ok(attr);
+        }
+        
+        let mut attr = self.get_attr(inode).await?;
+        let mode_mask = match flags.intersection(OFlag::O_RDONLY.union(OFlag::O_WRONLY).union(OFlag::O_RDWR)) {
+            OFlag::O_RDONLY => ModeMask::READ,
+            OFlag::O_WRONLY => ModeMask::WRITE,
+            OFlag::O_RDWR => ModeMask::READ.union(ModeMask::WRITE),
+            _ => ModeMask::empty(),
+        };
+        self.access(inode, mode_mask, &attr).await?;
+        if attr.flags.intersects(Flag::IMMUTABLE) || attr.parent > TRASH_INODE {
+            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) {
+                return Err(libc::EPERM);
+            }
+        }
+        if attr.flags.intersects(Flag::APPEND) {
+            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) && !flags.intersects(OFlag::O_APPEND) {
+                return Err(libc::EPERM);
+            }
+            if flags.intersects(OFlag::O_TRUNC) {
+                return Err(libc::EPERM);
+            }
+        }
+        self.as_ref().open_files.open(inode, &mut attr).await;
+        Ok(attr)
+        
     }
 
     // Close a file.

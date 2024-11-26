@@ -50,7 +50,7 @@ impl OpenFiles {
         of
     }
 
-    /// Open a file. Hold a file locker.
+    /// Open a file directly.
     pub async fn open(&self, ino: Ino, attr: &mut Attr) {
         let of = {
             let mut files = self.files.lock();
@@ -72,6 +72,31 @@ impl OpenFiles {
         of.last_check = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards");
+    }
+
+    /// Open file using cache
+    pub async fn open_with_cache(&self, ino: Ino) -> Option<Attr> {
+        if self.expire == Duration::ZERO {
+            return None;
+        }
+
+        let file = {
+            let files = self.files.lock();
+            files.get(&ino).map(|file| file.clone())
+        };
+        if let Some(of) = file {
+            let mut of = of.lock().await;
+            if SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                - of.last_check
+                < self.expire
+            {
+                of.refs += 1;
+                return Some(of.attr.clone());
+            }
+        }
+        None
     }
 
     pub async fn is_open(&self, ino: Ino) -> bool {

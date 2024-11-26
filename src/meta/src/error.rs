@@ -79,6 +79,12 @@ pub enum MyError {
         #[snafu(implicit)]
         loc: snafu::Location,
     },
+    #[snafu(display("cann't found ({description}) in db, loc({loc})."))]
+    NotFoundError {
+        description: String,
+        #[snafu(implicit)]
+        loc: snafu::Location,
+    },
     // other
     #[snafu(display("Rename same error"))]
     RenameSameInoError,
@@ -103,12 +109,9 @@ pub type FsResult<T> = std::result::Result<T, Errno>;
 
 impl From<MyError> for Errno {
     fn from(e: MyError) -> Self {
-        if let MyError::SysError { code } = e {
-            return code;
-        }
-        
-        error!("error: {}\nstack: {}", e, Backtrace::capture());
+        error!("inner error: {}", e);
         match e {
+            MyError::SysError { code, .. } => code,
             MyError::NotFoundEntryError { .. } => libc::ENOENT,
             MyError::NotFoundInoError { .. } => libc::ENOENT,
             MyError::FileExistError { .. } => libc::EEXIST,

@@ -203,6 +203,14 @@ bitflags! {
         /// RESTORE: TODO: ????
         const RESTORE = 1 << 5;
     }
+
+    pub struct OFlag: u32 {
+        const O_RDONLY = 0 << 0;
+        const O_WRONLY = 1 << 0;
+        const O_RDWR = 1 << 1;
+        const O_TRUNC = 1 << 7;
+        const O_APPEND = 1 << 8;
+    }
 }
 
 // Attr represents attributes of a node.
@@ -518,8 +526,13 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         flags: i32,
     ) -> FsResult<(Ino, Attr)>;
 
-    // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: i32, attr: &mut Attr) -> FsResult<()>;
+    /// Open checks permission on a node and track it as open.
+    ///
+    /// # Arguments
+    /// 
+    /// * `inode`: inode of the node to be opened
+    /// * `flags`: open flags
+    async fn open(&self, inode: Ino, flags: OFlag) -> FsResult<Attr>;
 
     // Close a file.
     async fn close(&self, inode: Ino) -> FsResult<()>;

@@ -30,7 +30,7 @@ use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{
     ConnectionSnafu, FileExistSnafu, FsResult, MyError, NotFoundEntrySnafu, NotFoundInoSnafu,
-    RedisDetailSnafu, RenameSameInoSnafu, Result, SysSnafu,
+    NotFoundSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result, SysSnafu,
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::Quota;
@@ -1474,7 +1474,10 @@ impl Engine for RedisEngineWithCtx {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(inode)], {
-            let attr_bytes: Vec<u8> = conn.get(self.inode_key(inode)).await?;
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await?
+                .ok_or_else(|| libc::ENOENT)?;
             let attr: Attr = bincode::deserialize(&attr_bytes)?;
             Ok(Some(attr))
         })
@@ -1752,78 +1755,93 @@ impl Engine for RedisEngineWithCtx {
     async fn do_link(&self, inode: Ino, parent: Ino, name: &str) -> Result<Attr> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent), self.inode_key(inode)], {
-            let keys = vec![self.inode_key(parent), self.inode_key(inode)];
-            let rs: Vec<Option<Vec<u8>>> = conn.mget(&keys).await?;
-            if rs.len() != 2 {
-                error!("no attribute for inodes {keys:?}");
-                return SysSnafu { code: libc::ENOENT }.fail();
-            }
-            for (r, ino) in rs.iter().zip(keys.iter()) {
-                if r.is_none() {
-                    error!("no attribute for inode {}", ino);
+        async_transaction!(
+            conn,
+            &[
+                self.inode_key(parent),
+                self.entry_key(parent),
+                self.inode_key(inode)
+            ],
+            {
+                let keys = vec![self.inode_key(parent), self.inode_key(inode)];
+                let rs: Vec<Option<Vec<u8>>> = conn.mget(&keys).await?;
+                if rs.len() != 2 {
+                    error!("no attribute for inodes {keys:?}");
                     return SysSnafu { code: libc::ENOENT }.fail();
                 }
-            }
-            
-            let mut pattr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
-            if pattr.typ != INodeType::Directory {
-                return SysSnafu { code: libc::ENOTDIR }.fail();
-            }
-            if pattr.parent > TRASH_INODE {
-                return SysSnafu { code: libc::ENOENT }.fail();
-            }
-            self.access(parent, ModeMask::WRITE.union(ModeMask::EXECUTE), &pattr).await?;
-            if pattr.flags.intersects(Flag::IMMUTABLE) {
-                return SysSnafu { code: libc::EPERM }.fail();
-            }
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards");
-            let update_pattr = if now.as_nanos() - pattr.mtime >= self.meta.conf.skip_dir_mtime.as_nanos() {
-                pattr.mtime = now.as_nanos();
-                pattr.ctime = now.as_nanos();
-                true
-            } else {
-                false
-            };
-            let mut attr: Attr = bincode::deserialize(&rs[1].as_ref().unwrap())?;
-            if attr.typ == INodeType::Directory {
-                return SysSnafu { code: libc::EPERM }.fail();
-            }
-            if attr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)) {
-                return SysSnafu { code: libc::EPERM }.fail();
-            }
+                for (r, ino) in rs.iter().zip(keys.iter()) {
+                    if r.is_none() {
+                        error!("no attribute for inode {}", ino);
+                        return SysSnafu { code: libc::ENOENT }.fail();
+                    }
+                }
 
-            let old_parent = attr.parent;
-            attr.parent = 0;
-            attr.ctime = now.as_nanos();
-            attr.nlink += 1;
-            let entry: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
-            if entry.is_some() {
-                return SysSnafu { code: libc::EEXIST }.fail();
-            } else if self.meta.conf.case_insensi && self.resolve_case(parent, name).await?.is_some() {
-                return SysSnafu { code: libc::EEXIST }.fail();
-            }
+                let mut pattr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
+                if pattr.typ != INodeType::Directory {
+                    return SysSnafu {
+                        code: libc::ENOTDIR,
+                    }
+                    .fail();
+                }
+                if pattr.parent > TRASH_INODE {
+                    return SysSnafu { code: libc::ENOENT }.fail();
+                }
+                self.access(parent, ModeMask::WRITE.union(ModeMask::EXECUTE), &pattr)
+                    .await?;
+                if pattr.flags.intersects(Flag::IMMUTABLE) {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("Time went backwards");
+                let update_pattr =
+                    if now.as_nanos() - pattr.mtime >= self.meta.conf.skip_dir_mtime.as_nanos() {
+                        pattr.mtime = now.as_nanos();
+                        pattr.ctime = now.as_nanos();
+                        true
+                    } else {
+                        false
+                    };
+                let mut attr: Attr = bincode::deserialize(&rs[1].as_ref().unwrap())?;
+                if attr.typ == INodeType::Directory {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
+                if attr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)) {
+                    return SysSnafu { code: libc::EPERM }.fail();
+                }
 
-            let mut pipe = pipe();
-            pipe.atomic();
-            pipe.hset(
-                self.entry_key(parent),
-                name,
-                bincode::serialize(&(&attr.typ, inode)).unwrap(),
-            );
-            if update_pattr {
-                pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
+                let old_parent = attr.parent;
+                attr.parent = 0;
+                attr.ctime = now.as_nanos();
+                attr.nlink += 1;
+                let entry: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
+                if entry.is_some() {
+                    return SysSnafu { code: libc::EEXIST }.fail();
+                } else if self.meta.conf.case_insensi
+                    && self.resolve_case(parent, name).await?.is_some()
+                {
+                    return SysSnafu { code: libc::EEXIST }.fail();
+                }
+
+                let mut pipe = pipe();
+                pipe.atomic();
+                pipe.hset(
+                    self.entry_key(parent),
+                    name,
+                    bincode::serialize(&(&attr.typ, inode)).unwrap(),
+                );
+                if update_pattr {
+                    pipe.set(self.inode_key(parent), bincode::serialize(&pattr)?);
+                }
+                pipe.set(self.inode_key(inode), bincode::serialize(&attr)?);
+                if old_parent > 0 {
+                    pipe.hincr(self.parent_key(inode), old_parent.to_string(), 1);
+                }
+                pipe.hincr(self.parent_key(inode), parent.to_string(), 1);
+                pipe.exec_async(conn).await?;
+                Ok(Some(attr))
             }
-            pipe.set(self.inode_key(inode), bincode::serialize(&attr)?);
-            if old_parent > 0 {
-                pipe.hincr(self.parent_key(inode), old_parent.to_string(), 1);
-            }
-            pipe.hincr(self.parent_key(inode), parent.to_string(), 1);
-            pipe.exec_async(conn).await?;
-            Ok(Some(attr))
-        })
+        )
     }
 
     async fn do_unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Attr> {
@@ -1832,7 +1850,9 @@ impl Engine for RedisEngineWithCtx {
         } else {
             None
         };
-        trash.as_ref().inspect(|trash_ino| info!("do unlink produce new trash: {}", trash_ino));
+        trash
+            .as_ref()
+            .inspect(|trash_ino| info!("do unlink produce new trash: {}", trash_ino));
         let base_meta = self.as_ref();
         if let Some(trash_ino) = trash {
             base_meta
@@ -2202,7 +2222,7 @@ impl Engine for RedisEngineWithCtx {
             let path: Option<String> = conn.get(self.sym_key(inode)).await?;
             return Ok((None, path.unwrap_or(String::from(""))));
         }
-        
+
         async_transaction!(conn, &[self.inode_key(inode)], {
             let keys = [self.inode_key(inode), self.sym_key(inode)];
             let rs: Vec<Option<Vec<u8>>> = conn.get(&keys).await?;
@@ -2218,16 +2238,14 @@ impl Engine for RedisEngineWithCtx {
                 return SysSnafu { code: libc::EINVAL }.fail();
             }
             let path = match &rs[1] {
-                Some(path) => {
-                    match String::from_utf8(path.clone()) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            error!("Invalid symbol path: {:?}", e);
-                            continue;
-                        }
+                Some(path) => match String::from_utf8(path.clone()) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        error!("Invalid symbol path: {:?}", e);
+                        continue;
                     }
                 },
-                None => return SysSnafu { code: libc::EIO }.fail(),  
+                None => return SysSnafu { code: libc::EIO }.fail(),
             };
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2235,7 +2253,7 @@ impl Engine for RedisEngineWithCtx {
             if !self.atime_need_update(&attr, now) {
                 return Ok((None, path));
             }
-            
+
             attr.atime = now.as_nanos();
             let mut pipe = pipe();
             pipe.atomic();
@@ -2591,7 +2609,8 @@ impl Engine for RedisEngineWithCtx {
                     pipe.hdel(self.entry_key(parent_src), name_src);
                     if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
                         && let Some(ref attr_dst) = exists_attr_dst
-                    {  // do replace
+                    {
+                        // do replace
                         let (typ_dst, ino_dst) = (typ_dst.clone(), ino_dst.clone());
                         if let Some(trash_ino) = trash {
                             pipe.set(
@@ -2663,7 +2682,10 @@ impl Engine for RedisEngineWithCtx {
                 // update parent src ino
                 if parent_dst != parent_src {
                     if parent_src.is_trash() && update_parent_src {
-                        pipe.set(self.inode_key(parent_src), bincode::serialize(&pattr_src).unwrap());
+                        pipe.set(
+                            self.inode_key(parent_src),
+                            bincode::serialize(&pattr_src).unwrap(),
+                        );
                     }
                     if attr_src.parent == 0 {
                         pipe.hincr(self.parent_key(ino_src), parent_dst, 1);
