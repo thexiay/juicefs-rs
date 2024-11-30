@@ -3,6 +3,7 @@
 #![feature(associated_type_defaults)]
 #![feature(duration_constructors)]
 #![feature(async_fn_traits)]
+#![feature(if_let_guard)]
 
 pub mod config;
 pub mod error;

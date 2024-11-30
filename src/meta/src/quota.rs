@@ -6,7 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::{INodeType, Ino, Meta, Summary, ROOT_INODE};
 use crate::base::{CommonMeta, DirStat, Engine};
-use crate::error::{MyError, Result, SysSnafu};
+use crate::error::{NoSpaceSnafu, QuotaExceededSnafu, Result};
 use crate::utils::align_4k;
 
 #[derive(Default, Debug)]
@@ -153,7 +153,7 @@ where
                 + space
                 > (format.capacity as i64)
         {
-            return SysSnafu { code: libc::ENOSPC }.fail();
+            return NoSpaceSnafu.fail()?;
         }
         if inodes > 0
             && format.inodes > 0
@@ -162,14 +162,14 @@ where
                 + inodes
                 > (format.capacity as i64)
         {
-            return SysSnafu { code: libc::ENOSPC }.fail();
+            return NoSpaceSnafu.fail()?;
         }
         if !format.enable_dir_stats {
             return Ok(());
         }
         for ino in parents {
             if self.check_quota(ino, space, inodes).await {
-                return SysSnafu { code: libc::EDQUOT }.fail();
+                return QuotaExceededSnafu.fail()?;
             }
         }
         Ok(())
@@ -385,11 +385,14 @@ where
                 continue;
             }
             match self.get_dir_summary(entry.inode, recursive, strict).await {
-                Err(MyError::SysError { code }) if code == libc::ENOENT => {
-                    info!("inode({}) not found at collect summary", entry.inode);
-                }
                 Ok(sum) => summary += sum,
-                Err(e) => return Err(e),
+                Err(err) => {
+                    if err.is_no_entry_found2(&entry.inode) {
+                        warn!("inode({}) not found at collect summary", entry.inode);
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
         }
         Ok(summary)

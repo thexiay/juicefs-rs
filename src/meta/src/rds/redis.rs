@@ -9,7 +9,8 @@ use redis::{
     IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, Value,
 };
 use regex::Regex;
-use snafu::{ensure, FromString, ResultExt};
+use snafu::{ensure, whatever, FromString, ResultExt};
+use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -27,10 +28,9 @@ use crate::base::{
     TrashSliceScan, NEXT_CHUNK, NEXT_INODE, TOTAL_INODES, USED_SPACE,
 };
 use crate::config::{Config, Format};
-use crate::context::{UserExt, WithContext};
+use crate::context::{Uid, UserExt, WithContext};
 use crate::error::{
-    ConnectionSnafu, FileExistSnafu, FsResult, MyError, NotFoundEntrySnafu, NotFoundInoSnafu,
-    NotFoundSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result, SysSnafu,
+    ConnectionSnafu, DirNotEmptySnafu, EntryExistsSnafu, InvalidArgSnafu, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu, OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::Quota;
@@ -115,7 +115,7 @@ local function resolve(parent, path, uid, gids)
         elseif _type ~= 2 then
             error("ENOTDIR")
         elseif parent > 1 and not can_access(parent, uid, gids) then 
-            error("EACCESS")
+            error("EACCES")
         end
         _type, parent = lookup(parent, name)
     end
@@ -127,6 +127,25 @@ end
 
 return resolve(tonumber(KEYS[1]), KEYS[2], tonumber(KEYS[3]), ARGV)
 "#;
+
+#[derive(Clone)]
+enum LuaScriptArg {
+    Lookup { parent: Ino, name: String },
+    Resolve { parent: Ino, name: String, uid: Uid },
+}
+
+impl Display for LuaScriptArg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LuaScriptArg::Lookup { parent, name } => {
+                write!(f, "lookup(parent:{},name:{})", parent, name)
+            }
+            LuaScriptArg::Resolve { parent, name, uid } => {
+                write!(f, "resolve(parent:{},name:{},uid:{})", parent, name, uid)
+            }
+        }
+    }
+}
 
 /**
  * conn: ConnectionLike
@@ -212,7 +231,8 @@ impl RedisEngine {
     }
 
     async fn exclusive_conn(&self) -> Result<Object<RedisClient>> {
-        self.pool.get().await.context(ConnectionSnafu)
+        let conn = self.pool.get().await.context(ConnectionSnafu)?;
+        Ok(conn)
     }
 
     fn share_conn(&self) -> ConnectionManager {
@@ -679,8 +699,7 @@ impl RedisEngineWithCtx {
         let cmds = from_redis_value::<Option<Vec<u8>>>(&res[0])?;
         match cmds {
             None => {
-                error!("Missing acl id: {}", id);
-                SysSnafu { code: libc::EIO }.fail()
+                whatever!("Missing acl id: {}", id);
             }
             Some(cmds) => {
                 let rule: Rule = bincode::deserialize(&cmds)?;
@@ -756,7 +775,7 @@ impl RedisEngineWithCtx {
                 let is_flock = lock.starts_with("lockf");
                 let inode = lock[self.prefix.len() + 5..]
                     .parse::<u64>()
-                    .with_whatever_context::<_, String, MyError>(|err| {
+                    .with_whatever_context::<_, String, MetaErrorEnum>(|err| {
                         format!(
                             "SMEMBERS {}. fill session {}, semember {}",
                             self.locked(sid),
@@ -794,8 +813,11 @@ impl RedisEngineWithCtx {
     }
 
     /// find inode by parent and name first, then find it by resolve second
-    /// return (ino, attr), name could be different if case insensitive
-    async fn do_fallback_resolve(
+    ///
+    /// # returns
+    ///
+    /// (ino_type, ino, name): name could be different if case insensitive
+    async fn do_lookup_entry(
         &self,
         conn: &mut impl AsyncCommands,
         parent: Ino,
@@ -807,78 +829,85 @@ impl RedisEngineWithCtx {
         {
             Some(buf) => {
                 let (typ, ino) = bincode::deserialize(&buf)
-                    .with_whatever_context::<_, _, MyError>(|_| {
+                    .with_whatever_context::<_, _, MetaErrorEnum>(|_| {
                         format!("HGET {} {}", self.entry_key(parent), name)
                     })?;
                 Ok((typ, ino, name.to_owned()))
             }
             None => {
                 if self.meta.conf.case_insensi {
-                    if let Some(entry) = self.resolve_case(parent, name).await? {
+                    if let Some(entry) = self.lookup_ignore_ascii_case(parent, name).await? {
                         Ok((entry.attr.typ, entry.inode, entry.name.to_string()))
                     } else {
-                        NotFoundEntrySnafu {
-                            parent: parent,
-                            name: name.to_string(),
-                        }
-                        .fail()
+                        NoEntryFoundSnafu { parent, name }.fail()?
                     }
                 } else {
-                    NotFoundEntrySnafu {
-                        parent: parent,
-                        name: name.to_string(),
-                    }
-                    .fail()
+                    NoEntryFoundSnafu { parent, name }.fail()?
                 }
             }
         }
     }
 
-    fn handle_script_result(op: &str, result: RedisResult<Value>) -> FsResult<(Ino, Attr)> {
+    fn handle_script_result(arg: LuaScriptArg, result: RedisResult<Value>) -> Result<(Ino, Attr)> {
         match result {
             Ok(value) => match value {
                 Value::Array(res) => {
-                    if res.len() != 2 {
-                        error!("invalid script op({}) result: {:?}", op, res);
-                        return Err(libc::ENOTSUP);
-                    }
+                    ensure!(
+                        res.len() == 2,
+                        OpNotSupportedSnafu {
+                            op: format!("lua script({arg}) return len err")
+                        }
+                    );
                     if let Value::Int(ino) = res[0]
                         && let Value::BulkString(ref attr) = res[1]
                     {
                         match bincode::deserialize(attr) {
                             Ok(attr) => Ok((ino as u64, attr)),
-                            Err(err) => {
-                                error!("deserialize attr error for script op({}): {}", op, err);
-                                Err(libc::EIO)
+                            Err(err) => OpNotSupportedSnafu {
+                                op: format!("lua script({arg}) return deser err {err}"),
                             }
+                            .fail()?,
                         }
                     } else {
-                        error!("invalid script op({}) result: {:?}", op, res);
-                        Err(libc::ENOTSUP)
+                        OpNotSupportedSnafu {
+                            op: format!("lua script({arg}) return output type err: {res:?}"),
+                        }
+                        .fail()?
                     }
                 }
-                other => {
-                    error!("invalid script op({}) result: {:?}", op, other);
-                    Err(libc::ENOTSUP)
+                other => OpNotSupportedSnafu {
+                    op: format!("lua script({arg}) return output err: {other:?}"),
                 }
+                .fail()?,
             },
             Err(error) => {
                 if let Some(detail) = error.detail() {
+                    let (parent, name) = match arg.clone() {
+                        LuaScriptArg::Lookup { parent, name } => (parent, name),
+                        LuaScriptArg::Resolve { parent, name, .. } => (parent, name),
+                    };
                     if detail.contains("ENOENT") {
-                        Err(libc::ENOENT)
+                        NoEntryFoundSnafu { parent, name }.fail()?
                     } else if detail.contains("ENOTSUP") {
-                        Err(libc::ENOTSUP)
+                        OpNotSupportedSnafu {
+                            op: format!("lua script({arg}) invoke err"),
+                        }
+                        .fail()?
                     } else if detail.contains("EACCES") {
-                        Err(libc::EACCES)
+                        return PermissionDeniedSnafu { ino: parent }.fail()?;
                     } else if detail.contains("ENOTDIR") {
-                        Err(libc::ENOTDIR)
+                        NotDir1Snafu { parent, name }.fail()?
                     } else {
-                        warn!("unexpected error for script op({}), {}", op, error);
-                        Err(libc::ENOTSUP)
+                        OpNotSupportedSnafu {
+                            op: format!("lua script({arg}) return redis err: {error}"),
+                        }
+                        .fail()?
                     }
                 } else {
-                    error!("invalid script op({}) result: {:?}", op, error);
-                    Err(libc::ENOTSUP)
+                    OpNotSupportedSnafu {
+                        op: format!("lua script({arg}) return redis err: {error}"),
+                    }
+                    .fail()?
                 }
             }
         }
@@ -936,7 +965,7 @@ impl Engine for RedisEngineWithCtx {
     }
 
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64> {
-        ensure!(!self.meta.conf.read_only, SysSnafu { code: libc::EROFS });
+        ensure!(!self.meta.conf.read_only, ReadFSSnafu);
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let name_lower = name.to_lowercase();
@@ -1277,7 +1306,7 @@ impl Engine for RedisEngineWithCtx {
                             .expect("error parse");
                         ch.send(Cchunk::new(inode, indx, cnt as isize))
                             .await
-                            .map_err(|_| MyError::SendError)?;
+                            .map_err(|_| MetaErrorEnum::SendError)?;
                     }
                     _ => error!("No way to happen for chunk key: {}", key),
                 }
@@ -1477,7 +1506,7 @@ impl Engine for RedisEngineWithCtx {
             let attr_bytes = conn
                 .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
                 .await?
-                .ok_or_else(|| libc::ENOENT)?;
+                .ok_or_else(|| NoEntryFound2Snafu { ino: inode }.build())?;
             let attr: Attr = bincode::deserialize(&attr_bytes)?;
             Ok(Some(attr))
         })
@@ -1493,15 +1522,19 @@ impl Engine for RedisEngineWithCtx {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(inode)], {
-            let attr_bytes: Vec<u8> =
-                conn.get(self.inode_key(inode))
-                    .await
-                    .context(RedisDetailSnafu {
-                        detail: format!("get attr for inode {}", inode),
-                    })?;
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await
+                .with_context(|_| RedisDetailSnafu {
+                    detail: format!("get attr for inode {}", inode),
+                })?
+                .ok_or_else(|| NoEntryFound2Snafu { ino: inode }.build())?;
             let cur: Attr = bincode::deserialize(&attr_bytes)?;
             if cur.parent > TRASH_INODE {
-                return SysSnafu { code: libc::EPERM }.fail();
+                return OpNotPermittedSnafu {
+                    op: format!("set_attr: rm trash without root user."),
+                }
+                .fail()?;
             }
 
             let now = SystemTime::now()
@@ -1537,19 +1570,31 @@ impl Engine for RedisEngineWithCtx {
                 .arg(name);
 
             // only handle ENOTSUP, fallback to normal lookup
-            match RedisEngineWithCtx::handle_script_result(
-                &format!("lookup parent: {parent} name: {name}"),
-                cmd.query_async(&mut conn).await,
-            ) {
+            let arg = LuaScriptArg::Lookup {
+                parent,
+                name: name.to_string(),
+            };
+            match RedisEngineWithCtx::handle_script_result(arg, cmd.query_async(&mut conn).await) {
                 Ok((ino, attr)) => return Ok((ino, attr)),
-                Err(errno) if errno != libc::ENOTSUP => return SysSnafu { code: errno }.fail(),
-                _ => (),
+                Err(err) => {
+                    if err.is_op_not_supported() {
+                        warn!("invoke script err: {err}");
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
         }
 
         let buf: Vec<u8> = match conn.hget(self.entry_key(parent), name).await? {
             Some(buf) => buf,
-            None => return NotFoundEntrySnafu { parent, name }.fail(),
+            None => {
+                return NoEntryFoundSnafu {
+                    parent,
+                    name: name.to_string(),
+                }
+                .fail()?
+            }
         };
         let (ino_type, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
         let attr_bytes: Option<Vec<u8>> = conn.get(self.inode_key(ino)).await?;
@@ -1571,10 +1616,10 @@ impl Engine for RedisEngineWithCtx {
 
     async fn do_resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)> {
         if self.meta.conf.case_insensi || !self.prefix.is_empty() {
-            return SysSnafu {
-                code: libc::ENOTSUP,
+            return OpNotSupportedSnafu {
+                op: "cannot resolve if case insensi or prefix is not empty",
             }
-            .fail();
+            .fail()?;
         }
 
         let mut conn = self.share_conn();
@@ -1583,16 +1628,19 @@ impl Engine for RedisEngineWithCtx {
         let mut cmd = cmd("EVALSHA");
         cmd.arg(&self.resolve_script_sha)
             .arg(3)
-            .arg(parent.to_string())
-            .arg(path.to_string())
-            .arg(format!("{}", self.uid()));
+            .arg(parent)
+            .arg(path)
+            .arg(self.uid());
         for gid in self.gids() {
             cmd.arg(gid.to_string());
         }
-        let (ino, attr) = RedisEngineWithCtx::handle_script_result(
-            &format!("resolve parent: {parent}, pat: {path}"),
-            cmd.query_async(&mut conn).await,
-        )?;
+        let arg = LuaScriptArg::Resolve {
+            parent,
+            name: path.to_string(),
+            uid: *self.uid(),
+        };
+        let (ino, attr) =
+            RedisEngineWithCtx::handle_script_result(arg, cmd.query_async(&mut conn).await)?;
         Ok((ino, attr))
     }
 
@@ -1608,21 +1656,28 @@ impl Engine for RedisEngineWithCtx {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
-            let pattr_bytes: Vec<u8> = conn.get(self.inode_key(parent)).await?;
-            let mut pattr: Attr = bincode::deserialize(&pattr_bytes)?;
+            let pattr_bytes: Option<Vec<u8>> = conn.get(self.inode_key(parent)).await?;
+            if pattr_bytes.is_none() {
+                return NoEntryFound2Snafu { ino: parent }.fail()?;
+            }
+            let mut pattr: Attr = bincode::deserialize(&pattr_bytes.unwrap())?;
             if pattr.typ != INodeType::Directory {
-                return SysSnafu {
-                    code: libc::ENOTDIR,
-                }
-                .fail();
+                return NotDir2Snafu { ino: parent }.fail()?;
             }
             if pattr.parent > TRASH_INODE {
-                return SysSnafu { code: libc::ENOENT }.fail();
+                return NoEntryFoundSnafu {
+                    parent,
+                    name: name.to_string(),
+                }
+                .fail()?;
             }
             self.access(parent, ModeMask::WRITE, &pattr).await?;
-            if !(Flag::IMMUTABLE & pattr.flags).is_empty() {
-                return SysSnafu { code: libc::EPERM }.fail();
-            }
+            ensure!(
+                !pattr.flags.intersects(Flag::IMMUTABLE),
+                OpNotPermittedSnafu {
+                    op: format!("mknod: mknod in an immutable dir."),
+                }
+            );
 
             // check exists
             let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
@@ -1632,7 +1687,7 @@ impl Engine for RedisEngineWithCtx {
                     Some((ino_type, ino))
                 }
                 None if self.meta.conf.case_insensi => self
-                    .resolve_case(parent, name)
+                    .lookup_ignore_ascii_case(parent, name)
                     .await?
                     .map(|entry| (entry.attr.typ, entry.inode)),
                 None => None,
@@ -1657,11 +1712,13 @@ impl Engine for RedisEngineWithCtx {
                     }
                     _ => attr.clone(),
                 };
-                return FileExistSnafu {
-                    ino: found_ino,
-                    attr: found_attr,
+                return EntryExistsSnafu {
+                    parent,
+                    name: name.to_string(),
+                    exist_ino: found_ino,
+                    exist_attr: Some(found_attr),
                 }
-                .fail();
+                .fail()?;
             };
 
             // acl mode search
@@ -1676,7 +1733,7 @@ impl Engine for RedisEngineWithCtx {
                 // set access acl by parent's default acl
                 let rule = match self.get_acl(conn, pattr.default_acl).await? {
                     Some(rule) => rule,
-                    None => return SysSnafu { code: libc::EIO }.fail(),
+                    None => whatever!("can't find parent({parent}) acl"),
                 };
                 if rule.is_minimal() {
                     attr.mode &= 0xFE00 | rule.get_mode();
@@ -1767,30 +1824,30 @@ impl Engine for RedisEngineWithCtx {
                 let rs: Vec<Option<Vec<u8>>> = conn.mget(&keys).await?;
                 if rs.len() != 2 {
                     error!("no attribute for inodes {keys:?}");
-                    return SysSnafu { code: libc::ENOENT }.fail();
+                    whatever!("Illigal len for mget {keys:?}, {:?}", keys);
                 }
-                for (r, ino) in rs.iter().zip(keys.iter()) {
-                    if r.is_none() {
-                        error!("no attribute for inode {}", ino);
-                        return SysSnafu { code: libc::ENOENT }.fail();
-                    }
+                if rs[0].is_none() {
+                    return NoEntryFound2Snafu { ino: parent }.fail()?;
+                }
+                if rs[1].is_none() {
+                    return NoEntryFound2Snafu { ino: inode }.fail()?;
                 }
 
                 let mut pattr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
                 if pattr.typ != INodeType::Directory {
-                    return SysSnafu {
-                        code: libc::ENOTDIR,
-                    }
-                    .fail();
+                    return NotDir2Snafu { ino: parent }.fail()?;
                 }
                 if pattr.parent > TRASH_INODE {
-                    return SysSnafu { code: libc::ENOENT }.fail();
+                    return NoEntryFound2Snafu { ino: parent }.fail()?;
                 }
                 self.access(parent, ModeMask::WRITE.union(ModeMask::EXECUTE), &pattr)
                     .await?;
-                if pattr.flags.intersects(Flag::IMMUTABLE) {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
+                ensure!(
+                    !pattr.flags.intersects(Flag::IMMUTABLE),
+                    OpNotPermittedSnafu {
+                        op: format!("link in an immutable dir."),
+                    }
+                );
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .expect("Time went backwards");
@@ -1803,24 +1860,48 @@ impl Engine for RedisEngineWithCtx {
                         false
                     };
                 let mut attr: Attr = bincode::deserialize(&rs[1].as_ref().unwrap())?;
-                if attr.typ == INodeType::Directory {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
-                if attr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)) {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
+                ensure!(
+                    attr.typ != INodeType::Directory,
+                    OpNotPermittedSnafu {
+                        op: format!("link an directory."),
+                    }
+                );
+                ensure!(
+                    !attr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)),
+                    OpNotPermittedSnafu {
+                        op: format!("link target has flag append or immutable."),
+                    }
+                );
 
                 let old_parent = attr.parent;
                 attr.parent = 0;
                 attr.ctime = now.as_nanos();
                 attr.nlink += 1;
                 let entry: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
-                if entry.is_some() {
-                    return SysSnafu { code: libc::EEXIST }.fail();
-                } else if self.meta.conf.case_insensi
-                    && self.resolve_case(parent, name).await?.is_some()
-                {
-                    return SysSnafu { code: libc::EEXIST }.fail();
+                match entry {
+                    Some(buf) => {
+                        let (typ, ino): (INodeType, Ino) = bincode::deserialize(&buf)?;
+                        return EntryExistsSnafu {
+                            parent,
+                            name: name.to_string(),
+                            exist_ino: inode,
+                            exist_attr: None,
+                        }
+                        .fail()?;
+                    }
+                    None if self.meta.conf.case_insensi
+                        && let Some(entry) =
+                            self.lookup_ignore_ascii_case(parent, name).await? =>
+                    {
+                        return EntryExistsSnafu {
+                            parent,
+                            name: name.to_string(),
+                            exist_ino: entry.inode,
+                            exist_attr: Some(entry.attr),
+                        }
+                        .fail()?;
+                    }
+                    _ => (),
                 }
 
                 let mut pipe = pipe();
@@ -1865,26 +1946,13 @@ impl Engine for RedisEngineWithCtx {
         let conn = pool_conn.deref_mut();
         let (space_guage, ino_cnt_guage, should_del, open_session_id, ino, attr) =
             async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
-                let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
-                let (buf, name) = match buf {
-                    Some(entry) => (entry, name.to_owned()),
-                    None if base_meta.conf.case_insensi => {
-                        if let Some(entry) = self.resolve_case(parent, name).await? {
-                            (
-                                bincode::serialize(&(entry.attr.typ, entry.inode)).unwrap(),
-                                entry.name.to_string(),
-                            )
-                        } else {
-                            return NotFoundInoSnafu { ino: parent }.fail();
-                        }
+                let (typ, ino, name) = self.do_lookup_entry(conn, parent, name).await?;
+                ensure!(
+                    typ != INodeType::Directory,
+                    OpNotPermittedSnafu {
+                        op: format!("unlink target is an directory."),
                     }
-                    None => return NotFoundInoSnafu { ino: parent }.fail(),
-                };
-
-                let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
-                if typ == INodeType::Directory {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
+                );
 
                 // first find ino by parent ino and son name, then watch it
                 cmd("WATCH")
@@ -1897,16 +1965,19 @@ impl Engine for RedisEngineWithCtx {
                 let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
                 // double check: parent mut be a dir and access mode
                 if pattr.typ != INodeType::Directory {
-                    return SysSnafu {
-                        code: libc::ENOTDIR,
+                    return NotDir2Snafu {
+                        ino: parent,
                     }
-                    .fail();
+                    .fail()?;
                 }
                 self.access(parent, ModeMask::WRITE | ModeMask::EXECUTE, &pattr)
                     .await?;
-                if pattr.flags.contains(Flag::APPEND) || pattr.flags.contains(Flag::IMMUTABLE) {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
+                ensure!(
+                    !pattr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)),
+                    OpNotPermittedSnafu {
+                        op: "unlink dir is append or immutable.",
+                    }
+                );
 
                 // change time
                 let mut update_parent = false;
@@ -1932,12 +2003,14 @@ impl Engine for RedisEngineWithCtx {
                             && uid != pattr.uid
                             && uid != attr.uid
                         {
-                            return SysSnafu { code: libc::EACCES }.fail();
+                            return PermissionDeniedSnafu { ino: parent }.fail()?;
                         }
-                        if attr.flags.contains(Flag::APPEND) || attr.flags.contains(Flag::IMMUTABLE)
-                        {
-                            return SysSnafu { code: libc::EPERM }.fail();
-                        }
+                        ensure!(
+                            !attr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)),
+                            OpNotPermittedSnafu {
+                                op: "unlink file is append or immutable.",
+                            }
+                        );
                         // check if trash ino and name already exists, don't repeat generate
                         if let Some(trash_ino) = trash
                             && attr.nlink > 1
@@ -1996,7 +2069,7 @@ impl Engine for RedisEngineWithCtx {
                         pipe.hset(
                             self.entry_key(trash_ino),
                             self.trash_entry(parent, ino, &name),
-                            buf,
+                            bincode::serialize(&(typ, ino)).unwrap(),
                         );
                         if attr.parent == 0 {
                             pipe.hincr(self.parent_key(ino), trash_ino.to_string(), 1);
@@ -2053,7 +2126,7 @@ impl Engine for RedisEngineWithCtx {
                     guaga
                 };
                 pipe.query_async(conn).await?;
-                Ok::<Option<_>, MyError>(Some((
+                Ok::<Option<_>, MetaErrorEnum>(Some((
                     guaga.0,
                     guaga.1,
                     should_del,
@@ -2088,32 +2161,11 @@ impl Engine for RedisEngineWithCtx {
 
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        let base = self.as_ref();
         let ino = async_transaction!(conn, &[self.inode_key(parent), self.entry_key(parent)], {
             // TODO: here is same with unlink
-            let buf: Option<Vec<u8>> = conn.hget(self.entry_key(parent), name).await?;
-            let (buf, name) = match buf {
-                Some(entry) => (entry, name.to_owned()),
-                None if base.conf.case_insensi => {
-                    if let Some(entry) = self.resolve_case(parent, name).await? {
-                        (
-                            bincode::serialize(&(entry.attr.typ, entry.inode)).unwrap(),
-                            entry.name.to_string(),
-                        )
-                    } else {
-                        return NotFoundInoSnafu { ino: parent }.fail();
-                    }
-                }
-                None => return NotFoundInoSnafu { ino: parent }.fail(),
-            };
-
-            let (typ, ino): (INodeType, Ino) = bincode::deserialize::<(INodeType, Ino)>(&buf)?;
-
+            let (typ, ino, _) = self.do_lookup_entry(conn, parent, name).await?;
             if typ != INodeType::Directory {
-                return SysSnafu {
-                    code: libc::ENOTDIR,
-                }
-                .fail();
+                return NotDir1Snafu { parent, name }.fail()?;
             }
             // first find ino by parent ino and son name, then watch it
             cmd("WATCH")
@@ -2126,16 +2178,16 @@ impl Engine for RedisEngineWithCtx {
             let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
             // double check: parent mut be a dir and access mode
             if pattr.typ != INodeType::Directory {
-                return SysSnafu {
-                    code: libc::ENOTDIR,
-                }
-                .fail();
+                return NotDir2Snafu { ino }.fail()?;
             }
             self.access(parent, ModeMask::WRITE | ModeMask::EXECUTE, &pattr)
                 .await?;
-            if pattr.flags.contains(Flag::APPEND) || pattr.flags.contains(Flag::IMMUTABLE) {
-                return SysSnafu { code: libc::EPERM }.fail();
-            }
+            ensure!(
+                !pattr.flags.intersects(Flag::APPEND.union(Flag::IMMUTABLE)),
+                OpNotPermittedSnafu {
+                    op: "rm dir is append or immutable.",
+                }
+            );
 
             // change time
             let now = SystemTime::now()
@@ -2148,21 +2200,15 @@ impl Engine for RedisEngineWithCtx {
 
             let cnt: u64 = conn.hlen(self.entry_key(ino)).await?;
             if cnt > 0 {
-                return SysSnafu {
-                    code: libc::ENOTEMPTY,
-                }
-                .fail();
+                return DirNotEmptySnafu { parent, name }.fail()?;
             }
             let attr = match attr_bytes {
                 Some(attr_bytes) => {
                     let mut attr = bincode::deserialize::<Attr>(&attr_bytes)?;
                     let uid = self.uid().clone();
-                    if !uid.is_root()
-                        && pattr.mode & 0o1000 != 0
-                        && uid != pattr.uid
-                        && uid != attr.uid
-                    {
-                        return SysSnafu { code: libc::EACCES }.fail();
+                    if !uid.is_root() && pattr.mode & 0o1000 != 0 {
+                        ensure!(uid == pattr.uid, PermissionDeniedSnafu { ino: pattr.uid });
+                        ensure!(uid == attr.uid, PermissionDeniedSnafu { ino: attr.uid });
                     }
                     if let Some(trash_ino) = trash {
                         attr.ctime = now;
@@ -2190,7 +2236,7 @@ impl Engine for RedisEngineWithCtx {
                     pipe.hset(
                         self.entry_key(trash_ino),
                         self.trash_entry(parent, ino, &name),
-                        buf,
+                        bincode::serialize(&(typ, ino)).unwrap(),
                     );
                 }
                 None => {
@@ -2207,7 +2253,7 @@ impl Engine for RedisEngineWithCtx {
             pipe.hdel(self.dir_quota_used_space_key(), ino);
             pipe.hdel(self.dir_quota_used_inodes_key(), ino);
             pipe.query_async(conn).await?;
-            Ok::<Option<u64>, MyError>(Some(ino))
+            Ok::<Option<u64>, MetaErrorEnum>(Some(ino))
         })?;
         if trash.is_none() {
             self.update_stats(-utils::align_4k(0), -1).await;
@@ -2227,16 +2273,16 @@ impl Engine for RedisEngineWithCtx {
             let keys = [self.inode_key(inode), self.sym_key(inode)];
             let rs: Vec<Option<Vec<u8>>> = conn.get(&keys).await?;
             if rs.len() != 2 {
-                error!("no attribute for inodes {keys:?}");
-                return SysSnafu { code: libc::ENOENT }.fail();
+                whatever!("Illigal len for mget {keys:?}, {:?}", keys);
             }
-            if rs[0].is_none() {
-                return SysSnafu { code: libc::ENOENT }.fail();
-            }
+            ensure!(rs[0].is_some(), NoEntryFound2Snafu { ino: inode });
             let mut attr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
-            if attr.typ != INodeType::Symlink {
-                return SysSnafu { code: libc::EINVAL }.fail();
-            }
+            ensure!(
+                attr.typ == INodeType::Symlink,
+                InvalidArgSnafu {
+                    arg: format!("inode({}) is not a symlink", inode)
+                }
+            );
             let path = match &rs[1] {
                 Some(path) => match String::from_utf8(path.clone()) {
                     Ok(path) => path,
@@ -2245,7 +2291,7 @@ impl Engine for RedisEngineWithCtx {
                         continue;
                     }
                 },
-                None => return SysSnafu { code: libc::EIO }.fail(),
+                None => whatever!("symlink path is empty"),
             };
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2365,22 +2411,35 @@ impl Engine for RedisEngineWithCtx {
         let (ino_src, attr_src, exists_entry, trash, delete_option, new_space, new_inode) =
             async_transaction!(conn, &watch_keys, {
                 let (typ_src, ino_src, name_src) =
-                    self.do_fallback_resolve(conn, parent_src, name_src).await?;
+                    self.do_lookup_entry(conn, parent_src, name_src).await?;
                 // because maybe case insensitive, so we need to check after lookup
                 if parent_src == parent_dst && name_src == name_dst {
-                    return RenameSameInoSnafu.fail();
+                    return RenameSameInoSnafu.fail()?;
                 }
                 let mut watch_keys = vec![self.inode_key(ino_src)];
-                let exists_dst = match self.do_fallback_resolve(conn, parent_dst, name_dst).await {
+                let exists_dst = match self.do_lookup_entry(conn, parent_dst, name_dst).await {
                     Ok((typ, ino, name)) => Some((typ, ino, name)),
-                    Err(MyError::NotFoundEntryError { .. }) => None,
-                    Err(e) => return Err(e),
+                    Err(err) => {
+                        if let MetaErrorEnum::NoEntryFound { parent, name } = err.inner()
+                            && *parent == parent_dst
+                            && name == name_dst
+                        {
+                            None
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 };
                 let mut trash = None;
                 // check if dst inode exists
                 if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst {
                     if flags.intersects(RenameMask::NOREPLACE) {
-                        return SysSnafu { code: libc::EEXIST }.fail();
+                        return EntryExistsSnafu {
+                            parent: parent_dst,
+                            name: name_dst.to_string(),
+                            exist_ino: *ino_dst,
+                            exist_attr: None,
+                        }.fail()?;
                     }
                     watch_keys.push(self.inode_key(*ino_dst));
                     if *typ_dst == INodeType::Directory {
@@ -2395,31 +2454,31 @@ impl Engine for RedisEngineWithCtx {
                 cmd("WATCH").arg(watch_keys).query_async(conn).await?;
 
                 // data check
-                let mut keys = vec![
-                    self.inode_key(parent_src),
-                    self.inode_key(parent_dst),
-                    self.inode_key(ino_src),
-                ];
-                exists_dst
+                let inodes = {
+                    let mut inodes = vec![parent_src, parent_dst, ino_src];
+                    exists_dst.iter().for_each(|dst| inodes.push(dst.1));
+                    inodes
+                };
+                let keys = inodes
                     .iter()
-                    .for_each(|dst| keys.push(self.inode_key(dst.1)));
+                    .map(|inode| self.inode_key(*inode))
+                    .collect::<Vec<String>>();
                 let rs = conn.mget::<_, Vec<Option<Vec<u8>>>>(&keys).await?;
                 if rs.len() != keys.len() {
-                    error!("no attribute for inodes");
-                    return SysSnafu { code: libc::ENOENT }.fail();
+                    whatever!("Illigal len for mget {keys:?}, {}", rs.len());
                 }
-                for (r, ino) in rs.iter().zip(keys.iter()) {
+                for (r, ino) in rs.iter().zip(inodes.iter()) {
                     if r.is_none() {
                         error!("no attribute for inode {}", ino);
-                        return SysSnafu { code: libc::ENOENT }.fail();
+                        return NoEntryFound2Snafu { ino: *ino }.fail()?;
                     }
                 }
                 let mut pattr_src: Attr = bincode::deserialize(rs[0].as_ref().unwrap())?;
                 if pattr_src.typ != INodeType::Directory {
-                    return SysSnafu {
-                        code: libc::ENOTDIR,
+                    return NotDir2Snafu {
+                        ino: parent_src,
                     }
-                    .fail();
+                    .fail()?;
                 }
                 self.access(
                     parent_src,
@@ -2429,13 +2488,14 @@ impl Engine for RedisEngineWithCtx {
                 .await?;
                 let mut pattr_dst: Attr = bincode::deserialize(rs[1].as_ref().unwrap())?;
                 if pattr_dst.typ != INodeType::Directory {
-                    return SysSnafu {
-                        code: libc::ENOTDIR,
+                    return NotDir2Snafu {
+                        ino: parent_dst,
                     }
-                    .fail();
+                    .fail()?;
                 }
+                // TODO: why dst parent inode can't be trash
                 if flags.intersects(RenameMask::RESTORE) && pattr_dst.parent > TRASH_INODE {
-                    return SysSnafu { code: libc::ENOENT }.fail();
+                    return NoEntryFound2Snafu { ino: parent_dst }.fail()?;
                 }
                 self.access(
                     parent_dst,
@@ -2443,10 +2503,13 @@ impl Engine for RedisEngineWithCtx {
                     &pattr_dst,
                 )
                 .await?;
-                // TODO: check parentDst is a subdir of source node
-                if ino_src == parent_dst || ino_src == pattr_dst.parent {
-                    return SysSnafu { code: libc::EPERM }.fail();
-                }
+                ensure!(
+                    ino_src != parent_dst && ino_src != pattr_dst.parent,
+                    OpNotPermittedSnafu {
+                        op: "rename target dir is or subdir of source inode.",
+                    }
+                );
+
                 let mut attr_src: Attr = bincode::deserialize(rs[2].as_ref().unwrap())?;
                 if pattr_src
                     .flags
@@ -2456,15 +2519,15 @@ impl Engine for RedisEngineWithCtx {
                         .flags
                         .intersects(Flag::APPEND.union(Flag::IMMUTABLE))
                 {
-                    return SysSnafu { code: libc::EPERM }.fail();
+                    return OpNotPermittedSnafu { op: "todo." }.fail()?;
                 }
                 if parent_src != parent_dst
                     && pattr_src.mode & 0o1000 != 0
                     && !self.uid().is_root()
                     && *self.uid() != attr_src.uid
-                    && (*self.uid() != pattr_src.uid || attr_src.typ == INodeType::Directory)
+                    && (self.uid() != &pattr_src.uid || attr_src.typ == INodeType::Directory)
                 {
-                    return SysSnafu { code: libc::EACCES }.fail();
+                    return PermissionDeniedSnafu { ino: pattr_src.uid }.fail()?;
                 }
 
                 // move dst inode to src inode if exchange
@@ -2477,12 +2540,14 @@ impl Engine for RedisEngineWithCtx {
                 let mut delete_option = None;
                 let exists_attr_dst = if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst {
                     let mut attr_dst: Attr = bincode::deserialize(rs[3].as_ref().unwrap())?;
-                    if attr_dst
-                        .flags
-                        .intersects(Flag::APPEND.union(Flag::IMMUTABLE))
-                    {
-                        return SysSnafu { code: libc::EPERM }.fail();
-                    }
+                    ensure!(
+                        !attr_dst
+                            .flags
+                            .intersects(Flag::APPEND.union(Flag::IMMUTABLE)),
+                        OpNotPermittedSnafu {
+                            op: "rename target inode is append or immutable."
+                        }
+                    );
                     attr_dst.ctime = now.as_nanos();
                     if flags.intersects(RenameMask::EXCHANGE) {
                         if parent_src != parent_dst {
@@ -2497,10 +2562,11 @@ impl Engine for RedisEngineWithCtx {
                             if *typ_dst == INodeType::Directory {
                                 let cnt: u64 = conn.hlen(self.entry_key(*ino_dst)).await?;
                                 if cnt != 0 {
-                                    return SysSnafu {
-                                        code: libc::ENOTEMPTY,
+                                    return DirNotEmptySnafu {
+                                        parent: parent_dst,
+                                        name: name_dst.to_string(),
                                     }
-                                    .fail();
+                                    .fail()?;
                                 }
                                 pattr_dst.nlink -= 1;
                                 update_parent_dst = true;
@@ -2534,12 +2600,16 @@ impl Engine for RedisEngineWithCtx {
                         && *self.uid() != pattr_dst.uid
                         && *self.uid() != attr_dst.uid
                     {
-                        return SysSnafu { code: libc::EACCES }.fail();
+                        return PermissionDeniedSnafu { ino: pattr_dst.uid }.fail()?;
                     }
                     Some(attr_dst)
                 } else {
                     if flags.intersects(RenameMask::EXCHANGE) {
-                        return SysSnafu { code: libc::ENOENT }.fail();
+                        return NoEntryFoundSnafu {
+                            parent: parent_dst,
+                            name: name_dst.to_string(),
+                        }
+                        .fail()?;
                     }
                     None
                 };
@@ -2550,7 +2620,7 @@ impl Engine for RedisEngineWithCtx {
                     && *self.uid() != pattr_src.uid
                     && *self.uid() != attr_src.uid
                 {
-                    return SysSnafu { code: libc::EACCES }.fail();
+                    return PermissionDeniedSnafu { ino: pattr_src.uid }.fail()?;
                 }
                 // move src inode to dst
                 if parent_src != parent_dst {
@@ -2710,7 +2780,7 @@ impl Engine for RedisEngineWithCtx {
                     );
                 }
                 pipe.query_async(conn).await?;
-                Ok::<_, MyError>(Some((
+                Ok::<_, MetaErrorEnum>(Some((
                     ino_src,
                     attr_src,
                     exists_dst.map(|dst| (dst.1, exists_attr_dst.unwrap())),

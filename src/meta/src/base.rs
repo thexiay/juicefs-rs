@@ -4,26 +4,31 @@ use chrono::Utc;
 use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
+use snafu::{ensure, ensure_whatever, whatever};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{mem, process};
+use std::process;
 use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use crate::acl::{self, AclCache, AclExt, AclType, Rule};
+use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
+    Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
+    SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE,
+    TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
-use crate::error::{FsResult, MyError, NotInitializedSnafu, Result, SysSnafu};
+use crate::error::{
+    BadFDSnafu, DirNotEmptySnafu, QuotaExceededSnafu, InterruptedSnafu, InvalidArgSnafu, MetaErrorEnum, NoEntryFoundSnafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, Result
+};
 use crate::openfile::{OpenFiles, INVALIDATE_ATTR_ONLY};
 use crate::quota::{MetaQuota, Quota};
 use crate::utils::{
@@ -257,13 +262,20 @@ pub trait Engine: WithContext + Send + Sync + 'static {
 
 #[async_trait]
 pub trait MetaOtherFunction {
+    /// An accumulator for the next inode to be allocated.
     async fn next_inode(&self) -> Result<Ino>;
-    async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
+    async fn lookup_ignore_ascii_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>>;
 
     /// Add a temporary folder to keep removed files for a certain time
-    /// If rm, unlink, rm dir.e.g happens, they can be moved to `.trash` dir to keep some times.
+    /// If `rm`,`unlink`,`rm dir` E.g happens, they can be moved to `.trash` dir to keep some times.
     ///
-    /// Returns the new trash inode if this ino should be moved to trash
+    /// # Arguments
+    ///
+    /// * `parent` - the parent inode
+    ///
+    /// # Returns
+    ///
+    /// * it will return Some(new_trash_ino) if the entry under the parent should be moved to trash
     async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>>;
 
     /// Immediately spawn a task to delete task
@@ -349,7 +361,7 @@ pub trait MetaOtherFunction {
 pub struct CommonMeta {
     pub addr: String,
     pub root: Ino,
-    pub sub_trash: Mutex<Option<InternalNode>>,
+    pub current_trash_dir: Mutex<Option<InternalNode>>,
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
     pub max_deleting: Arc<Semaphore>,
@@ -386,7 +398,7 @@ impl CommonMeta {
         CommonMeta {
             addr: addr.to_string(),
             root: ROOT_INODE,
-            sub_trash: Mutex::new(None),
+            current_trash_dir: Mutex::new(None),
             removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
             max_deleting,
@@ -469,7 +481,7 @@ where
         Ok(n)
     }
 
-    async fn resolve_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
+    async fn lookup_ignore_ascii_case(&self, parent: Ino, name: &str) -> Result<Option<Entry>> {
         let entries = self.do_readdir(parent, false, None).await?;
         Ok(entries
             .into_iter()
@@ -488,9 +500,10 @@ where
         if !trash_enable {
             return Ok(None);
         }
+        // use current trash dir as cache
         let name = Utc::now().format("%Y-%m-%d-%H").to_string();
         {
-            let sub_trash = self.as_ref().sub_trash.lock();
+            let sub_trash = self.as_ref().current_trash_dir.lock();
             if let Some(trash) = &*sub_trash
                 && trash.name == name
             {
@@ -498,50 +511,74 @@ where
             }
         }
 
-        let mut trash = None;
         // all trash file in one trash directory: `%Y-%m-%d-%H`
-        // find trash name in trash root first, if this trash dir does not exist, create it.
-        let lookup_res = match self.do_lookup(TRASH_INODE, &name).await {
-            Err(MyError::SysError { code }) if code == libc::ENOENT => {
-                let next = self.incr_counter(NEXT_TRASH, 1).await?;
-                let _ = trash.insert(TRASH_INODE + next as u64);
-                self.do_mknod(
-                    TRASH_INODE,
-                    &name,
-                    0,
-                    "",
-                    trash.unwrap(),
-                    Attr {
-                        typ: INodeType::Directory,
-                        nlink: 2,
-                        length: 4 << 10,
-                        mode: 0o555,
-                        parent: TRASH_INODE,
-                        full: true,
-                        ..Attr::default()
-                    },
-                )
-                .await
+        // Create if trash dir not exists.
+        match self.do_lookup(TRASH_INODE, &name).await {
+            Ok((trash_ino, _)) => Ok(Some(trash_ino)),
+            Err(e) => {
+                if let MetaErrorEnum::NoEntryFound {
+                    parent: TRASH_INODE,
+                    name: no_name,
+                } = e.inner()
+                    && name == *no_name
+                {
+                    // create new trash dir
+                    let next = self.incr_counter(NEXT_TRASH, 1).await?;
+                    let trash_ino = TRASH_INODE + next as u64;
+                    if trash_ino < TRASH_INODE {
+                        return BadFDSnafu { fd: trash_ino }.fail()?;
+                    }
+
+                    match self
+                        .do_mknod(
+                            TRASH_INODE,
+                            &name,
+                            0,
+                            "",
+                            trash_ino,
+                            Attr {
+                                typ: INodeType::Directory,
+                                nlink: 2,
+                                length: 4 << 10,
+                                mode: 0o555,
+                                parent: TRASH_INODE,
+                                full: true,
+                                ..Attr::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            info!("Created trash dir {}", name);
+                            let mut current_trash_dir = self.as_ref().current_trash_dir.lock();
+                            current_trash_dir.replace(InternalNode {
+                                inode: trash_ino,
+                                name,
+                            });
+                            Ok(Some(trash_ino))
+                        }
+                        Err(err) => {
+                            if let MetaErrorEnum::EntryExists {
+                                parent: TRASH_INODE,
+                                name: no_name,
+                                ..
+                            } = err.inner()
+                                && *no_name == name
+                            {
+                                warn!(
+                                    "Found trash dir {} already exists, maybe create by other user",
+                                    name
+                                );
+                                Ok(None)
+                            } else {
+                                Err(err)
+                            }
+                        }
+                    }
+                } else {
+                    Err(e)
+                }
             }
-            Err(e) => Err(e),
-            Ok((_, attr)) => Ok(attr),
-        };
-        match lookup_res {
-            Err(e @ MyError::SysError { code }) if code != libc::EEXIST => {
-                warn!("create subTrash {} failed {}", name, e);
-                Err(e)
-            }
-            _ if trash.is_some_and(|trash_ino| trash_ino <= TRASH_INODE) => {
-                warn!("invalid trash inode: {:?}", trash);
-                Err(MyError::SysError { code: libc::EBADF }.into())
-            }
-            _ => Ok(trash.inspect(|trash| {
-                let mut sub_trash = self.as_ref().sub_trash.lock();
-                sub_trash.replace(InternalNode {
-                    inode: *trash,
-                    name,
-                });
-            })),
         }
     }
 
@@ -595,17 +632,21 @@ where
             .await?;
         if !inode.is_trash() {
             match self.rmdir(parent, name, skip_check_trash).await {
-                Err(errno) if errno == libc::ENOTEMPTY => {
-                    // redo when concurrent conflict may happen
-                    self.remove_entry(
-                        parent,
-                        name,
-                        inode,
-                        skip_check_trash,
-                        count,
-                        max_removing.clone(),
-                    )
-                    .await?;
+                Err(err) => {
+                    if err.is_dir_not_empty(&parent, name) {
+                        // redo when concurrent conflict may happen
+                        self.remove_entry(
+                            parent,
+                            name,
+                            inode,
+                            skip_check_trash,
+                            count,
+                            max_removing.clone(),
+                        )
+                        .await?;
+                    } else {
+                        warn!(parent = %parent, name = %name, "remove entry failed: {}", err);
+                    }
                 }
                 _ => {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -636,8 +677,16 @@ where
                 .await
             {
                 Ok(_) => (),
-                Err(errno) if errno == libc::ENOENT => (),
-                Err(errno) => return SysSnafu { code: errno }.fail(),
+                Err(err) => {
+                    if let MetaErrorEnum::NoEntryFound { parent, name } = err.inner() {
+                        warn!(
+                            "entry({},{}) not found when remove, maybe other thread remove it",
+                            parent, name
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
 
             // try directories first to increase parallel
@@ -686,10 +735,17 @@ where
                                 .await
                             {
                                 Ok(_) => (),
-                                Err(MyError::SysError { code }) if code == libc::ENOENT => (),
                                 Err(err) => {
-                                    self.token().cancel();
-                                    return Err(err);
+                                    if err.is_no_entry_found(&inode, &entry.name) {
+                                        warn!(
+                                            parent = %inode,
+                                            name = %entry.name,
+                                            "entry not found when remove, maybe other thread unlink it",
+                                        )
+                                    } else {
+                                        self.token().cancel();
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }
@@ -698,31 +754,38 @@ where
                     count.fetch_add(1, Ordering::SeqCst);
                     match self.unlink(inode, &entry.name, skip_check_trash).await {
                         Ok(_) => (),
-                        Err(errno) if errno == libc::ENOENT => {
-                            info!(
-                                "entry({},{}) not found when remove, maybe other thread unlink it",
-                                inode, entry.name
-                            )
-                        }
                         Err(err) => {
-                            self.token().cancel();
-                            return SysSnafu { code: err }.fail();
+                            if err.is_no_entry_found(&inode, &entry.name) {
+                                warn!(
+                                    parent = %inode,
+                                    name = %entry.name,
+                                    "entry not found when remove, maybe other thread unlink it",
+                                )
+                            } else {
+                                self.token().cancel();
+                                return Err(err);
+                            }
                         }
                     }
                 }
                 if self.token().is_cancelled() {
-                    return SysSnafu { code: libc::EINTR }.fail();
+                    return InterruptedSnafu.fail()?;
                 }
             }
             while let Some(join_res) = join_set.join_next().await {
                 match join_res {
                     Ok(remove_res) => match remove_res {
                         Ok(_) => (),
-                        Err(MyError::SysError { code }) if code == libc::ENOENT => {
-                            info!("entry not found when remove, maybe other thread remove it, ignore it.")
-                        }
                         Err(err) => {
-                            return Err(err);
+                            if let MetaErrorEnum::NoEntryFound { parent, name } = err.inner() {
+                                warn!(
+                                    parent = %parent,
+                                    name = %name,
+                                    "entry not found when remove, maybe other thread unlink it",
+                                );
+                            } else {
+                                return Err(err);
+                            }
                         }
                     },
                     Err(err) => {
@@ -768,7 +831,7 @@ where
                 } else {
                     Attr::default()
                 }
-            },
+            }
             Some(attr) => attr,
         };
         let now = SystemTime::now()
@@ -824,12 +887,24 @@ where
         }
         if set.intersects(SetAttrMask::SET_GID) {
             if !self.uid().is_root() && *self.uid() != current.uid {
-                return SysSnafu { code: libc::EPERM }.fail();
+                return OpNotPermittedSnafu {
+                    op: format!(
+                        "SET_GID not permiited if not root and not inode({}) owner",
+                        inode
+                    ),
+                }
+                .fail()?;
             }
             let contains_gid = self.gids().iter().any(|gid| *gid == incoming.gid);
             if current.gid != incoming.gid {
                 if self.check_permission() && !self.uid().is_root() && !contains_gid {
-                    return SysSnafu { code: libc::EPERM }.fail();
+                    return OpNotPermittedSnafu {
+                        op: format!(
+                            "SET_GID not permiited if not root and not in inode({}) group",
+                            incoming.gid
+                        ),
+                    }
+                    .fail()?;
                 }
                 dirty_attr.gid = incoming.gid;
                 changed = true;
@@ -837,7 +912,13 @@ where
         }
         if set.intersects(SetAttrMask::SET_UID) && current.uid != incoming.uid {
             if !self.uid().is_root() {
-                return SysSnafu { code: libc::EPERM }.fail();
+                return OpNotPermittedSnafu {
+                    op: format!(
+                        "SET_UID not permiited if not root and not inode({}) owner",
+                        inode
+                    ),
+                }
+                .fail()?;
             }
             dirty_attr.uid = incoming.uid;
             changed = true;
@@ -859,7 +940,10 @@ where
                         || mode & 0o2000 > current.mode & 0o2000
                         || mode & 0o4000 > current.mode & 0o4000)
                 {
-                    return SysSnafu { code: libc::EPERM }.fail();
+                    return OpNotPermittedSnafu {
+                        op: format!("SET_MODE not permiited for inode({})", inode),
+                    }
+                    .fail()?;
                 }
                 dirty_attr.mode = mode;
                 changed = true;
@@ -868,21 +952,24 @@ where
         if set.intersects(SetAttrMask::SET_ATIME_NOW)
             || (set.intersects(SetAttrMask::SET_ATIME) && incoming.atime == 0)
         {
-            if let Err(_) = self.access(inode, ModeMask::WRITE, current).await
+            if self.access(inode, ModeMask::WRITE, current).await.is_err()
                 && *self.uid() != current.uid
             {
-                return SysSnafu { code: libc::EACCES }.fail();
+                return PermissionDeniedSnafu { ino: inode }.fail()?;
             }
             dirty_attr.atime = now.as_nanos();
             changed = true;
         } else if set.intersects(SetAttrMask::SET_ATIME) && current.atime != incoming.atime {
             if current.uid.is_root() && !self.uid().is_root() {
-                return SysSnafu { code: libc::EPERM }.fail();
+                return OpNotPermittedSnafu {
+                    op: format!("SET_ATIME not permiited for inode({})", inode),
+                }
+                .fail()?;
             }
-            if let Err(_) = self.access(inode, ModeMask::WRITE, current).await
+            if self.access(inode, ModeMask::WRITE, current).await.is_err()
                 && *self.uid() != current.uid
             {
-                return SysSnafu { code: libc::EACCES }.fail();
+                return PermissionDeniedSnafu { ino: inode }.fail()?;
             }
             dirty_attr.atime = incoming.atime;
             changed = true;
@@ -890,21 +977,24 @@ where
         if set.intersects(SetAttrMask::SET_MTIME_NOW)
             || (set.intersects(SetAttrMask::SET_MTIME) && incoming.mtime == 0)
         {
-            if let Err(_) = self.access(inode, ModeMask::WRITE, current).await
+            if self.access(inode, ModeMask::WRITE, current).await.is_err()
                 && *self.uid() != current.uid
             {
-                return SysSnafu { code: libc::EACCES }.fail();
+                return PermissionDeniedSnafu { ino: inode }.fail()?;
             }
             dirty_attr.mtime = now.as_nanos();
             changed = true;
         } else if set.intersects(SetAttrMask::SET_MTIME) && current.mtime != incoming.mtime {
             if current.uid.is_root() && !self.uid().is_root() {
-                return SysSnafu { code: libc::EPERM }.fail();
+                return OpNotPermittedSnafu {
+                    op: format!("SET_MTIME not permiited for inode({})", inode),
+                }
+                .fail()?;
             }
-            if let Err(_) = self.access(inode, ModeMask::WRITE, current).await
+            if self.access(inode, ModeMask::WRITE, current).await.is_err()
                 && *self.uid() != current.uid
             {
-                return SysSnafu { code: libc::EACCES }.fail();
+                return PermissionDeniedSnafu { ino: inode }.fail()?;
             }
             dirty_attr.mtime = incoming.mtime;
             changed = true;
@@ -993,11 +1083,14 @@ where
                         }
                     }
                 }
-                Err(e @ MyError::NotInitializedError) => {
-                    error!("reload setting: {}", e);
-                    process::exit(UMOUNT_EXIT_CODE);
+                Err(err) => {
+                    if let MetaErrorEnum::NotInitializedError = err.inner() {
+                        error!("please reload setting: {}", err);
+                        process::exit(UMOUNT_EXIT_CODE);
+                    } else {
+                        warn!("reload setting: {}", err);
+                    }   
                 }
-                Err(e) => warn!("reload setting: {}", e),
             }
 
             match self.get_counter(USED_SPACE).await {
@@ -1080,7 +1173,7 @@ where
     async fn load(&self, check_version: bool) -> Result<Arc<Format>> {
         info!("Load format from meta service");
         let fmt = match self.do_load().await {
-            Ok(None) => return NotInitializedSnafu.fail(),
+            Ok(None) => return NotInitializedSnafu.fail()?,
             Ok(Some(body)) => body,
             Err(e) => return Err(e),
         };
@@ -1226,10 +1319,8 @@ where
                 loop {
                     sleep_with_jitter(Duration::from_hours(1)).await;
                     if let Err(e) = meta.do_get_attr(TRASH_INODE).await {
-                        if let MyError::SysError { code } = e
-                            && code != libc::ENOENT
-                        {
-                            warn!("getattr inode {}: {}", TRASH_INODE, code);
+                        if matches!(e.inner(), MetaErrorEnum::NoEntryFound { .. }) {
+                            warn!("get trash attr inode error {e}");
                         }
                         continue;
                     }
@@ -1392,12 +1483,12 @@ where
         availspace: AtomicU64,
         iused: AtomicU64,
         iavail: AtomicU64,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // Access checks the access permission on given inode.
-    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> FsResult<()> {
+    async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()> {
         if self.uid().is_root() || !self.check_permission() {
             return Ok(());
         }
@@ -1415,7 +1506,7 @@ where
             if rule.can_access(self.uid(), self.gids(), attr.uid, attr.gid, mode_mask) {
                 return Ok(());
             }
-            return SysSnafu { code: libc::EACCES }.fail()?;
+            return PermissionDeniedSnafu { ino: inode }.fail()?;
         }
 
         let mode = access_mode(&attr, self.uid(), self.gids());
@@ -1424,19 +1515,14 @@ where
                 "Access inode {}, attr mode {:o}, access mode {:o}, request mode {:o}",
                 inode, attr.mode, mode, mode_mask
             );
-            SysSnafu { code: libc::EACCES }.fail()?
+            return PermissionDeniedSnafu { ino: inode }.fail()?;
         } else {
             Ok(())
         }
     }
 
     // Lookup returns the inode and attributes for the given entry in a directory.
-    async fn lookup(
-        &self,
-        parent: Ino,
-        name: &str,
-        check_permission: bool,
-    ) -> FsResult<(Ino, Attr)> {
+    async fn lookup(&self, parent: Ino, name: &str, check_permission: bool) -> Result<(Ino, Attr)> {
         let base = self.as_ref();
         let parent = base.check_root(parent);
         if check_permission {
@@ -1451,10 +1537,7 @@ where
             ".." => {
                 let par_attr = self.get_attr(parent).await?;
                 if par_attr.typ != INodeType::Directory {
-                    return SysSnafu {
-                        code: libc::ENOTDIR,
-                    }
-                    .fail()?;
+                    NotDir2Snafu { ino: parent }.fail()?
                 } else {
                     Ok(((par_attr.parent), self.get_attr(par_attr.parent).await?))
                 }
@@ -1466,27 +1549,33 @@ where
                 } else {
                     let (inode, attr) = match self.do_lookup(parent, name).await {
                         Ok((inode, attr)) => (inode, attr),
-                        Err(MyError::SysError { code })
-                            if code == libc::ENOENT && base.conf.case_insensi =>
-                        {
-                            if let Ok(Some(entry)) = self.resolve_case(parent, name).await {
-                                // TODO: why here not use e.attr directly?
+                        Err(err) => {
+                            // fallback to find case insensitive
+                            if err.is_no_entry_found(&parent, name)
+                                && base.conf.case_insensi
+                                && let Ok(Some(entry)) =
+                                    self.lookup_ignore_ascii_case(parent, name).await
+                            {
                                 match self.get_attr(entry.inode).await {
                                     Ok(attr) => (entry.inode, attr),
-                                    Err(code) if code == libc::ENOENT => {
-                                        warn!(
-                                            "no attribute for inode {}({},{})",
-                                            entry.inode, parent, entry.name
-                                        );
-                                        (entry.inode, entry.attr)
+                                    Err(err) => {
+                                        if err.is_no_entry_found2(&entry.inode) {
+                                            warn!(
+                                                inode = %entry.inode,
+                                                %parent,
+                                                name = %name,
+                                                "No attribute find, use incomplele attr.",
+                                            );
+                                            (entry.inode, entry.attr)
+                                        } else {
+                                            return Err(err);
+                                        }
                                     }
-                                    Err(err) => return Err(err),
                                 }
                             } else {
-                                return SysSnafu { code: libc::ENOENT }.fail()?;
+                                return Err(err);
                             }
                         }
-                        Err(e) => return Err(e.into()),
                     };
                     if attr.typ == INodeType::Directory && !parent.is_trash() {
                         let mut dir_parents = base.dir_parents.lock();
@@ -1498,13 +1587,13 @@ where
         }
     }
 
-    async fn resolve(&self, parent: Ino, path: &str) -> FsResult<(Ino, Attr)> {
+    async fn resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)> {
         let (ino, attr) = self.do_resolve(parent, path).await?;
         Ok((ino, attr))
     }
 
     // GetAttr returns the attributes for given node.
-    async fn get_attr(&self, inode: Ino) -> FsResult<Attr> {
+    async fn get_attr(&self, inode: Ino) -> Result<Attr> {
         let base = self.as_ref();
         let inode = inode.transfer_root(base.root);
         if let Some(attr) = base.open_files.get_attr(inode).await {
@@ -1547,7 +1636,7 @@ where
         set: SetAttrMask,
         sggid_clear_mode: u8,
         attr: &Attr,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         let base = self.as_ref();
         let inode = inode.transfer_root(base.root);
         let res = self.do_set_attr(inode, set, sggid_clear_mode, attr).await;
@@ -1565,7 +1654,7 @@ where
     }
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> FsResult<()> {
+    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()> {
         todo!()
     }
 
@@ -1576,7 +1665,7 @@ where
         flags: u8,
         attr_length: u64,
         skip_perm_check: bool,
-    ) -> FsResult<Attr> {
+    ) -> Result<Attr> {
         if let Some(file) = self.as_ref().open_files.find(inode) {
             let _ = file.lock().await;
         }
@@ -1597,12 +1686,12 @@ where
         off: u64,
         size: u64,
         length: &u64,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // ReadLink returns the target of a symlink.
-    async fn read_symlink(&self, inode: Ino) -> FsResult<String> {
+    async fn read_symlink(&self, inode: Ino) -> Result<String> {
         let base = self.as_ref();
         let no_atime = self.as_ref().conf.atime_mode == "NoAtime" || self.as_ref().conf.read_only;
 
@@ -1626,40 +1715,31 @@ where
             }
         }
         let (atime, path) = self.do_read_symlink(inode, no_atime).await?;
-        if path.is_empty() {
-            let attr = self.get_attr(inode).await?;
-            if attr.typ != INodeType::Symlink {
-                return Err(libc::EINVAL);
-            }
-            return Err(libc::EIO);
-        }
+        ensure_whatever!(!path.is_empty(), "read symlink empty path");
         base.symlinks.lock().insert(inode, (atime, path.clone()));
         Ok(path)
     }
 
     // Symlink creates a symlink in a directory with given name.
-    async fn symlink(&self, parent: Ino, name: &str, target_path: &str) -> FsResult<(Ino, Attr)> {
+    async fn symlink(&self, parent: Ino, name: &str, target_path: &str) -> Result<(Ino, Attr)> {
         if target_path.is_empty() || target_path.len() > MAX_SYMLINK {
-            return SysSnafu { code: libc::ENOENT }.fail()?;
+            return InvalidArgSnafu {
+                arg: format!("symlink: target_path: {target_path}"),
+            }
+            .fail()?;
         }
         // ' ' is illegal in posix path
         if target_path.chars().any(|c| c == '\0') {
-            return SysSnafu { code: libc::ENOENT }.fail()?;
+            return InvalidArgSnafu {
+                arg: format!("symlink: target_path: {target_path}"),
+            }
+            .fail()?;
         }
 
         // mode of symlink is ignored in POSIX
         // do not care exists inode
-        self.mknod(
-            parent,
-            name,
-            INodeType::Symlink,
-            0o777,
-            0,
-            0,
-            target_path,
-            &mut None,
-        )
-        .await
+        self.mknod(parent, name, INodeType::Symlink, 0o777, 0, 0, target_path)
+            .await
     }
 
     // Mknod creates a node in a directory with given name, type and permissions.
@@ -1672,19 +1752,28 @@ where
         cumask: u16,
         rdev: u32,
         path: &str,
-        exists_node: &mut Option<(Ino, Attr)>,
-    ) -> FsResult<(Ino, Attr)> {
+    ) -> Result<(Ino, Attr)> {
         if parent.is_trash() {
-            return SysSnafu { code: libc::EPERM }.fail()?;
+            return OpNotPermittedSnafu {
+                op: format!("mknod: make inode in trash."),
+            }
+            .fail()?;
         }
         if parent == ROOT_INODE && name == TRASH_NAME {
-            return SysSnafu { code: libc::EPERM }.fail()?;
+            return OpNotPermittedSnafu {
+                op: format!("mknod: make trash in root dir."),
+            }
+            .fail()?;
         }
         if self.as_ref().conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail()?;
+            return ReadFSSnafu.fail()?;
         }
         if name.is_empty() {
-            return SysSnafu { code: libc::ENOENT }.fail()?;
+            return NoEntryFoundSnafu {
+                parent,
+                name: name.to_string(),
+            }
+            .fail()?;
         }
 
         let parent = self.as_ref().check_root(parent);
@@ -1721,11 +1810,7 @@ where
                 self.update_quota(parent, space, inodes).await;
                 Ok((ino, attr))
             }
-            Err(MyError::FileExistError { ino, attr }) => {
-                exists_node.replace((ino, attr));
-                Err(libc::EEXIST)
-            }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1737,37 +1822,31 @@ where
         mode: u16,
         cumask: u16,
         copysgid: u8,
-    ) -> FsResult<(Ino, Attr)> {
-        self.mknod(
-            parent,
-            name,
-            INodeType::Directory,
-            mode,
-            cumask,
-            0,
-            "",
-            &mut None,
-        )
-        .await
-        .inspect(|(ino, _)| {
-            let base = self.as_ref();
-            let mut dir_parents = base.dir_parents.lock();
-            dir_parents.insert(*ino, parent);
-        })
+    ) -> Result<(Ino, Attr)> {
+        self.mknod(parent, name, INodeType::Directory, mode, cumask, 0, "")
+            .await
+            .inspect(|(ino, _)| {
+                let base = self.as_ref();
+                let mut dir_parents = base.dir_parents.lock();
+                dir_parents.insert(*ino, parent);
+            })
     }
 
     // Unlink removes a file entry from a directory.
     // The file will be deleted if it's not linked by any entries and not open by any sessions.
-    async fn unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<()> {
+    async fn unlink(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<()> {
         if (parent == ROOT_INODE && name == TRASH_NAME)
             || (parent.is_trash() && !self.uid().is_root())
         {
-            return SysSnafu { code: libc::EPERM }.fail()?;
+            return OpNotPermittedSnafu {
+                op: format!("unlink: illegal op about trash."),
+            }
+            .fail()?;
         }
 
         let base = self.as_ref();
         if base.conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail()?;
+            return ReadFSSnafu.fail()?;
         }
 
         let parent = parent.transfer_root(base.root);
@@ -1784,24 +1863,38 @@ where
     }
 
     // Rmdir removes an empty sub-directory.
-    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> FsResult<Ino> {
+    async fn rmdir(&self, parent: Ino, name: &str, skip_check_trash: bool) -> Result<Ino> {
         match name {
-            "." => return SysSnafu { code: libc::EINVAL }.fail()?,
+            "." => {
+                return InvalidArgSnafu {
+                    arg: format!("rmdir: invalid name: {name}"),
+                }
+                .fail()?
+            }
             ".." => {
-                return SysSnafu {
-                    code: libc::ENOTEMPTY,
+                return DirNotEmptySnafu {
+                    parent,
+                    name: name.to_string(),
                 }
                 .fail()?
             }
             _ => {}
         }
-        if (parent.is_root() && name == TRASH_NAME) || (parent.is_trash() && !self.uid().is_root())
-        {
-            return SysSnafu { code: libc::EPERM }.fail()?;
+        if parent.is_root() && name == TRASH_NAME {
+            return OpNotPermittedSnafu {
+                op: format!("rmdir: rm trash in root."),
+            }
+            .fail()?;
+        }
+        if parent.is_trash() && !self.uid().is_root() {
+            return OpNotPermittedSnafu {
+                op: format!("rmdir: rm trash without root user."),
+            }
+            .fail()?;
         }
         let base = self.as_ref();
         if base.conf.read_only {
-            return SysSnafu { code: libc::EROFS }.fail()?;
+            return ReadFSSnafu.fail()?;
         }
 
         let parent = parent.transfer_root(base.root);
@@ -1829,21 +1922,41 @@ where
         parent_dst: Ino,
         name_dst: &str,
         flags: RenameMask,
-    ) -> FsResult<Option<(Ino, Attr)>> {
+    ) -> Result<Option<(Ino, Attr)>> {
         let base = self.as_ref();
-        if parent_src.is_root() && name_src == TRASH_NAME
-            || parent_dst.is_root() && name_dst == TRASH_NAME
-        {
-            return Err(libc::EPERM);
+        if parent_src.is_root() && name_src == TRASH_NAME {
+            return OpNotPermittedSnafu {
+                op: format!("rename: move root/.trash from "),
+            }
+            .fail()?;
         }
-        if parent_src.is_trash() || (parent_dst.is_trash() && !self.uid().is_root()) {
-            return Err(libc::EPERM);
+        if parent_dst.is_root() && name_dst == TRASH_NAME {
+            return OpNotPermittedSnafu {
+                op: format!("rename: move root/.trash to "),
+            }
+            .fail()?;
+        }
+        if parent_src.is_trash() {
+            return OpNotPermittedSnafu {
+                op: format!("rename: source parent is trash."),
+            }
+            .fail()?;
+        }
+        if parent_dst.is_trash() && !self.uid().is_root() {
+            return OpNotPermittedSnafu {
+                op: format!("rename: dst parent is trash without root user."),
+            }
+            .fail()?;
         }
         if base.conf.read_only {
-            return Err(libc::EROFS);
+            return ReadFSSnafu.fail()?;
         }
         if name_dst.is_empty() {
-            return Err(libc::ENOENT);
+            return NoEntryFoundSnafu {
+                parent: parent_dst,
+                name: name_dst.to_string(),
+            }
+            .fail()?;
         }
 
         match flags {
@@ -1857,9 +1970,12 @@ where
             flag if flag == RenameMask::WHITEOUT
                 || flag == RenameMask::NOREPLACE.union(RenameMask::WHITEOUT) =>
             {
-                return Err(libc::ENOTSUP)
+                return OpNotSupportedSnafu {
+                    op: "rename flag has WHITEOUT",
+                }
+                .fail()?;
             }
-            _ => return Err(libc::EINVAL),
+            _ => return InvalidArgSnafu { arg: "rename flags" }.fail()?,
         }
 
         let parent_src = parent_src.transfer_root(base.root);
@@ -1903,7 +2019,7 @@ where
             };
             // TODO: dst exists and is replaced or exchanged
             if quota_dst.is_some() && self.check_quota(parent_src, space, inodes).await {
-                return Err(libc::EDQUOT);
+                return QuotaExceededSnafu.fail()?;
             }
             (space, inodes)
         } else {
@@ -1917,11 +2033,14 @@ where
             .await
         {
             Ok((ino, attr, t_entry)) => (ino, attr, t_entry),
-            Err(MyError::RenameSameInoError) => {
-                info!("rename same ino({},{})", parent_src, name_src);
-                return Ok(None);
+            Err(err) => {
+                if matches!(err.inner(), MetaErrorEnum::RenameSameInoError) {
+                    info!("rename same ino({},{})", parent_src, name_src);
+                    return Ok(None);
+                } else {
+                    return Err(err);
+                }   
             }
-            Err(e) => return Err(e.into()),
         };
         let diff_length = match attr.typ {
             INodeType::Directory => {
@@ -1976,30 +2095,46 @@ where
     }
 
     // Link creates an entry for node.
-    async fn link(&self, inode: Ino, parent: Ino, name: &str) -> FsResult<Attr> {
+    async fn link(&self, inode: Ino, parent: Ino, name: &str) -> Result<Attr> {
         if parent.is_trash() {
-            return Err(libc::EPERM);
+            return OpNotPermittedSnafu {
+                op: format!("link: target dir is in trash."),
+            }
+            .fail()?;
         }
         if parent.is_root() && name == TRASH_NAME {
-            return Err(libc::EPERM);
+            return OpNotPermittedSnafu {
+                op: format!("link: target path is root's trash."),
+            }
+            .fail()?;
         }
         if self.as_ref().conf.read_only {
-            return Err(libc::EROFS);
+            return ReadFSSnafu.fail()?;
         }
         if name.is_empty() {
-            return Err(libc::ENOENT);
+            return NoEntryFoundSnafu {
+                parent,
+                name: name.to_string(),
+            }
+            .fail()?;
         }
         if name == "." || name == ".." {
-            return Err(libc::EEXIST);
+            return InvalidArgSnafu {
+                arg: format!("link: invalid name: {name}"),
+            }
+            .fail()?;
         }
 
         let parent = parent.transfer_root(self.as_ref().root);
         let attr = self.get_attr(inode).await?;
         if attr.typ == INodeType::Directory {
-            return Err(libc::EPERM);
+            return OpNotPermittedSnafu {
+                op: format!("link: source is dir."),
+            }
+            .fail()?;
         }
         if self.check_quota(parent, align_4k(attr.length), 1).await {
-            return Err(libc::EDQUOT);
+            return QuotaExceededSnafu.fail()?;
         }
         let res = self.do_link(inode, parent, name).await;
         if let Ok(_) = res {
@@ -2015,7 +2150,7 @@ where
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
-    async fn readdir(&self, inode: Ino, wantattr: bool) -> FsResult<Vec<Entry>> {
+    async fn readdir(&self, inode: Ino, wantattr: bool) -> Result<Vec<Entry>> {
         let base = self.as_ref();
         let inode = inode.transfer_root(base.root);
         let mut attr = self.get_attr(inode).await?;
@@ -2047,11 +2182,7 @@ where
             },
         ];
         //  TODO: why here ENOENT and trash return ok?
-        match self.do_readdir(inode, wantattr, None).await {
-            Ok(mut entries) => base_entries.append(&mut entries),
-            Err(MyError::SysError { code }) if code == libc::ENOENT && inode == TRASH_INODE => (),
-            Err(e) => return Err(e.into()),
-        }
+        base_entries.append(&mut self.do_readdir(inode, wantattr, None).await?);
         self.touch_attr_atime(inode, Some(attr)).await;
         Ok(base_entries)
     }
@@ -2063,42 +2194,41 @@ where
         name: &str,
         mode: u16,
         cumask: u16,
-        flags: i32,
-    ) -> FsResult<(Ino, Attr)> {
-        let mut exist_node = None;
+        flags: OFlag,
+    ) -> Result<(Ino, Attr)> {
         match self
-            .mknod(
-                parent,
-                name,
-                INodeType::File,
-                mode,
-                cumask,
-                0,
-                "",
-                &mut exist_node,
-            )
+            .mknod(parent, name, INodeType::File, mode, cumask, 0, "")
             .await
         {
             Ok((ino, mut attr)) => {
                 self.as_ref().open_files.open(ino, &mut attr).await;
                 Ok((ino, attr))
             }
-            Err(libc::EEXIST) => {
-                if let Some((ino, mut attr)) = exist_node
-                    && (flags & libc::O_EXCL == 0 && attr.typ == INodeType::File)
+            Err(err) => {
+                if let MetaErrorEnum::EntryExists {
+                    parent: parent,
+                    name: name,
+                    exist_ino,
+                    exist_attr,
+                } = err.inner()
+                    && !flags.intersects(OFlag::O_EXCL)
                 {
-                    self.as_ref().open_files.open(ino, &mut attr).await;
-                    Ok((ino, attr))
-                } else {
-                    Err(libc::EEXIST)
+                    let mut attr = match exist_attr {
+                        Some(attr) => attr.clone(),
+                        None => self.get_attr(*exist_ino).await?,
+                    };
+                    if attr.typ == INodeType::File {
+                        self.as_ref().open_files.open(*exist_ino, &mut attr).await;
+                        return Ok((*exist_ino, attr));
+                    }
                 }
+                Err(err)
             }
-            Err(e) => Err(e),
         }
     }
 
     // Open checks permission on a node and track it as open.
-    async fn open(&self, inode: Ino, flags: OFlag) -> FsResult<Attr> {
+    async fn open(&self, inode: Ino, flags: OFlag) -> Result<Attr> {
         if self.as_ref().conf.read_only
             && flags.intersects(
                 OFlag::O_WRONLY
@@ -2107,42 +2237,53 @@ where
                     .union(OFlag::O_APPEND),
             )
         {
-            return Err(libc::EROFS);
+            return ReadFSSnafu.fail()?;
         }
         // use cache if has cache
         if let Some(attr) = self.as_ref().open_files.open_with_cache(inode).await {
             self.touch_attr_atime(inode, Some(attr.clone())).await;
             return Ok(attr);
         }
-        
+
         let mut attr = self.get_attr(inode).await?;
-        let mode_mask = match flags.intersection(OFlag::O_RDONLY.union(OFlag::O_WRONLY).union(OFlag::O_RDWR)) {
-            OFlag::O_RDONLY => ModeMask::READ,
-            OFlag::O_WRONLY => ModeMask::WRITE,
-            OFlag::O_RDWR => ModeMask::READ.union(ModeMask::WRITE),
-            _ => ModeMask::empty(),
-        };
+        let mode_mask =
+            match flags.intersection(OFlag::O_RDONLY.union(OFlag::O_WRONLY).union(OFlag::O_RDWR)) {
+                OFlag::O_RDONLY => ModeMask::READ,
+                OFlag::O_WRONLY => ModeMask::WRITE,
+                OFlag::O_RDWR => ModeMask::READ.union(ModeMask::WRITE),
+                _ => ModeMask::empty(),
+            };
         self.access(inode, mode_mask, &attr).await?;
         if attr.flags.intersects(Flag::IMMUTABLE) || attr.parent > TRASH_INODE {
             if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) {
-                return Err(libc::EPERM);
+                return OpNotPermittedSnafu {
+                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                }
+                .fail()?;
             }
         }
         if attr.flags.intersects(Flag::APPEND) {
-            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) && !flags.intersects(OFlag::O_APPEND) {
-                return Err(libc::EPERM);
+            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR))
+                && !flags.intersects(OFlag::O_APPEND)
+            {
+                return OpNotPermittedSnafu {
+                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                }
+                .fail()?;
             }
             if flags.intersects(OFlag::O_TRUNC) {
-                return Err(libc::EPERM);
+                return OpNotPermittedSnafu {
+                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                }
+                .fail()?;
             }
         }
         self.as_ref().open_files.open(inode, &mut attr).await;
         Ok(attr)
-        
     }
 
     // Close a file.
-    async fn close(&self, inode: Ino) -> FsResult<()> {
+    async fn close(&self, inode: Ino) -> Result<()> {
         let base = self.as_ref();
         if base.open_files.close(inode).await {
             let removed = {
@@ -2170,12 +2311,12 @@ where
     }
 
     // Read returns the list of slices on the given chunk.
-    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> FsResult<()> {
+    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()> {
         todo!()
     }
 
     // NewSlice returns an id for new slice.
-    async fn new_slice(&self) -> FsResult<u64> {
+    async fn new_slice(&self) -> Result<u64> {
         let mut slices = self.as_ref().free_slices.lock().await;
         if slices.next >= slices.maxid {
             let v = self.incr_counter("nextChunk", SLICE_ID_BATCH).await?;
@@ -2195,12 +2336,12 @@ where
         off: u32,
         slice: Slice,
         mtime: SystemTime,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // InvalidateChunkCache invalidate chunk cache
-    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> FsResult<()> {
+    async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()> {
         todo!()
     }
 
@@ -2215,43 +2356,37 @@ where
         flags: u32,
         copied: &u64,
         out_length: &u64,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // GetDirStat returns the space and inodes usage of a directory.
-    async fn get_dir_stat(&self, inode: Ino) -> FsResult<DirStat> {
+    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat> {
         todo!()
     }
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> FsResult<()> {
+    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()> {
         todo!()
     }
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> FsResult<()> {
+    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()> {
         todo!()
     }
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(
-        &self,
-        inode: Ino,
-        name: String,
-        value: &Vec<u8>,
-        flags: u32,
-    ) -> FsResult<()> {
+    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()> {
         todo!()
     }
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> FsResult<()> {
+    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()> {
         todo!()
     }
 
     // Flock tries to put a lock on given file.
-    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> FsResult<()> {
+    async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()> {
         todo!()
     }
 
@@ -2264,7 +2399,7 @@ where
         start: &u64,
         end: &u64,
         pid: &u32,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
@@ -2278,12 +2413,12 @@ where
         start: u64,
         end: u64,
         pid: u32,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // Compact all the chunks by merge small slices together
-    async fn compact_all(&self, threads: isize, bar: juice_utils::process::Bar) -> FsResult<()> {
+    async fn compact_all(&self, threads: isize, bar: juice_utils::process::Bar) -> Result<()> {
         todo!()
     }
 
@@ -2294,7 +2429,7 @@ where
         concurrency: isize,
         pre_func: Box<dyn Fn() + Send>,
         post_func: Box<dyn Fn() + Send>,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
@@ -2303,12 +2438,12 @@ where
         &self,
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
-    ) -> FsResult<HashMap<Ino, Vec<Slice>>> {
+    ) -> Result<HashMap<Ino, Vec<Slice>>> {
         todo!()
     }
 
     // Remove all files and directories recursively.
-    async fn remove(&self, parent: Ino, name: &str) -> FsResult<u64> {
+    async fn remove(&self, parent: Ino, name: &str) -> Result<u64> {
         let base = self.as_ref();
         let parent = parent.transfer_root(base.root);
         self.access(
@@ -2341,7 +2476,7 @@ where
     }
 
     // Get summary of a node; for a directory it will accumulate all its child nodes
-    async fn get_summary(&self, ino: Ino, recursive: bool, strict: bool) -> FsResult<Summary> {
+    async fn get_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary> {
         let attr = self.get_attr(ino).await?;
         if attr.typ != INodeType::Directory {
             Ok(Summary {
@@ -2367,7 +2502,7 @@ where
         topn: u8,
         strict: bool,
         update_progress: Box<dyn Fn(u64, u64) + Send>,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
@@ -2381,12 +2516,12 @@ where
         cumask: u16,
         count: &u64,
         total: &u64,
-    ) -> FsResult<()> {
+    ) -> Result<()> {
         todo!()
     }
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> FsResult<()> {
+    async fn chroot(&self, subdir: String) -> Result<()> {
         todo!()
     }
 

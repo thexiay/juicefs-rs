@@ -18,7 +18,7 @@ use juice_meta::{
 use parking_lot::RwLock;
 use tokio::time::sleep;
 use tracing::info;
-use tracing_subscriber::{fmt::{self, time::OffsetTime}, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod base_test;
 

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use snafu::whatever;
 use tracing::warn;
 
 use crate::{
@@ -147,15 +148,9 @@ impl Format {
             warn!("Existing volume will be overwrited: {:?}", old);
         } else {
             if self.name != old.name {
-                return UpgradeFormatSnafu {
-                    detail: format!("name {} -> {}", old.name, self.name),
-                }
-                .fail();
+                whatever!("upgrade: name {} -> {}", old.name, self.name);
             } else if self.block_size != old.block_size {
-                return UpgradeFormatSnafu {
-                    detail: format!("block size {} -> {}", old.block_size, self.block_size),
-                }
-                .fail();
+                whatever!("upgrade: block size {} -> {}", old.block_size, self.block_size);
             } else if self.compression != old.compression {
                 return UpgradeFormatSnafu {
                     detail: format!(
@@ -163,12 +158,12 @@ impl Format {
                         old.compression, self.compression
                     ),
                 }
-                .fail();
+                .fail()?;
             } else if self.shards != old.shards {
                 return UpgradeFormatSnafu {
                     detail: format!("shards {:?} -> {:?}", old.shards, self.shards),
                 }
-                .fail();
+                .fail()?;
             } else if self.hash_prefix != old.hash_prefix {
                 return UpgradeFormatSnafu {
                     detail: format!(
@@ -176,12 +171,12 @@ impl Format {
                         old.hash_prefix, self.hash_prefix
                     ),
                 }
-                .fail();
+                .fail()?;
             } else if self.meta_version != old.meta_version {
                 return UpgradeFormatSnafu {
                     detail: format!("meta version {} -> {}", old.meta_version, self.meta_version),
                 }
-                .fail();
+                .fail()?;
             }
         }
         Ok(())
@@ -192,7 +187,7 @@ impl Format {
             return NotIncompatibleClientSnafu {
                 version: self.meta_version,
             }
-            .fail();
+            .fail()?;
         }
 
         // TODO: check client version
