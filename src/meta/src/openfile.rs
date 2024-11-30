@@ -1,11 +1,10 @@
 use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    collections::HashMap, ops::Deref, sync::Arc, time::{Duration, SystemTime}
 };
 
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
+use tracing::{debug, warn};
 
 use crate::api::{Attr, Ino, Slice};
 
@@ -13,25 +12,113 @@ pub const INVALIDATE_ALL_CHUNK: u32 = 0xFFFFFFFF;
 pub const INVALIDATE_ATTR_ONLY: u32 = 0xFFFFFFFF;
 
 #[derive(Default)]
+/// Two situation to hold an openfile:
+/// - Open it.
+/// - Modify it.
 pub struct OpenFile {
-    pub attr: Attr,
-    refs: i32,
+    expire: Arc<Duration>,
+
+    attr: Option<Attr>,
+    refs: i32,  // refs is the number of open fileholders.
     last_check: Duration,
     first: Vec<Slice>,
     chunks: HashMap<u32, Vec<Slice>>,
 }
 
 impl OpenFile {
-    pub fn invalidate_chunk(&mut self) {
-        self.first.clear();
-        self.chunks.clear();
+    pub fn put_attr(&mut self, attr: &mut Attr) {
+        if self.attr.is_some() {
+            debug!("put attr to a non empty cache");
+        }
+
+        if let Some(cached_attr) = &self.attr
+            && cached_attr.mtime == attr.mtime
+        {
+            attr.keep_cache = cached_attr.keep_cache;
+        } else {
+            // already modify, clear cache.
+            self.invalidate_chunk(INVALIDATE_ALL_CHUNK);
+        }
+        self.attr = Some(attr.clone());
+        self.attr.as_mut().unwrap().keep_cache = true;
+        self.last_check = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards");
+    }
+
+    pub fn get_attr(&self) -> Option<Attr> {
+        if *self.expire == Duration::ZERO {
+            return None;
+        }
+        if self.attr.is_some()
+            && SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                - self.last_check
+                < *self.expire
+        {
+            Some(self.attr.as_ref().unwrap().clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn open(&mut self) {
+        self.refs += 1;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.refs > 0
+    }
+    
+    pub fn close(&mut self) {
+        self.refs -= 1;
+    }
+
+    pub fn invalidate_chunk(&mut self, indx: u32) {
+        match indx {
+            INVALIDATE_ALL_CHUNK => {
+                self.first.clear();
+                self.chunks.clear();
+            },
+            0 => self.first.clear(),
+            _ => {
+                self.chunks.remove(&indx);
+            }
+        }
+        self.last_check = Duration::ZERO;
+    }
+}
+
+pub struct OpenFileChunkGuard<'a> {
+    guard: MutexGuard<'a, OpenFile>,
+    indx: u32,
+}
+
+impl<'a> OpenFileChunkGuard<'a> {
+    pub fn new(guard: MutexGuard<'a, OpenFile>, indx: u32) -> Self {
+        OpenFileChunkGuard { guard, indx }
+    }
+}
+
+impl<'a> Deref for OpenFileChunkGuard<'a> {
+    type Target = MutexGuard<'a, OpenFile>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a> Drop for OpenFileChunkGuard<'a> {
+    fn drop(&mut self) {
+        self.guard.invalidate_chunk(self.indx);
     }
 }
 
 /// OpenFiles is a cache for open files.
 /// It also hold a lock for every open file, once it is open, other open request will wait until the lock is released.
 pub struct OpenFiles {
-    expire: Duration,
+    expire: Arc<Duration>,
     limit: u64,
     files: Mutex<HashMap<Ino, Arc<AsyncMutex<OpenFile>>>>,
 }
@@ -39,7 +126,7 @@ pub struct OpenFiles {
 impl OpenFiles {
     pub fn new(expire: Duration, limit: u64) -> Arc<Self> {
         let of = Arc::new(OpenFiles {
-            expire,
+            expire: Arc::new(expire),
             limit,
             files: Mutex::new(HashMap::new()),
         });
@@ -50,151 +137,19 @@ impl OpenFiles {
         of
     }
 
-    /// Open a file directly.
-    pub async fn open(&self, ino: Ino, attr: &mut Attr) {
-        let of = {
-            let mut files = self.files.lock();
-            files
-                .entry(ino)
-                .or_insert(Arc::new(AsyncMutex::new(OpenFile::default())))
-                .clone()
-        };
-        
-        let mut of = of.lock().await;
-        if attr.mtime == of.attr.mtime {
-            attr.keep_cache = of.attr.keep_cache;
-        } else {
-            of.invalidate_chunk();
-        }
-        of.attr = attr.clone();
-        of.attr.keep_cache = true;
-        of.refs += 1;
-        of.last_check = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards");
+    pub fn lock(&self, ino: Ino) -> Arc<AsyncMutex<OpenFile>> {
+        let mut files = self.files.lock();
+        files
+            .entry(ino)
+            .or_insert(Arc::new(AsyncMutex::new(OpenFile::default())))
+            .clone()
     }
 
-    /// Open file using cache
-    pub async fn open_with_cache(&self, ino: Ino) -> Option<Attr> {
-        if self.expire == Duration::ZERO {
-            return None;
-        }
-
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        if let Some(of) = file {
-            let mut of = of.lock().await;
-            if SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards")
-                - of.last_check
-                < self.expire
-            {
-                of.refs += 1;
-                return Some(of.attr.clone());
-            }
-        }
-        None
-    }
-
-    pub async fn is_open(&self, ino: Ino) -> bool {
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        match file {
-            Some(file) => {
-                let of = file.lock().await;
-                of.refs > 0
-            }
-            None => false,
-        }
-    }
-
-    /// Close a fileholder.
-    /// Reentrant func.
-    pub async fn close(&self, ino: Ino) -> bool {
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        if let Some(file) = file {
-            let mut of = file.lock().await;
-            of.refs -= 1;
-            of.refs <= 0
-        } else {
-            true
-        }
-    }
-
-    /// get attr in openfiles cache
-    pub async fn get_attr(&self, ino: Ino) -> Option<Attr> {
-        if self.expire == Duration::ZERO {
-            return None;
-        }
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        if let Some(of) = file {
-            let of = of.lock().await;
-            if SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards")
-                - of.last_check
-                < self.expire
-            {
-                return Some(of.attr.clone());
-            }
-        }
-        None
-    }
-
-    /// update attr in openfiles cache
-    pub async fn update_attr(&self, ino: Ino, attr: &mut Attr) {
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        if let Some(of) = file {
-            let mut of = of.lock().await;
-            if attr.mtime != of.attr.mtime {
-                of.invalidate_chunk();
-            } else {
-                attr.keep_cache = of.attr.keep_cache;
-            }
-            of.attr = attr.clone();
-            of.last_check = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("Time went backwards");
-        }
+    pub async fn has_any_open(&self, ino: Ino) -> bool {
+        let file = self.lock(ino);
+        let of = file.lock().await;
+        of.is_open()
     }
 
     async fn cleanup(&self) {}
-
-    pub fn find(&self, ino: Ino) -> Option<Arc<AsyncMutex<OpenFile>>> {
-        let files = self.files.lock();
-        files.get(&ino).map(|file| file.clone())
-    }
-
-    // TODO: encapsulation it with drop call this function
-    pub async fn invalidate_chunk(&self, ino: Ino, indx: u32) {
-        let file = {
-            let files = self.files.lock();
-            files.get(&ino).map(|file| file.clone())
-        };
-        if let Some(file) = file {
-            let mut of = file.lock().await;
-            match indx {
-                INVALIDATE_ALL_CHUNK => of.invalidate_chunk(),
-                0 => of.first.clear(),
-                _ => {
-                    of.chunks.remove(&indx);
-                }
-            }
-            of.last_check = Duration::ZERO;
-        }
-    }
 }

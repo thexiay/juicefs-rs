@@ -547,14 +547,22 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // NewSlice returns an id for new slice.
     async fn new_slice(&self) -> Result<u64>;
 
-    // Write put a slice of data on top of the given chunk.
+    /// Write put a slice of data on top of the given chunk.
+    ///
+    /// # Arguments
+    /// 
+    /// * `inode` - inode of the file
+    /// * `indx` - index of the chunk
+    /// * `off` - offset of the slice
+    /// * `slice` - slice description
+    /// * `mtime` - modified time
     async fn write(
         &self,
         inode: Ino,
         indx: u32,
         off: u32,
         slice: Slice,
-        mtime: SystemTime,
+        mtime: Duration,
     ) -> Result<()>;
 
     // InvalidateChunkCache invalidate chunk cache

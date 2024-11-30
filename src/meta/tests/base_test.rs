@@ -18,12 +18,17 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use juice_meta::{api::{INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE}, error::MetaErrorEnum};
+    use std::time::UNIX_EPOCH;
+
+    use juice_meta::{
+        api::{INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE},
+        error::MetaErrorEnum,
+    };
     use tracing::info;
 
     let attr = m.get_attr(ROOT_INODE).await.unwrap();
     assert_eq!(attr.mode, 0o777);
-    
+
     m.init(test_format(), true)
         .await
         .expect("initialize failed");
@@ -47,7 +52,12 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert!(sessions.len() == 1, "list sessions cnt should be 1");
     let base = m.get_base();
     let base_sid = { base.sid.read().clone() };
-    assert!(base_sid.unwrap() == sessions[0].sid, "base sid: {:?} != registered sid {}", base_sid, sessions[0].sid);
+    assert!(
+        base_sid.unwrap() == sessions[0].sid,
+        "base sid: {:?} != registered sid {}",
+        base_sid,
+        sessions[0].sid
+    );
 
     let meta = m.clone();
     tokio::spawn(async move {
@@ -60,11 +70,19 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("mkdir d: ");
     let rs = m.unlink(ROOT_INODE, "d", false).await;
-    assert!(rs.as_ref().unwrap_err().is_op_not_permitted(), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_op_not_permitted(),
+        "got {:?}",
+        rs
+    );
     let rs = m.rmdir(parent, ".", false).await;
     assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
     let rs = m.rmdir(parent, "..", false).await;
-    assert!(rs.as_ref().unwrap_err().is_dir_not_empty(&parent, ".."), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_dir_not_empty(&parent, ".."),
+        "got {:?}",
+        rs
+    );
     // test lookup
     let (parent, _) = m.lookup(ROOT_INODE, "d", true).await.expect("lookup d: ");
     let (inode, _) = m.lookup(ROOT_INODE, "..", true).await.expect("lookup ..: ");
@@ -86,44 +104,68 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     let rs = m.lookup(inode, "..", true).await;
     assert!(rs.as_ref().unwrap_err().is_not_dir2(&inode), "got {:?}", rs);
     let rs = m.rmdir(parent, "f", false).await;
-    assert!(rs.as_ref().unwrap_err().is_not_dir1(&parent, "f"), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_not_dir1(&parent, "f"),
+        "got {:?}",
+        rs
+    );
     let rs = m.rmdir(ROOT_INODE, "d", false).await;
-    assert!(rs.as_ref().unwrap_err().is_dir_not_empty(&ROOT_INODE, "d"), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_dir_not_empty(&ROOT_INODE, "d"),
+        "got {:?}",
+        rs
+    );
     let rs = m
-        .mknod(
-            inode,
-            "df",
-            INodeType::Directory,
-            0o650,
-            0o22,
-            0,
-            "",
-        )
+        .mknod(inode, "df", INodeType::Directory, 0o650, 0o22, 0, "")
         .await;
     assert!(rs.as_ref().unwrap_err().is_not_dir2(&inode), "got {:?}", rs);
     let rs = m
         .mknod(parent, "f", INodeType::File, 0o650, 0o22, 0, "")
         .await;
-    assert!(rs.as_ref().unwrap_err().is_entry_exists(&parent, "f"), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_entry_exists(&parent, "f"),
+        "got {:?}",
+        rs
+    );
     let (_, _) = m.lookup(parent, "f", true).await.expect("lookup f: ");
 
     // test resolve
     let rs = m.resolve(ROOT_INODE, "d/f").await;
-    assert!(rs.as_ref().unwrap_err().is_op_not_supported(), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_op_not_supported(),
+        "got {:?}",
+        rs
+    );
     let rs = m.resolve(parent, "/f").await;
-    assert!(rs.as_ref().unwrap_err().is_op_not_supported(), "got {:?}", rs);
+    assert!(
+        rs.as_ref().unwrap_err().is_op_not_supported(),
+        "got {:?}",
+        rs
+    );
 
     // test resolve with different user
     let ctx = 0;
     let ctx2 = 1;
     m.with_login(ctx2, vec![ctx2]);
     let err = m.resolve(parent, "/f").await.unwrap_err();
-    assert!(err.is_op_not_supported() || err.is_permission_denied(), "got {:?}", rs);
+    assert!(
+        err.is_op_not_supported() || err.is_permission_denied(),
+        "got {:?}",
+        rs
+    );
     let err = m.resolve(parent, "/f/c").await.unwrap_err();
-    assert!(err.is_not_dir1(&parent, "/f/c") || err.is_op_not_supported(), "got {:?}", rs);
+    assert!(
+        err.is_not_dir1(&parent, "/f/c") || err.is_op_not_supported(),
+        "got {:?}",
+        rs
+    );
     let err = m.resolve(parent, "/f2").await.unwrap_err();
-    assert!(err.is_no_entry_found(&parent, "/f2") || err.is_op_not_supported(), "got {:?}", rs);
-    
+    assert!(
+        err.is_no_entry_found(&parent, "/f2") || err.is_op_not_supported(),
+        "got {:?}",
+        rs
+    );
+
     // check owner permission
     let (p1, mut attr) = m
         .mkdir(ROOT_INODE, "d1", 0o2777, 0, 0)
@@ -200,7 +242,10 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     .await
     .expect("setattr f: ");
     m.with_login(2, vec![2, 1]); // fake_ctx
-    let err = m.access(parent, ModeMask::WRITE, &Attr::default()).await.unwrap_err();
+    let err = m
+        .access(parent, ModeMask::WRITE, &Attr::default())
+        .await
+        .unwrap_err();
     assert!(err.is_permission_denied(), "got {:?}", rs);
     m.access(inode, ModeMask::READ, &Attr::default())
         .await
@@ -212,12 +257,13 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].name, ".");
     assert_eq!(entries[1].name, "..");
-    assert_eq!(entries[2].name, "f");    
+    assert_eq!(entries[2].name, "f");
     // -------------------------------- test rename --------------------------------
 
     let res = m
         .rename(parent, "f", ROOT_INODE, "f2", RenameMask::WHITEOUT)
-        .await.unwrap_err();
+        .await
+        .unwrap_err();
     assert!(res.is_op_not_supported(), "got {:?}", res);
     m.rename(parent, "f", ROOT_INODE, "f2", RenameMask::empty())
         .await
@@ -265,17 +311,9 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("rename d4/d5 -> d5: ");
     assert_eq!(res.unwrap().1.parent, ROOT_INODE);
-    m.mknod(
-        parent2,
-        "f6",
-        INodeType::File,
-        0o650,
-        0o22,
-        0,
-        "",
-    )
-    .await
-    .expect("create file d4/f6: ");
+    m.mknod(parent2, "f6", INodeType::File, 0o650, 0o22, 0, "")
+        .await
+        .expect("create file d4/f6: ");
     let res = m
         .rename(ROOT_INODE, "d5", parent2, "f6", RenameMask::EXCHANGE)
         .await
@@ -342,25 +380,26 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     // try to open a file that does not exist
     let err = m.open(99999, OFlag::O_RDWR).await.unwrap_err();
     assert!(err.is_no_entry_found2(&99999), "got {:?}", err);
-    
+
     let _ = m.open(inode, OFlag::O_RDWR).await.expect("open f: ");
-    /*
-    
-	if st := m.Open(ctx, 99999, syscall.O_RDWR, &Attr{}); st != syscall.ENOENT {
-		t.Fatalf("open not exist inode got %d, expected %d", st, syscall.ENOENT)
-	}
-	if st := m.Open(ctx, inode, syscall.O_RDWR, attr); st != 0 {
-		t.Fatalf("open f: %s", st)
-	}
-	_ = m.Close(ctx, inode)
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
-		t.Fatalf("write chunk: %s", st)
-	}
-	var s = Slice{Id: sliceId, Size: 100, Len: 100}
-	if st := m.Write(ctx, inode, 0, 100, s, time.Now()); st != 0 {
-		t.Fatalf("write end: %s", st)
-	}
-     */
+    m.close(inode).await.expect("close f: ");
+    let slice_id = m.new_slice().await.expect("new slice: ");
+    m.write(
+        inode,
+        0,
+        100,
+        Slice {
+            id: slice_id,
+            size: 100,
+            off: 0,
+            len: 100,
+        },
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards"),
+    )
+    .await
+    .expect("write f: ");
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
@@ -384,7 +423,9 @@ pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
             off: 0,
             len: 100,
         },
-        SystemTime::now(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards"),
     )
     .await
     .expect("write file: ");
@@ -430,7 +471,10 @@ pub async fn test_trash(mut m: Box<dyn Meta>) {}
 pub async fn test_parents(mut m: Box<dyn Meta>) {}
 
 pub async fn test_remove(mut m: Box<dyn Meta>) {
-    let (_, _) = m.create(1, "f", 0644, 0, OFlag::empty()).await.expect("create f: ");
+    let (_, _) = m
+        .create(1, "f", 0644, 0, OFlag::empty())
+        .await
+        .expect("create f: ");
 
     let _ = m.remove(1, "f").await.expect("rmr f: ");
     let (parent, _) = m.mkdir(1, "d", 0755, 0, 0).await.expect("mkdir d: ");

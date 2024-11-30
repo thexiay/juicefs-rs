@@ -15,6 +15,7 @@ pub(crate) mod rds;
 pub(crate) mod utils;
 pub(crate) mod base;
 pub(crate) mod quota;
+pub(crate) mod data;
 pub(crate) mod session;
 pub(crate) mod openfile;
 pub(crate) mod slice;
