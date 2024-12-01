@@ -400,6 +400,46 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     )
     .await
     .expect("write f: ");
+    let slices = m
+        .read(inode, 0)
+        .await
+        .expect("read chunk: ");
+    assert_eq!(slices.len(), 2);
+    assert_eq!(slices[0].id, 0);
+    assert_eq!(slices[0].size, 100);
+    assert_eq!(slices[1].id, slice_id);
+    assert_eq!(slices[1].size, 100);
+
+    
+    /*
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != 0 {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocCollapesRange, 100, 50, nil); st != syscall.EINVAL {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocInsertRange, 100, 50, nil); st != syscall.EINVAL {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, inode, fallocCollapesRange, 100, 50, nil); st != syscall.ENOTSUP {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, inode, fallocPunchHole, 100, 50, nil); st != syscall.EINVAL {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 0, 0, nil); st != syscall.EINVAL {
+		t.Fatalf("fallocate: %s", st)
+	}
+	if st := m.Fallocate(ctx, parent, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != syscall.EPERM {
+		t.Fatalf("fallocate dir: %s", st)
+	}
+	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+		t.Fatalf("read chunk: %s", st)
+	}
+	if len(slices) != 3 || slices[1].Id != 0 || slices[1].Len != 50 || slices[2].Id != sliceId || slices[2].Len != 50 {
+		t.Fatalf("slices: %v", slices)
+	}
+    */
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {

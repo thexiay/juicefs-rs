@@ -4,6 +4,7 @@
 #![feature(duration_constructors)]
 #![feature(async_fn_traits)]
 #![feature(if_let_guard)]
+#![feature(linked_list_cursors)]
 
 pub mod config;
 pub mod error;
@@ -15,8 +16,7 @@ pub(crate) mod rds;
 pub(crate) mod utils;
 pub(crate) mod base;
 pub(crate) mod quota;
-pub(crate) mod data;
+pub(crate) mod slice;
 pub(crate) mod session;
 pub(crate) mod openfile;
-pub(crate) mod slice;
 pub(crate) mod random_test;

@@ -5,7 +5,7 @@ use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use snafu::{ensure, ensure_whatever, whatever};
-use std::collections::HashMap;
+use std::collections::{HashMap, LinkedList};
 use std::io::{Read, Write};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use crate::api::{
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
-use crate::data::MetaCompact;
+use crate::slice::{MetaCompact, PSlice, PSlices};
 use crate::error::{
     BadFDSnafu, DirNotEmptySnafu, InterruptedSnafu, InvalidArgSnafu, MetaErrorEnum,
     NoEntryFoundSnafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu, OpNotSupportedSnafu,
@@ -204,7 +204,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()>;
     async fn do_touch_atime(&self, inode: Ino, ts: Duration) -> Result<Attr>;
-    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
+    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Option<PSlices>>;
     async fn do_write(
         &self,
         inode: Ino,
@@ -2335,8 +2335,37 @@ where
     }
 
     // Read returns the list of slices on the given chunk.
-    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()> {
-        todo!()
+    async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>> {
+        let base = self.as_ref();
+        let file = base.open_files.lock(inode);
+        let of = file.lock().await;
+        if let Some(ss) = of.read_chunk(indx) {
+            return Ok(ss);
+        }
+        let pslices = self.do_read(inode, indx).await?;
+        ensure_whatever!(pslices.is_some(), "read chunk not found");
+        let pslices = pslices.unwrap();
+        if pslices.is_empty() {
+            let attr = self.get_attr(inode).await?;
+            if attr.typ != INodeType::File {
+                return InvalidArgSnafu {
+                    arg: format!("read: inode is not file."),
+                }
+                .fail()?;
+            }
+            Ok(Vec::new())
+        } else {
+            let pslices_len = pslices.len();
+            let slices = pslices.build_slices();
+            if !base.conf.read_only && (pslices_len >= 5 || slices.len() >= 5) {
+                let mut meta = dyn_clone::clone_box(self);
+                meta.with_cancel(self.token().child_token());
+                tokio::spawn(async move {
+                    meta.compact_chunk(inode, indx, false, false).await;
+                });
+            }
+            Ok(slices)
+        }
     }
 
     // NewSlice returns an id for new slice.

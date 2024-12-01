@@ -21,7 +21,7 @@ pub struct OpenFile {
     attr: Option<Attr>,
     refs: i32,  // refs is the number of open fileholders.
     last_check: Duration,
-    first: Vec<Slice>,
+    first: Option<Vec<Slice>>,
     chunks: HashMap<u32, Vec<Slice>>,
 }
 
@@ -78,16 +78,24 @@ impl OpenFile {
     pub fn invalidate_chunk(&mut self, indx: u32) {
         match indx {
             INVALIDATE_ALL_CHUNK => {
-                self.first.clear();
+                self.first = None;
                 self.chunks.clear();
             },
-            0 => self.first.clear(),
+            0 => self.first = None,
             _ => {
                 self.chunks.remove(&indx);
             }
         }
         self.last_check = Duration::ZERO;
     }
+
+    pub fn read_chunk(&self, indx: u32) -> Option<Vec<Slice>> {
+        if indx == 0 {
+            self.first.as_ref().map(|slices| slices.clone())
+        } else {
+            self.chunks.get(&indx).map(|v| v.clone())
+        }
+    } 
 }
 
 pub struct OpenFileChunkGuard<'a> {

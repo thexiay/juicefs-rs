@@ -90,15 +90,13 @@ pub struct Entry {
 
 // Slice is a slice of a chunk.
 // Multiple slices could be combined together as a chunk.
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Slice {
     pub id: u64,
     pub size: u32,
     pub off: u32,
     pub len: u32,
 }
-
-pub struct Slices(pub Vec<Slice>);
 
 #[derive(Default, Serialize, Deserialize)]
 // Summary represents the total number of files/directories and
@@ -542,7 +540,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn close(&self, inode: Ino) -> Result<()>;
 
     // Read returns the list of slices on the given chunk.
-    async fn read(&self, inode: Ino, indx: u32, slices: &Vec<Slice>) -> Result<()>;
+    async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
 
     // NewSlice returns an id for new slice.
     async fn new_slice(&self) -> Result<u64>;

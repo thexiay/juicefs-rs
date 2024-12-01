@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::acl::{self, AclExt, AclId, AclType, Rule};
 use crate::api::{
     Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask, Session,
-    SetAttrMask, Slice, Slices, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    SetAttrMask, Slice, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
@@ -34,6 +34,7 @@ use crate::error::{
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::{MetaQuota, Quota};
+use crate::slice::{PSlice, PSlices, Slices};
 use crate::utils::{self, DeleteFileOption};
 use std::collections::HashMap;
 
@@ -2845,8 +2846,9 @@ impl Engine for RedisEngine {
         })
     }
 
-    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>> {
-        unimplemented!()
+    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Option<PSlices>> {
+        let mut conn = self.share_conn();
+        Ok(conn.lrange(self.chunk_key(inode, indx), 0, -1).await?)
     }
 
     async fn do_write(
@@ -2891,7 +2893,7 @@ impl Engine for RedisEngine {
 
             let mut pipe = pipe();
             pipe.atomic();
-            pipe.rpush(self.chunk_key(inode, indx), bincode::serialize(&(off, &slice)).unwrap());
+            pipe.rpush(self.chunk_key(inode, indx), PSlice::new(&slice, off));
             // most of chunk are used by single inode, so use that as the default (1 == not exists)
 			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap()).ignore();
@@ -2943,7 +2945,6 @@ impl Engine for RedisEngine {
     }
 
     async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, i32> {
-        
         /*
         vals, err := m.rdb.HGetAll(ctx, m.parentKey(inode)).Result()
 	if err != nil {
