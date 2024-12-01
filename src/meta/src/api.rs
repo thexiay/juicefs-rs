@@ -88,13 +88,19 @@ pub struct Entry {
     pub attr: Attr,
 }
 
-// Slice is a slice of a chunk.
-// Multiple slices could be combined together as a chunk.
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+/// Slice is a continuous write in a chunk
+/// Multiple slices could be combined together as a chunk.
+/// One slice can only in one chunk.
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slice {
+    // slice id
     pub id: u64,
+    // slice total length
     pub size: u32,
+    // valid data offsite
     pub off: u32,
+    // valid data length
+    // actually not all data in slice is valid, not [off, off+len] is valid data
     pub len: u32,
 }
 
@@ -209,6 +215,15 @@ bitflags! {
         const O_EXCL = 1 << 7;
         const O_TRUNC = 1 << 9;
         const O_APPEND = 1 << 10;
+    }
+
+    pub struct Falloc: u8 {
+        const KEEP_SIZE = 1 << 0;
+        const PUNCH_HOLE = 1 << 1;
+        // const NO_HODE_STALE = 1 << 2;  RESERVED
+        const COLLAPES_RANGE = 1 << 3;
+        const ZERO_RANGE = 1 << 4;
+        const INSERT_RANGE = 1 << 5;
     }
 }
 
@@ -401,15 +416,15 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         skip_perm_check: bool,
     ) -> Result<Attr>;
 
-    // Fallocate preallocate given space for given file.
+    /// Fallocate preallocate given space for given file.
+    /// Returns the length of the file after fallocate.
     async fn fallocate(
         &self,
         inode: Ino,
-        mode: u8,
+        flag: Falloc,
         off: u64,
         size: u64,
-        length: &u64,
-    ) -> Result<()>;
+    ) -> Result<u64>;
 
     // ReadLink returns the target of a symlink.
     ///
@@ -551,7 +566,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// 
     /// * `inode` - inode of the file
     /// * `indx` - index of the chunk
-    /// * `off` - offset of the slice
+    /// * `off` - offset of the chunk
     /// * `slice` - slice description
     /// * `mtime` - modified time
     async fn write(

@@ -1,14 +1,16 @@
-use std::{collections::LinkedList, ops::Deref};
+use std::ops::Deref;
 
 use async_trait::async_trait;
 use redis::{ErrorKind, FromRedisValue, RedisError, ToRedisArgs, Value};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::{
     api::{Ino, Slice},
     base::{CommonMeta, Engine},
 };
 
+/// PSlice is a tree with it's node is a data range with latest data.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PSlice {
     id: u64,
@@ -37,18 +39,29 @@ impl PSlice {
 
     fn cut(mut self, pos: u32) -> (Option<PSlice>, Option<PSlice>) {
         if pos <= self.pos {
-            let left = self.left.unwrap_or(Box::new(PSlice {
-                id: 0,
-                size: 0,
-                off: 0,
-                len: self.pos - pos,
-                pos: pos,
-                left: None,
-                right: None,
-            }));
-            let (left, right) = left.cut(pos);
-            self.left = right.map(Box::new);
-            (left, Some(self))
+            let left = self.left.take().or_else(|| {
+                if self.pos - pos == 0 {
+                    None
+                } else {
+                    Some(Box::new(PSlice {
+                        id: 0,
+                        size: 0,
+                        off: 0,
+                        len: self.pos - pos,
+                        pos: pos,
+                        left: None,
+                        right: None,
+                    }))
+                }
+            });
+            match left {
+                Some(left) => {
+                    let (left, right) = left.cut(pos);
+                    self.left = right.map(Box::new);
+                    (left, Some(self))
+                }
+                None => (None, Some(self)),
+            }
         } else if pos < self.pos + self.len {
             let l = pos - self.pos;
             let mut right = PSlice {
@@ -60,31 +73,40 @@ impl PSlice {
                 left: None,
                 right: None,
             };
-            right.right = self.right;
+            right.right = self.right.take();
             self.len = l;
-            self.right = None;
             (Some(self), Some(right))
         } else {
-            let right = self.right.unwrap_or(Box::new(PSlice {
-                id: 0,
-                size: 0,
-                off: 0,
-                len: pos - self.pos - self.len,
-                pos: self.pos + self.len,
-                left: None,
-                right: None,
-            }));
-            let (left, right) = right.cut(pos);
-            self.right = left.map(Box::new);
-            (Some(self), right)
+            let right = self.right.take().or_else(|| {
+                if pos - self.pos - self.len == 0 {
+                    None
+                } else {
+                    Some(Box::new(PSlice {
+                        id: 0,
+                        size: 0,
+                        off: 0,
+                        len: pos - self.pos - self.len,
+                        pos: self.pos + self.len,
+                        left: None,
+                        right: None,
+                    }))
+                }
+            });
+            match right {
+                Some(right) => {
+                    let (left, right) = right.cut(pos);
+                    self.right = left.map(Box::new);
+                    (Some(self), right)
+                }
+                None => (Some(self), None),
+            }
         }
     }
 
     fn visit(&self, f: &mut impl FnMut(&PSlice)) {
         self.left.as_ref().map(|s| s.visit(f));
-        let right = self.right.as_ref();
         f(self); // self could be freed
-        right.map(|s| s.visit(f));
+        self.right.as_ref().map(|s| s.visit(f));
     }
 }
 
@@ -112,6 +134,7 @@ impl FromRedisValue for PSlice {
     }
 }
 
+#[derive(Debug)]
 pub struct PSlices {
     pslices: Vec<PSlice>,
 }
@@ -132,16 +155,20 @@ impl FromRedisValue for PSlices {
 }
 
 impl PSlices {
-    /// Build a list of slices from a list of flatten pslices
-    /// pslices should distribute the data to make data as equal as possible in each slice.
+    /// Build a list of slices from a list of flatten pslices stored in time order
+    /// **Return the slices make sure every data in the slices is the newest.**
     pub fn build_slices(self) -> Vec<Slice> {
         let mut root: Option<PSlice> = None;
         for mut pslice in self.pslices {
             if let Some(prev) = root {
+                debug!("cut before pslices: {prev:#?}");
                 let (left, right) = prev.cut(pslice.pos);
+                debug!("cut after pslices: left: {left:#?}, right: {right:#?}",);
                 pslice.left = left.map(Box::new);
                 if let Some(right) = right {
-                    let (_, right) = right.cut(pslice.pos + pslice.len);
+                    debug!("cut before pslices: {right:#?}");
+                    let (_left, right) = right.cut(pslice.pos + pslice.len);
+                    debug!("cut after pslices: left: {_left:#?}, right: {right:#?}",);
                     pslice.right = right.map(Box::new);
                 }
             }
@@ -152,6 +179,7 @@ impl PSlices {
         if let Some(root) = root {
             root.visit(&mut |s| {
                 if s.pos > pos {
+                    // blank interva, fill it with default slice id 0
                     chunk.push(Slice {
                         size: s.pos - pos,
                         len: s.pos - pos,
@@ -205,5 +233,98 @@ where
 
     async fn compact_chunk(&self, inode: Ino, indx: u32, once: bool, force: bool) {
         // TODO: fill it
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+
+    use crate::api::Slice;
+
+    use super::{PSlice, PSlices};
+
+    // id, (off, end)
+    impl From<(u64, Range<u32>)> for PSlice {
+        fn from((id, range): (u64, Range<u32>)) -> Self {
+            PSlice {
+                id,
+                size: range.end - range.start,
+                off: 0,
+                len: range.end - range.start,
+                pos: range.start,
+                left: None,
+                right: None,
+            }
+        }
+    }
+
+    // id, (off, end), (valid off, valid end)
+    impl From<(u64, Range<u32>, Range<u32>)> for Slice {
+        fn from((id, total, valid): (u64, Range<u32>, Range<u32>)) -> Self {
+            Slice {
+                id,
+                size: total.end - total.start,
+                off: valid.start - total.start,
+                len: valid.end - valid.start,
+            }
+        }
+    }
+
+    #[test]
+    fn slice_overlap() {
+        // lead overlap
+        let p1: PSlice = (1, 10..20).into();
+        let p2: PSlice = (2, 15..25).into();  // latest
+        let pslices = PSlices {
+            pslices: vec![p1, p2]
+        };
+        let slices = pslices.build_slices();
+        let s1 = (0, 0..10, 0..10).into();
+        let s2 = (1, 10..20, 10..15).into();
+        let s3 = (2, 15..25, 15..25).into();
+        let expect = vec![s1, s2, s3];
+        assert_eq!(slices, expect);
+
+        // tail overlap
+        let p1: PSlice = (1, 15..25).into();
+        let p2: PSlice = (2, 10..20).into();  // latest
+        let pslices = PSlices {
+            pslices: vec![p1, p2]
+        };
+        let slices = pslices.build_slices();
+        let s1 = (0, 0..10, 0..10).into();
+        let s2 = (2, 10..20, 10..20).into();
+        let s3 = (1, 15..25, 20..25).into();
+        let expect = vec![s1, s2, s3];
+        assert_eq!(slices, expect);
+    }
+
+    #[test]
+    fn slice_contains() {
+        // contains
+        let p1: PSlice = (1, 10..20).into();
+        let p2: PSlice = (2, 15..20).into();  // latest
+        let pslices = PSlices {
+            pslices: vec![p1, p2]
+        };
+        let slices = pslices.build_slices();
+        let s1 = (0, 0..10, 0..10).into();
+        let s2 = (1, 10..20, 10..15).into();
+        let s3 = (2, 15..20, 15..20).into();
+        let expect = vec![s1, s2, s3];
+        assert_eq!(slices, expect);
+
+        // contained
+        let p1: PSlice = (1, 15..20).into();
+        let p2: PSlice = (2, 10..20).into();  // latest
+        let pslices = PSlices {
+            pslices: vec![p1, p2]
+        };
+        let slices = pslices.build_slices();
+        let s1 = (0, 0..10, 0..10).into();
+        let s2 = (2, 10..20, 10..20).into();
+        let expect = vec![s1, s2];
+        assert_eq!(slices, expect);
     }
 }

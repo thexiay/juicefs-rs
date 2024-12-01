@@ -82,7 +82,10 @@ pub enum MetaErrorEnum {
     QuotaExceeded,
     #[snafu(display("No space left on device"))]
     NoSpace,
-    
+    #[snafu(display("Broken pipe: {ino}"))]
+    BrokenPipe {
+        ino: Ino
+    },
 
     // ----------------- other error  -------------------
     #[snafu(display("An connection error occurred: {:?}", source))]

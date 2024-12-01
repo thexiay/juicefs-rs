@@ -20,11 +20,9 @@ pub fn test_format() -> Format {
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     use std::time::UNIX_EPOCH;
 
-    use juice_meta::{
-        api::{INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE},
-        error::MetaErrorEnum,
+    use juice_meta::api::{
+        Falloc, INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE,
     };
-    use tracing::info;
 
     let attr = m.get_attr(ROOT_INODE).await.unwrap();
     assert_eq!(attr.mode, 0o777);
@@ -400,46 +398,61 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     )
     .await
     .expect("write f: ");
-    let slices = m
-        .read(inode, 0)
-        .await
-        .expect("read chunk: ");
+    let slices = m.read(inode, 0).await.expect("read chunk: ");
     assert_eq!(slices.len(), 2);
     assert_eq!(slices[0].id, 0);
     assert_eq!(slices[0].size, 100);
     assert_eq!(slices[1].id, slice_id);
     assert_eq!(slices[1].size, 100);
 
-    
-    /*
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != 0 {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocCollapesRange, 100, 50, nil); st != syscall.EINVAL {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocInsertRange, 100, 50, nil); st != syscall.EINVAL {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, inode, fallocCollapesRange, 100, 50, nil); st != syscall.ENOTSUP {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole, 100, 50, nil); st != syscall.EINVAL {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 0, 0, nil); st != syscall.EINVAL {
-		t.Fatalf("fallocate: %s", st)
-	}
-	if st := m.Fallocate(ctx, parent, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != syscall.EPERM {
-		t.Fatalf("fallocate dir: %s", st)
-	}
-	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
-		t.Fatalf("read chunk: %s", st)
-	}
-	if len(slices) != 3 || slices[1].Id != 0 || slices[1].Len != 50 || slices[2].Id != sliceId || slices[2].Len != 50 {
-		t.Fatalf("slices: %v", slices)
-	}
-    */
+    m.fallocate(inode, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 100, 50)
+        .await
+        .expect("fallocate: ");  // success
+    let rs = m
+        .fallocate(
+            inode,
+            Falloc::PUNCH_HOLE.union(Falloc::COLLAPES_RANGE),
+            100,
+            50,
+        )
+        .await;
+    assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let rs = m
+        .fallocate(
+            inode,
+            Falloc::PUNCH_HOLE.union(Falloc::INSERT_RANGE),
+            100,
+            50,
+        )
+        .await;
+    assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let rs = m.fallocate(inode, Falloc::COLLAPES_RANGE, 100, 50).await;
+    assert!(
+        rs.as_ref().unwrap_err().is_op_not_supported(),
+        "got {:?}",
+        rs
+    );
+    let rs = m.fallocate(inode, Falloc::PUNCH_HOLE, 100, 50).await;
+    assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let rs = m
+        .fallocate(inode, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 0, 0)
+        .await;
+    assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let rs = m
+        .fallocate(parent, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 100, 50)
+        .await;
+    assert!(
+        rs.as_ref().unwrap_err().is_op_not_permitted(),
+        "got {:?}",
+        rs
+    );
+
+    let slices = m.read(inode, 0).await.expect("read chunk: ");
+    assert_eq!(slices.len(), 3);
+    assert_eq!(slices[1].id, 0);
+    assert_eq!(slices[1].len, 50);
+    assert_eq!(slices[2].id, slice_id);
+    assert_eq!(slices[2].len, 50);
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {

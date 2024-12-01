@@ -20,20 +20,20 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
+    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
     SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE,
     TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
-use crate::slice::{MetaCompact, PSlice, PSlices};
 use crate::error::{
     BadFDSnafu, DirNotEmptySnafu, InterruptedSnafu, InvalidArgSnafu, MetaErrorEnum,
     NoEntryFoundSnafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu, OpNotSupportedSnafu,
     PermissionDeniedSnafu, QuotaExceededSnafu, ReadFSSnafu, Result,
 };
-use crate::openfile::{OpenFileChunkGuard, OpenFiles, INVALIDATE_ATTR_ONLY};
+use crate::openfile::{OpenFileChunkGuard, OpenFiles, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
 use crate::quota::{MetaQuota, Quota};
+use crate::slice::{MetaCompact, PSlice, PSlices};
 use crate::utils::{
     access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem,
     FreeID, PLockItem,
@@ -225,12 +225,10 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_fallocate(
         &self,
         inode: Ino,
-        mode: u8,
+        flag: Falloc,
         off: u64,
         size: u64,
-        delta: &mut DirStat,
-        attr: &mut Attr,
-    ) -> Result<()>;
+    ) -> Result<(DirStat, Attr)>;
 
     async fn do_compact_chunk(
         &self,
@@ -325,7 +323,7 @@ pub trait MetaOtherFunction {
     fn clear_sugid(&self, cur: &mut Attr, set: &mut u16);
 
     /// Alter attr atime, it will use cache attr or persist attr to decide whether to update atime.
-    /// 
+    ///
     /// caller makes sure inode is not special inode.
     async fn update_attr_atime(&self, ino: Ino, open: bool);
 
@@ -832,15 +830,18 @@ where
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
-        if let Some(attr) = of.get_attr() && attr.full && !self.is_atime_need_update(&attr, now) {
+        if let Some(attr) = of.get_attr()
+            && attr.full
+            && !self.is_atime_need_update(&attr, now)
+        {
             return;
         }
-        
-        // update persist layer atime 
+
+        // update persist layer atime
         match self.do_touch_atime(ino, now).await {
             Ok(mut attr) => {
                 of.put_attr(&mut attr);
-            },
+            }
             Err(e) => {
                 warn!("Update atime of inode {} failed: {}", ino, e);
             }
@@ -1671,7 +1672,7 @@ where
         skip_perm_check: bool,
     ) -> Result<Attr> {
         let file = self.as_ref().open_files.lock(inode);
-        let _ = file.lock().await;  // lock file until truncate finished
+        let _ = file.lock().await; // lock file until truncate finished
 
         let (attr, dir_stat) = self
             .do_truncate(inode, flags, attr_length, skip_perm_check)
@@ -1682,15 +1683,45 @@ where
     }
 
     // Fallocate preallocate given space for given file.
-    async fn fallocate(
-        &self,
-        inode: Ino,
-        mode: u8,
-        off: u64,
-        size: u64,
-        length: &u64,
-    ) -> Result<()> {
-        todo!()
+    async fn fallocate(&self, inode: Ino, flag: Falloc, off: u64, size: u64) -> Result<u64> {
+        if flag.intersects(Falloc::COLLAPES_RANGE) && flag != Falloc::COLLAPES_RANGE {
+            return InvalidArgSnafu {
+                arg: format!("fallocate: COLLAPES_RANGE has other flag"),
+            }
+            .fail()?;
+        }
+        if flag.intersects(Falloc::INSERT_RANGE) && flag != Falloc::INSERT_RANGE {
+            return InvalidArgSnafu {
+                arg: format!("fallocate: INSERT_RANGE has other flag"),
+            }
+            .fail()?;
+        }
+        ensure!(
+            flag != Falloc::INSERT_RANGE,
+            OpNotSupportedSnafu {
+                op: "not support op: INSERT RANGE. "
+            }
+        );
+        ensure!(
+            flag != Falloc::COLLAPES_RANGE,
+            OpNotSupportedSnafu {
+                op: "not support op: INSERT RANGE. "
+            }
+        );
+        if flag.intersects(Falloc::PUNCH_HOLE) && !flag.intersects(Falloc::KEEP_SIZE) {
+            return InvalidArgSnafu {
+                arg: format!("fallocate: KEEP_SIZE with size 0"),
+            }
+            .fail()?;
+        }
+        ensure!(size != 0, InvalidArgSnafu { arg: "fallocate: size 0" });
+        
+        let file = self.as_ref().open_files.lock(inode);
+        let _ = OpenFileChunkGuard::new(file.lock().await, INVALIDATE_ALL_CHUNK);
+        let (delta, attr) = self.do_fallocate(inode, flag, off, size).await?;
+        self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
+            .await;
+        Ok(attr.length)
     }
 
     // ReadLink returns the target of a symlink.
@@ -2255,7 +2286,9 @@ where
             // use cache if has cache
             let file = self.as_ref().open_files.lock(inode);
             let mut of = file.lock().await;
-            if of.is_open() && let Some(attr) = of.get_attr() {
+            if of.is_open()
+                && let Some(attr) = of.get_attr()
+            {
                 Some(attr)
             } else {
                 None
@@ -2310,7 +2343,8 @@ where
         let file = base.open_files.lock(inode);
         let mut of = file.lock().await;
         of.close();
-        if !of.is_open() {  // lock during close file
+        if !of.is_open() {
+            // lock during close file
             let removed = {
                 let mut removed_files = base.removed_files.lock();
                 removed_files.remove(&inode)
@@ -2394,7 +2428,8 @@ where
         // TODO: lock with whole function?
         let _ = OpenFileChunkGuard::new(file.lock().await, indx);
         let (num_slices, delta, attr) = self.do_write(inode, indx, off, slice, mtime).await?;
-        self.update_parent_stats(inode, attr.parent, delta.length, delta.space).await;
+        self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
+            .await;
         if num_slices % 100 == 99 || num_slices > 350 {
             if num_slices < MAX_SLICES {
                 let mut meta = dyn_clone::clone_box(self);

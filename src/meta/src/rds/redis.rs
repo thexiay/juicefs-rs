@@ -16,12 +16,12 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclExt, AclId, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask, Session,
-    SetAttrMask, Slice, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    Attr, Entry, Falloc, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask,
+    Session, SetAttrMask, Slice, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
@@ -30,12 +30,15 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{Uid, UserExt, WithContext};
 use crate::error::{
-    ConnectionSnafu, DirNotEmptySnafu, EntryExistsSnafu, InvalidArgSnafu, MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu, OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result
+    BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExistsSnafu, InvalidArgSnafu,
+    MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu,
+    OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu,
+    RenameSameInoSnafu, Result,
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::{MetaQuota, Quota};
 use crate::slice::{PSlice, PSlices, Slices};
-use crate::utils::{self, DeleteFileOption};
+use crate::utils::{self, align_4k, DeleteFileOption};
 use std::collections::HashMap;
 
 use std::time::{Duration, SystemTime};
@@ -849,8 +852,15 @@ impl RedisEngine {
         }
     }
 
-    async fn do_get_parents_inner(&self, conn: &mut impl AsyncCommands, inode: Ino) -> HashMap<Ino, u32> {
-         match conn.hgetall::<_, HashMap<u64, u32>>(self.parent_key(inode)).await {
+    async fn do_get_parents_inner(
+        &self,
+        conn: &mut impl AsyncCommands,
+        inode: Ino,
+    ) -> HashMap<Ino, u32> {
+        match conn
+            .hgetall::<_, HashMap<u64, u32>>(self.parent_key(inode))
+            .await
+        {
             Ok(ps) => ps,
             Err(e) => {
                 warn!("Scan parent key of inode {}: {}", inode, e);
@@ -1650,8 +1660,7 @@ impl Engine for RedisEngine {
             name: path.to_string(),
             uid: *self.uid(),
         };
-        let (ino, attr) =
-            RedisEngine::handle_script_result(arg, cmd.query_async(&mut conn).await)?;
+        let (ino, attr) = RedisEngine::handle_script_result(arg, cmd.query_async(&mut conn).await)?;
         Ok((ino, attr))
     }
 
@@ -1975,10 +1984,7 @@ impl Engine for RedisEngine {
                 let mut pattr = bincode::deserialize::<Attr>(&pattr_bytes)?;
                 // double check: parent mut be a dir and access mode
                 if pattr.typ != INodeType::Directory {
-                    return NotDir2Snafu {
-                        ino: parent,
-                    }
-                    .fail()?;
+                    return NotDir2Snafu { ino: parent }.fail()?;
                 }
                 self.access(parent, ModeMask::WRITE | ModeMask::EXECUTE, &pattr)
                     .await?;
@@ -2448,7 +2454,8 @@ impl Engine for RedisEngine {
                             name: name_dst.to_string(),
                             exist_ino: *ino_dst,
                             exist_attr: None,
-                        }.fail()?;
+                        }
+                        .fail()?;
                     }
                     watch_keys.push(self.inode_key(*ino_dst));
                     if *typ_dst == INodeType::Directory {
@@ -2484,10 +2491,7 @@ impl Engine for RedisEngine {
                 }
                 let mut pattr_src: Attr = bincode::deserialize(rs[0].as_ref().unwrap())?;
                 if pattr_src.typ != INodeType::Directory {
-                    return NotDir2Snafu {
-                        ino: parent_src,
-                    }
-                    .fail()?;
+                    return NotDir2Snafu { ino: parent_src }.fail()?;
                 }
                 self.access(
                     parent_src,
@@ -2497,10 +2501,7 @@ impl Engine for RedisEngine {
                 .await?;
                 let mut pattr_dst: Attr = bincode::deserialize(rs[1].as_ref().unwrap())?;
                 if pattr_dst.typ != INodeType::Directory {
-                    return NotDir2Snafu {
-                        ino: parent_dst,
-                    }
-                    .fail()?;
+                    return NotDir2Snafu { ino: parent_dst }.fail()?;
                 }
                 // TODO: why dst parent inode can't be trash
                 if flags.intersects(RenameMask::RESTORE) && pattr_dst.parent > TRASH_INODE {
@@ -2828,7 +2829,9 @@ impl Engine for RedisEngine {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, self.inode_key(inode), {
-            let attr_bytes = conn.get::<_, Option<Vec<u8>>>(self.inode_key(inode)).await?;
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await?;
             ensure!(attr_bytes.is_some(), NoEntryFound2Snafu { ino: inode });
             let mut attr: Attr = bincode::deserialize(&attr_bytes.unwrap())?;
             let now = SystemTime::now()
@@ -2862,10 +2865,17 @@ impl Engine for RedisEngine {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(inode)], {
-            let attr_bytes = conn.get::<_, Option<Vec<u8>>>(self.inode_key(inode)).await?;
-            ensure!(attr_bytes.is_some(), NoEntryFound2Snafu { ino: inode});
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await?;
+            ensure!(attr_bytes.is_some(), NoEntryFound2Snafu { ino: inode });
             let mut attr: Attr = bincode::deserialize(&attr_bytes.unwrap())?;
-            ensure!(attr.typ == INodeType::File, OpNotPermittedSnafu { op: "write into a non file" });
+            ensure!(
+                attr.typ == INodeType::File,
+                OpNotPermittedSnafu {
+                    op: "write into a non file"
+                }
+            );
             let new_len = CHUNK_SIZE * indx as u64 + off as u64 + slice.len as u64;
             let delta = if new_len > attr.length {
                 attr.length = new_len;
@@ -2880,7 +2890,10 @@ impl Engine for RedisEngine {
             let parents = if attr.parent > 0 {
                 vec![attr.parent]
             } else {
-                self.do_get_parents_inner(conn, inode).await.into_keys().collect()
+                self.do_get_parents_inner(conn, inode)
+                    .await
+                    .into_keys()
+                    .collect()
             };
             self.check_quotas(delta.space, 0, parents).await?;
 
@@ -2895,8 +2908,9 @@ impl Engine for RedisEngine {
             pipe.atomic();
             pipe.rpush(self.chunk_key(inode, indx), PSlice::new(&slice, off));
             // most of chunk are used by single inode, so use that as the default (1 == not exists)
-			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
-            pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap()).ignore();
+            // pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
+            pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap())
+                .ignore();
             if delta.space > 0 {
                 pipe.incr(self.used_space_key(), delta.space).ignore();
             }
@@ -2920,13 +2934,106 @@ impl Engine for RedisEngine {
     async fn do_fallocate(
         &self,
         inode: Ino,
-        mode: u8,
+        flag: Falloc,
         off: u64,
         size: u64,
-        delta: &mut DirStat,
-        attr: &mut Attr,
-    ) -> Result<()> {
-        unimplemented!()
+    ) -> Result<(DirStat, Attr)> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+
+        async_transaction!(conn, &[self.inode_key(inode)], {
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await?;
+            ensure!(attr_bytes.is_some(), NoEntryFound2Snafu { ino: inode });
+            let mut attr: Attr = bincode::deserialize(&attr_bytes.unwrap())?;
+            ensure!(attr.typ != INodeType::FIFO, BrokenPipeSnafu { ino: inode });
+            ensure!(
+                attr.typ == INodeType::File,
+                OpNotPermittedSnafu {
+                    op: "fallocate a non file"
+                }
+            );
+            ensure!(
+                !attr.flags.intersects(Flag::IMMUTABLE),
+                OpNotPermittedSnafu {
+                    op: "fallocate a immutable  file"
+                }
+            );
+            self.access(inode, ModeMask::WRITE, &attr).await?;
+            if attr.flags.intersects(Flag::APPEND) && !flag.difference(Falloc::KEEP_SIZE).is_empty() {
+                return OpNotPermittedSnafu {
+                    op: "fallocate a append file but not keep size".to_string(),
+                }
+                .fail()?;
+            }
+
+            let length = if off + size > attr.length && !flag.intersects(Falloc::KEEP_SIZE) {
+                off + size
+            } else {
+                attr.length
+            };
+            let old = attr.length;
+            let delta = DirStat {
+                length: length as i64 - old as i64,
+                space: align_4k(length) - align_4k(old),
+                inodes: 0,
+            };
+            let parents = if attr.parent > 0 {
+                vec![attr.parent]
+            } else {
+                self.do_get_parents_inner(conn, inode)
+                    .await
+                    .into_keys()
+                    .collect()
+            };
+            self.check_quotas(delta.space, 0, parents).await?;
+
+            // modify attr
+            attr.length = length;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos();
+            attr.mtime = now;
+            attr.ctime = now;
+            let mut pipe = pipe();
+            pipe.atomic();
+            pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
+            if flag.intersects(Falloc::ZERO_RANGE.union(Falloc::PUNCH_HOLE)) && off < old {
+                let (mut off, mut size) = (off, size);
+                if off + size > old {
+                    size = old - off;
+                }
+                while size > 0 {
+                    let indx = (off / CHUNK_SIZE) as u32;
+                    let coff = off % CHUNK_SIZE;
+                    let len = if coff + size > CHUNK_SIZE {
+                        CHUNK_SIZE - coff
+                    } else {
+                        size
+                    };
+                    pipe.rpush(
+                        self.chunk_key(inode, indx),
+                        PSlice::new(
+                            &Slice {
+                                id: 0,
+                                size: 0,
+                                off: 0,
+                                len: len as u32,
+                            },
+                            coff as u32,
+                        ),
+                    );
+                    off += len;
+                    size -= len;
+                    debug!("11111");
+                }
+            }
+            pipe.incr(self.used_space_key(), align_4k(length) - align_4k(old));
+            pipe.query_async(conn).await?;
+            Ok::<_, MetaError>(Some((delta, attr)))
+        })
     }
 
     async fn do_compact_chunk(
@@ -2946,20 +3053,20 @@ impl Engine for RedisEngine {
 
     async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, i32> {
         /*
-        vals, err := m.rdb.HGetAll(ctx, m.parentKey(inode)).Result()
-	if err != nil {
-		logger.Warnf("Scan parent key of inode %d: %s", inode, err)
-		return nil
-	}
-	ps := make(map[Ino]int)
-	for k, v := range vals {
-		if n, _ := strconv.Atoi(v); n > 0 {
-			ino, _ := strconv.ParseUint(k, 10, 64)
-			ps[Ino(ino)] = n
-		}
-	}
-	return ps
-         */
+            vals, err := m.rdb.HGetAll(ctx, m.parentKey(inode)).Result()
+        if err != nil {
+            logger.Warnf("Scan parent key of inode %d: %s", inode, err)
+            return nil
+        }
+        ps := make(map[Ino]int)
+        for k, v := range vals {
+            if n, _ := strconv.Atoi(v); n > 0 {
+                ino, _ := strconv.ParseUint(k, 10, 64)
+                ps[Ino(ino)] = n
+            }
+        }
+        return ps
+             */
         unimplemented!()
     }
 
