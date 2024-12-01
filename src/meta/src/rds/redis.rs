@@ -211,7 +211,7 @@ macro_rules! async_transaction {
 ///       it may break transaction. So we use [`ExclusiveConnection`] to as pool conn.
 ///       [relational issue](https://github.com/redis-rs/redis-rs/issues/1257)
 /// shared_conn: A shared connection.It use [`redis::aio::MultiplexedConnection`]
-pub struct RedisEngine {
+pub struct RedisHandle {
     // TODO: single connection or multiple connections?
     /// Redis Sentinel mode
     /// Redis Cluster mode
@@ -225,7 +225,7 @@ pub struct RedisEngine {
     meta: CommonMeta,
 }
 
-impl RedisEngine {
+impl RedisHandle {
     fn should_retry(err: &RedisError) -> bool {
         !err.is_unrecoverable_error()
     }
@@ -506,28 +506,28 @@ impl RedisEngine {
 
 /// Redis Engine with Context
 /// Context is independent execution context
-pub struct RedisEngineWithCtx {
-    engine: Arc<RedisEngine>,
+pub struct RedisEngine {
+    engine: Arc<RedisHandle>,
     uid: u32,
     gid: u32,
     gids: Vec<u32>,
     token: CancellationToken,
 }
 
-impl Deref for RedisEngineWithCtx {
-    type Target = RedisEngine;
+impl Deref for RedisEngine {
+    type Target = RedisHandle;
     fn deref(&self) -> &Self::Target {
         &self.engine
     }
 }
 
-impl AsRef<CommonMeta> for RedisEngineWithCtx {
+impl AsRef<CommonMeta> for RedisEngine {
     fn as_ref(&self) -> &CommonMeta {
         &self.engine.meta
     }
 }
 
-impl RedisEngineWithCtx {
+impl RedisEngine {
     /// redis URL:
     /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
     pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
@@ -554,7 +554,7 @@ impl RedisEngineWithCtx {
             })?;
 
         let meta = CommonMeta::new(addr, conf);
-        let engine = RedisEngine {
+        let engine = RedisHandle {
             pool,
             shared_conn: conn,
             prefix,
@@ -564,7 +564,7 @@ impl RedisEngineWithCtx {
         };
 
         engine.check_server_config().await?;
-        Ok(Box::new(RedisEngineWithCtx {
+        Ok(Box::new(RedisEngine {
             engine: Arc::new(engine),
             uid: 0,
             gid: 0,
@@ -650,7 +650,7 @@ impl RedisEngineWithCtx {
             slices.into_iter().filter(|s| s.id > 0).for_each(|slice| {
                 pipe.hincr(
                     self.slice_refs(),
-                    RedisEngine::slice_key(slice.id, slice.size),
+                    RedisHandle::slice_key(slice.id, slice.size),
                     -1,
                 );
                 todel.push(slice);
@@ -924,9 +924,9 @@ impl RedisEngineWithCtx {
     }
 }
 
-impl Clone for RedisEngineWithCtx {
+impl Clone for RedisEngine {
     fn clone(&self) -> Self {
-        RedisEngineWithCtx {
+        RedisEngine {
             engine: self.engine.clone(),
             uid: self.uid,
             gid: self.gid,
@@ -936,7 +936,7 @@ impl Clone for RedisEngineWithCtx {
     }
 }
 
-impl WithContext for RedisEngineWithCtx {
+impl WithContext for RedisEngine {
     fn with_login(&mut self, uid: u32, gids: Vec<u32>) {
         assert!(gids.len() > 0);
         self.uid = uid;
@@ -965,7 +965,7 @@ impl WithContext for RedisEngineWithCtx {
 }
 
 #[async_trait]
-impl Engine for RedisEngineWithCtx {
+impl Engine for RedisEngine {
     async fn get_counter(&self, name: &str) -> Result<i64> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
@@ -1348,7 +1348,7 @@ impl Engine for RedisEngineWithCtx {
                     pipe.atomic()
                         .zadd(
                             self.del_files(),
-                            RedisEngine::to_delete(inode, attr.length),
+                            RedisHandle::to_delete(inode, attr.length),
                             ts,
                         )
                         .del(self.inode_key(inode))
@@ -1584,7 +1584,7 @@ impl Engine for RedisEngineWithCtx {
                 parent,
                 name: name.to_string(),
             };
-            match RedisEngineWithCtx::handle_script_result(arg, cmd.query_async(&mut conn).await) {
+            match RedisEngine::handle_script_result(arg, cmd.query_async(&mut conn).await) {
                 Ok((ino, attr)) => return Ok((ino, attr)),
                 Err(err) => {
                     if err.is_op_not_supported() {
@@ -1650,7 +1650,7 @@ impl Engine for RedisEngineWithCtx {
             uid: *self.uid(),
         };
         let (ino, attr) =
-            RedisEngineWithCtx::handle_script_result(arg, cmd.query_async(&mut conn).await)?;
+            RedisEngine::handle_script_result(arg, cmd.query_async(&mut conn).await)?;
         Ok((ino, attr))
     }
 
@@ -2101,7 +2101,7 @@ impl Engine for RedisEngineWithCtx {
                                     .as_secs();
                                 pipe.zadd(
                                     self.del_files(),
-                                    RedisEngine::to_delete(ino, attr.length),
+                                    RedisHandle::to_delete(ino, attr.length),
                                     ts,
                                 );
                                 pipe.del(self.inode_key(ino));
@@ -2725,7 +2725,7 @@ impl Engine for RedisEngineWithCtx {
                                 } else {
                                     pipe.zadd(
                                         self.del_files(),
-                                        RedisEngine::to_delete(ino_dst, attr_dst.length),
+                                        RedisHandle::to_delete(ino_dst, attr_dst.length),
                                         now.as_secs(),
                                     );
                                     pipe.del(self.inode_key(ino_dst));

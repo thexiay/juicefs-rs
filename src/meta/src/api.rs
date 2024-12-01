@@ -20,7 +20,7 @@ use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
 use crate::error::{DriverSnafu, Result};
 use crate::quota::Quota;
-use crate::rds::RedisEngineWithCtx;
+use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
 pub const RESERVED_INODE: Ino = 0;
@@ -695,7 +695,7 @@ pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
         None => panic!("invalid uri {}", uri),
     };
     let res: Result<Box<dyn Meta>> = match driver {
-        "redis" => RedisEngineWithCtx::new(driver, addr, conf).await,
+        "redis" => RedisEngine::new(driver, addr, conf).await,
         _ => Err(DriverSnafu {
             driver: driver.to_string(),
         }

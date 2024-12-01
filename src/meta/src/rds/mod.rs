@@ -2,4 +2,4 @@ mod redis;
 mod check;
 mod conn;
 
-pub use redis::RedisEngineWithCtx as RedisEngineWithCtx;
+pub use redis::RedisEngine as RedisEngineWithCtx;
