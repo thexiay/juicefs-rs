@@ -20,9 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
-    SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, MAX_VERSION, RESERVED_INODE, ROOT_INODE,
-    TRASH_INODE, TRASH_NAME,
+    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -200,8 +198,10 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         name_dst: &str,
         flags: RenameMask,
     ) -> Result<(Ino, Attr, Option<(Ino, Attr)>)>;
-    async fn do_set_xattr(&self, inode: Ino, name: String, value: Bytes, flags: u32) -> Result<()>;
-    async fn do_remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
+    async fn do_set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()>;
+    async fn do_get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>>;
+    async fn do_list_xattr(&self, inode: Ino) -> Result<Vec<u8>>;
+    async fn do_remove_xattr(&self, inode: Ino, name: &str) -> Result<()>;
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()>;
     async fn do_touch_atime(&self, inode: Ino, ts: Duration) -> Result<Attr>;
     async fn do_read(&self, inode: Ino, indx: u32) -> Result<Option<PSlices>>;
@@ -2470,23 +2470,28 @@ where
     }
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()> {
-        todo!()
+    async fn get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>> {
+        self.do_get_xattr(inode, name).await
     }
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()> {
-        todo!()
+    async fn list_xattr(&self, inode: Ino) -> Result<Vec<u8>> {
+        self.do_list_xattr(inode).await
     }
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()> {
-        todo!()
+    async fn set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()> {
+        ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
+        ensure!(!name.is_empty(), InvalidArgSnafu { arg: "set xattr empty name" });
+        self.do_set_xattr(inode, name, value, flag).await
     }
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()> {
-        todo!()
+    async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<()> {
+        ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
+        ensure!(!name.is_empty(), InvalidArgSnafu { arg: "remove xattr empty name" });
+
+        self.do_remove_xattr(inode.transfer_root(self.as_ref().root), name).await
     }
 
     // Flock tries to put a lock on given file.

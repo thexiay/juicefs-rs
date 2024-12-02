@@ -40,6 +40,11 @@ pub enum MetaErrorEnum {
         exist_ino: Ino,
         exist_attr: Option<Attr>,
     },
+    #[snafu(display("Entry alreay exists: {ino}"))]
+    EntryExists2 {
+        ino: Ino,
+        exist_attr: Option<Attr>,
+    },
     #[snafu(display("Bad file descriptor: {fd}"))]
     BadFD {
         fd: Ino,
@@ -86,6 +91,8 @@ pub enum MetaErrorEnum {
     BrokenPipe {
         ino: Ino
     },
+    #[snafu(display("No such attribute."))]
+    NoSuchAttr,
 
     // ----------------- other error  -------------------
     #[snafu(display("An connection error occurred: {:?}", source))]
@@ -177,6 +184,14 @@ impl MetaError {
         )
     }
 
+    pub fn is_entry_exists2(&self, ino: &Ino) -> bool {
+        matches!(
+            self.inner(),
+            MetaErrorEnum::EntryExists2 { ino: ino_, .. }
+            if ino == ino_
+        )
+    }
+
     pub fn is_dir_not_empty(&self, parent: &Ino, name: &str) -> bool {
         matches!(
             self.inner(),
@@ -217,6 +232,10 @@ impl MetaError {
 
     pub fn is_op_not_permitted(&self) -> bool {
         matches!(self.inner(), MetaErrorEnum::OpNotPermitted { .. })
+    }
+
+    pub fn is_no_such_attr(&self) -> bool {
+        matches!(self.inner(), MetaErrorEnum::NoSuchAttr)
     }
 }
 

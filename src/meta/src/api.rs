@@ -225,6 +225,12 @@ bitflags! {
         const ZERO_RANGE = 1 << 4;
         const INSERT_RANGE = 1 << 5;
     }
+
+    pub struct XattrF: u32 {
+        const CREATE_OR_REPLACE = 0;
+        const CREATE = 1 << 0;
+        const REPLACE = 1 << 1;
+    }
 }
 
 // Attr represents attributes of a node.
@@ -598,16 +604,16 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()>;
+    async fn get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>>;
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()>;
+    async fn list_xattr(&self, inode: Ino) -> Result<Vec<u8>>;
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()>;
+    async fn set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()>;
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
+    async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<()>;
 
     // Flock tries to put a lock on given file.
     async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()>;

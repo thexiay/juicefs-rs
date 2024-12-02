@@ -20,8 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclExt, AclId, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask,
-    Session, SetAttrMask, Slice, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE,
+    Attr, Entry, Falloc, Flag, Flock, INodeType, Ino, InoExt, Meta, ModeMask, Plock, RenameMask, Session, SetAttrMask, Slice, XattrF, CHUNK_SIZE, MAX_FILE_NAME_LEN, ROOT_INODE, TRASH_INODE
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
@@ -30,10 +29,7 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{Uid, UserExt, WithContext};
 use crate::error::{
-    BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExistsSnafu, InvalidArgSnafu,
-    MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu,
-    OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu,
-    RenameSameInoSnafu, Result,
+    BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExists2Snafu, EntryExistsSnafu, InvalidArgSnafu, MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu, NoSuchAttrSnafu, NotDir1Snafu, NotDir2Snafu, OpNotPermittedSnafu, OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result
 };
 use crate::openfile::INVALIDATE_ATTR_ONLY;
 use crate::quota::{MetaQuota, Quota};
@@ -439,7 +435,7 @@ impl RedisHandle {
         }
         logger.Infof("Ping redis latency: %s", time.Since(start))
              */
-    }
+    }    
 
     /*
     async fn txn_with_retry<
@@ -2813,12 +2809,69 @@ impl Engine for RedisEngine {
         Ok((ino_src, attr_src, exists_entry))
     }
 
-    async fn do_set_xattr(&self, inode: Ino, name: String, value: Bytes, flags: u32) -> Result<()> {
-        unimplemented!()
+    async fn do_set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flags: XattrF) -> Result<()> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &self.xattr_key(inode), {
+            let key = self.xattr_key(inode);
+            match flags {
+                XattrF::CREATE => {
+                    let ok = conn.hset_nx::<_,_,_,bool>(key, name, &value).await?;
+                    ensure!(ok, EntryExists2Snafu { ino: inode, exist_attr: None});
+                }
+                XattrF::REPLACE => {
+                    let ok = conn.hexists::<_,_,bool>(key, name).await?;
+                    ensure!(ok, NoSuchAttrSnafu);
+                }
+                _ => {
+                    conn.hset(key, name, &value).await?;
+                }
+            }
+            Ok::<_, MetaError>(Some(()))
+        })
     }
 
-    async fn do_remove_xattr(&self, inode: Ino, name: String) -> Result<()> {
-        unimplemented!()
+    async fn do_get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>> {
+        let inode = inode.transfer_root(self.meta.root);
+        let mut conn = self.share_conn();
+        let vbuff = conn.hget::<_, _, Option<Vec<u8>>>(self.xattr_key(inode), name).await?;
+        ensure!(vbuff.is_some(), NoSuchAttrSnafu);
+        Ok(vbuff.unwrap())
+    }
+
+    async fn do_list_xattr(&self, inode: Ino) -> Result<Vec<u8>> {
+        let inode = inode.transfer_root(self.meta.root);
+        let mut conn = self.share_conn();
+        let vals = conn.hkeys::<_, Option<Vec<Vec<u8>>>>(self.xattr_key(inode)).await?;
+        ensure!(vals.is_some(), NoEntryFound2Snafu { ino: inode });
+        let mut names = Vec::new();
+        for name in vals.unwrap() {
+            names.extend_from_slice(&name);
+            names.push(0_u8);
+        }
+
+        let val = conn.get::<_, Option<Vec<u8>>>(self.inode_key(inode)).await?;
+        ensure!(val.is_some(), NoEntryFound2Snafu { ino: inode });
+        let attr: Attr = bincode::deserialize(&val.unwrap())?;
+        
+        if attr.access_acl != 0 {
+            names.extend_from_slice(b"system.posix_acl_access");
+            names.push(0_u8);
+        }
+        if attr.default_acl != 0 {
+            names.extend_from_slice(b"system.posix_acl_default");
+            names.push(0_u8);
+        }
+        Ok(names)
+        
+    }
+
+    async fn do_remove_xattr(&self, inode: Ino, name: &str) -> Result<()> {
+        let mut conn = self.share_conn();
+        let n = conn.hdel::<_, _, Option<u32>>(self.xattr_key(inode), name).await?;
+        ensure!(n.is_some(), NoEntryFound2Snafu { ino: inode });
+        ensure!(n.unwrap() != 0, NoSuchAttrSnafu);
+        Ok(())
     }
 
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()> {

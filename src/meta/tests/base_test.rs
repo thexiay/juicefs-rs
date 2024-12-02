@@ -21,7 +21,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     use std::time::UNIX_EPOCH;
 
     use juice_meta::api::{
-        Falloc, INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, ROOT_INODE,
+        Falloc, INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, XattrF, ROOT_INODE,
     };
 
     let attr = m.get_attr(ROOT_INODE).await.unwrap();
@@ -407,7 +407,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
 
     m.fallocate(inode, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 100, 50)
         .await
-        .expect("fallocate: ");  // success
+        .expect("fallocate: "); // success
     let rs = m
         .fallocate(
             inode,
@@ -453,6 +453,66 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert_eq!(slices[1].len, 50);
     assert_eq!(slices[2].id, slice_id);
     assert_eq!(slices[2].len, 50);
+
+    // xattr
+    m.set_xattr(
+        inode,
+        "a",
+        "v".as_bytes().to_owned(),
+        XattrF::CREATE_OR_REPLACE,
+    )
+    .await
+    .expect("setxattr: ");
+    m.set_xattr(
+        inode,
+        "a",
+        "v2".as_bytes().to_owned(),
+        XattrF::CREATE_OR_REPLACE,
+    )
+    .await
+    .expect("setxattr: ");
+    let value = m.get_xattr(inode, "a").await.expect("getxattr: ");
+    assert_eq!(value, "v2".as_bytes());
+    let value = m.list_xattr(inode).await.expect("listxattr: ");
+    assert_eq!(value, "a\0".as_bytes());
+    m.unlink(ROOT_INODE, "F3", false).await.expect("unlink F3: ");
+    let value = m.get_xattr(inode, "a").await.expect("getxattr: ");
+    assert_eq!(value, "v2".as_bytes());
+    m.remove_xattr(inode, "a").await.expect("removexattr: ");
+    let rs = m.set_xattr(
+        inode,
+        "a",
+        "v".as_bytes().to_owned(),
+        XattrF::REPLACE,
+    ).await;
+    assert!(rs.as_ref().unwrap_err().is_no_such_attr(), "got {:?}", rs);
+    m.set_xattr(
+        inode,
+        "a",
+        "v3".as_bytes().to_owned(),
+        XattrF::CREATE,
+    ).await.expect("setxattr: ");
+    let rs = m.set_xattr(
+        inode,
+        "a",
+        "v3".as_bytes().to_owned(),
+        XattrF::CREATE,
+    ).await;
+    assert!(rs.as_ref().unwrap_err().is_entry_exists2(&inode), "got {:?}", rs);
+    m.set_xattr(
+        inode,
+        "a",
+        "v3".as_bytes().to_owned(),
+        XattrF::REPLACE,
+    ).await.expect("setxattr: ");
+    m.set_xattr(
+        inode,
+        "a",
+        "v4".as_bytes().to_owned(),
+        XattrF::REPLACE,
+    ).await.expect("setxattr: ");
+
+
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
