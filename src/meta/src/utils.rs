@@ -41,6 +41,8 @@ pub struct FLockItem {
 pub enum DeleteFileOption {
     Deferred,
     Immediate {
+        // if force, it will wait semaphore to be acquired
+        // if not, it will skip this delete
         force: bool,
     },
 }

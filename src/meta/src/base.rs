@@ -20,7 +20,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
+    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
+    SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE,
+    ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -30,7 +32,7 @@ use crate::error::{
     PermissionDeniedSnafu, QuotaExceededSnafu, ReadFSSnafu, Result,
 };
 use crate::openfile::{OpenFileChunkGuard, OpenFiles, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
-use crate::quota::{MetaQuota, Quota};
+use crate::quota::{MetaQuota, Quota, QuotaView};
 use crate::slice::{MetaCompact, PSlice, PSlices};
 use crate::utils::{
     access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem,
@@ -50,8 +52,8 @@ pub const NEXT_INODE: &str = "nextinode";
 pub const NEXT_CHUNK: &str = "nextchunk";
 pub const NEXT_SESSION: &str = "nextsession";
 pub const NEXT_TRASH: &str = "nexttrash";
-pub const USED_SPACE: &str = "usedSpace";
-pub const TOTAL_INODES: &str = "totalInodes";
+pub const USED_SPACE: &str = "usedSpace";  // used space 
+pub const TOTAL_INODES: &str = "totalInodes"; // used inodes
 
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
@@ -156,7 +158,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_find_detached_nodes(&self, t: SystemTime) -> Vec<Ino>;
     async fn do_cleanup_detached_node(&self, detached_node: Ino) -> Result<()>;
     // quota manage
-    async fn do_get_quota(&self, inode: Ino) -> Result<Quota>;
+    async fn do_get_quota(&self, inode: Ino) -> Result<Option<QuotaView>>;
     async fn do_del_quota(&self, inode: Ino) -> Result<()>;
     async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
     async fn do_flush_quotas(&self, quotas: &HashMap<Ino, (i64, i64)>) -> Result<()>;
@@ -198,7 +200,13 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         name_dst: &str,
         flags: RenameMask,
     ) -> Result<(Ino, Attr, Option<(Ino, Attr)>)>;
-    async fn do_set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()>;
+    async fn do_set_xattr(
+        &self,
+        inode: Ino,
+        name: &str,
+        value: Vec<u8>,
+        flag: XattrF,
+    ) -> Result<()>;
     async fn do_get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>>;
     async fn do_list_xattr(&self, inode: Ino) -> Result<Vec<u8>>;
     async fn do_remove_xattr(&self, inode: Ino, name: &str) -> Result<()>;
@@ -605,7 +613,7 @@ where
                         false => max_deleting
                             .try_acquire()
                             .inspect_err(|err| {
-                                warn!("try acquire delete inode({}) permit failed: {}", inode, err);
+                                warn!("Have no resource to delete inode({}), {}. It may can't delete it immediate.", inode, err);
                             })
                             .ok(),
                     };
@@ -628,9 +636,12 @@ where
         count: Arc<AtomicU64>,
         max_removing: Arc<Semaphore>,
     ) -> Result<()> {
+        info!("remove dir {inode} start");
         self.remove_dir(inode, skip_check_trash, count.clone(), max_removing.clone())
             .await?;
+        info!("remove dir {inode} end");
         if !inode.is_trash() {
+            info!("rmdir {parent} {name} start");
             match self.rmdir(parent, name, skip_check_trash).await {
                 Err(err) => {
                     if err.is_dir_not_empty(&parent, name) {
@@ -649,6 +660,7 @@ where
                     }
                 }
                 _ => {
+                    info!("rmdir {parent} {name} end");
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -664,7 +676,9 @@ where
         max_removing: Arc<Semaphore>,
     ) -> Result<()> {
         loop {
+            // readdir把自己读进去了？不应该readdir包含自己
             let mut entries = self.do_readdir(inode, false, Some(1_0000)).await?;
+            info!("the read dir result of {inode} is {:?}", entries.iter().map(|e| e.inode).collect::<Vec<_>>());
             if entries.is_empty() {
                 return Ok(());
             }
@@ -703,7 +717,8 @@ where
                     let removing_limit = max_removing.clone();
                     match removing_limit.try_acquire_owned() {
                         Ok(permit) => {
-                            let meta = dyn_clone::clone_box(self);
+                            let mut meta = dyn_clone::clone_box(self);
+                            meta.with_cancel(self.token().child_token());
                             let max_removing = max_removing.clone();
                             let count = count.clone();
                             // 这里如果多线程进入，会导致多个同时去删除，会抢占元素？
@@ -1471,15 +1486,55 @@ where
 
     // ---------------------------------------- sys call -----------------------------------------------------------
     // StatFS returns summary statistics of a volume.
-    async fn stat_fs(
-        &self,
-        inode: Ino,
-        totalspace: AtomicU64,
-        availspace: AtomicU64,
-        iused: AtomicU64,
-        iavail: AtomicU64,
-    ) -> Result<()> {
-        todo!()
+    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)> {
+        let (mut total_space, mut avail_space, mut i_used, mut i_avail) = self.stat_root_fs().await;
+        let inode = inode.transfer_root(self.as_ref().root);
+        if inode.is_root() {
+            return Ok((total_space, avail_space, i_used, i_avail));
+        }
+
+        self.access(
+            inode,
+            ModeMask::READ.union(ModeMask::EXECUTE),
+            &Attr::default(),
+        )
+        .await?;
+        let mut root = inode;
+        let mut usage = None;
+        // TODO:why here not use dirquota directly?
+        while root >= ROOT_INODE {
+            let attr = self.get_attr(root).await?;
+            if root == ROOT_INODE {
+                break;
+            }
+            let mut quota = match self.do_get_quota(root).await? {
+                Some(quota) => quota,
+                None => continue,
+            };
+
+            quota.sanitize();
+            if usage.is_none() {
+                usage = Some(quota.clone());
+            }
+            if quota.max_space > 0 {
+                let ls = (quota.max_space - quota.used_space) as u64;
+                if ls < avail_space {
+                    avail_space = ls;
+                }
+            }
+            if quota.max_inodes > 0 {
+                let li = (quota.max_inodes - quota.used_inodes) as u64;
+                if li < i_avail {
+                    i_avail = li;
+                }
+            }
+            root = attr.parent;
+        }
+        if let Some(usage) = usage {
+            total_space = usage.used_space as u64 + avail_space;
+            i_used = usage.used_inodes as u64;
+        }
+        Ok((total_space, avail_space, i_used, i_avail))
     }
 
     // Access checks the access permission on given inode.
@@ -1714,8 +1769,13 @@ where
             }
             .fail()?;
         }
-        ensure!(size != 0, InvalidArgSnafu { arg: "fallocate: size 0" });
-        
+        ensure!(
+            size != 0,
+            InvalidArgSnafu {
+                arg: "fallocate: size 0"
+            }
+        );
+
         let file = self.as_ref().open_files.lock(inode);
         let _ = OpenFileChunkGuard::new(file.lock().await, INVALIDATE_ALL_CHUNK);
         let (delta, attr) = self.do_fallocate(inode, flag, off, size).await?;
@@ -1934,15 +1994,13 @@ where
         let parent = parent.transfer_root(base.root);
         let ino = self
             .do_rmdir(parent, name, skip_check_trash)
-            .await
-            .inspect(|ino| {
-                if !parent.is_trash() {
-                    let mut dir_parents = base.dir_parents.lock();
-                    dir_parents.remove(ino);
-                }
-                self.update_dir_stats(parent, 0, -(align_4k(0)), -1);
-                self.update_quota(parent, -(align_4k(0)), -1);
-            })?;
+            .await?;
+        if !parent.is_trash() {
+            let mut dir_parents = base.dir_parents.lock();
+            dir_parents.remove(&ino);
+        }
+        self.update_dir_stats(parent, 0, -(align_4k(0)), -1);
+        self.update_quota(parent, -(align_4k(0)), -1).await;
         Ok(ino)
     }
 
@@ -2482,16 +2540,27 @@ where
     // SetXattr update the extended attribute of a node.
     async fn set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()> {
         ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
-        ensure!(!name.is_empty(), InvalidArgSnafu { arg: "set xattr empty name" });
+        ensure!(
+            !name.is_empty(),
+            InvalidArgSnafu {
+                arg: "set xattr empty name"
+            }
+        );
         self.do_set_xattr(inode, name, value, flag).await
     }
 
     // RemoveXattr removes the extended attribute of a node.
     async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<()> {
         ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
-        ensure!(!name.is_empty(), InvalidArgSnafu { arg: "remove xattr empty name" });
+        ensure!(
+            !name.is_empty(),
+            InvalidArgSnafu {
+                arg: "remove xattr empty name"
+            }
+        );
 
-        self.do_remove_xattr(inode.transfer_root(self.as_ref().root), name).await
+        self.do_remove_xattr(inode.transfer_root(self.as_ref().root), name)
+            .await
     }
 
     // Flock tries to put a lock on given file.

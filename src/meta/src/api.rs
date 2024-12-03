@@ -368,15 +368,12 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
     async fn load_meta(&self, r: Box<dyn Read + Send>) -> Result<()>;
     // ---------------------------------------- sys call -----------------------------------------------------------
-    // StatFS returns summary statistics of a volume.
-    async fn stat_fs(
-        &self,
-        inode: Ino,
-        totalspace: AtomicU64,
-        availspace: AtomicU64,
-        iused: AtomicU64,
-        iavail: AtomicU64,
-    ) -> Result<()>;
+    /// StatFS returns summary statistics of a volume.
+    ///
+    /// # Returns
+    ///
+    /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
+    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
 
     // Access checks the current user can access (mode)permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;
@@ -387,11 +384,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// Resolve fetches the inode and attributes for an entry identified by the given path.
     /// The different between with lookup and resolve is that resolve deep search in path,
     /// but lookup only search in current directory.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// * `ENOTSUP` - will be returned if there's no natural implementation for this operation or
     /// if there are any symlink following involved.
     async fn resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)>;
@@ -424,13 +421,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
 
     /// Fallocate preallocate given space for given file.
     /// Returns the length of the file after fallocate.
-    async fn fallocate(
-        &self,
-        inode: Ino,
-        flag: Falloc,
-        off: u64,
-        size: u64,
-    ) -> Result<u64>;
+    async fn fallocate(&self, inode: Ino, flag: Falloc, off: u64, size: u64) -> Result<u64>;
 
     // ReadLink returns the target of a symlink.
     ///
@@ -476,11 +467,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// The file will be deleted if it's not linked by any entries and not open by any sessions.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `parent`: parent inode
     /// * `name`: entry name
     /// * `skip_check_trash`: skip check trash or not
-    /// 
+    ///
     /// # Erorr
     ///
     /// * `EPERM` - if current user has no permission
@@ -569,7 +560,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// Write put a slice of data on top of the given chunk.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `inode` - inode of the file
     /// * `indx` - index of the chunk
     /// * `off` - offset of the chunk

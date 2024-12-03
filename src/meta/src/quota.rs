@@ -1,13 +1,43 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::api::{INodeType, Ino, Meta, Summary, ROOT_INODE};
-use crate::base::{CommonMeta, DirStat, Engine};
+use crate::base::{CommonMeta, DirStat, Engine, TOTAL_INODES, USED_SPACE};
 use crate::error::{NoSpaceSnafu, QuotaExceededSnafu, Result};
 use crate::utils::align_4k;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QuotaView {
+    pub max_space: i64,
+    pub max_inodes: i64,
+    pub used_space: i64,
+    pub used_inodes: i64,
+    pub new_space: i64,
+    pub new_inodes: i64,
+}
+
+impl QuotaView {
+    pub fn sanitize(&mut self) {
+        if self.used_space < 0 {
+            self.used_space = 0;
+        }
+        if self.max_space > 0 && self.max_space < self.used_space {
+            self.max_space = self.used_space;
+        }
+        if self.used_inodes < 0 {
+            self.used_inodes = 0;
+        }
+        if self.max_inodes > 0 && self.max_inodes < self.used_inodes {
+            self.max_inodes = self.used_inodes;
+        }
+    }
+}
 
 #[derive(Default, Debug)]
 pub struct Quota {
@@ -82,6 +112,9 @@ pub trait MetaQuota {
 
     /// Get summary of a dir ino
     async fn get_dir_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary>;
+
+    /// Get the stat of the root fs
+    async fn stat_root_fs(&self) -> (u64, u64, u64, u64);
     
 }
 
@@ -396,5 +429,73 @@ where
             }
         }
         Ok(summary)
+    }
+
+    async fn stat_root_fs(&self) -> (u64, u64, u64, u64) {
+        let meta = dyn_clone::clone_box(self);
+        let err = timeout(Duration::from_millis(150), async {
+            meta.get_counter(USED_SPACE).await
+        }).await;
+        let mut used = match err {
+            Ok(Ok(used)) => used,
+            other => { 
+                warn!("Get used space failed: {:?}. Use cache instead.", other);
+                self.as_ref().fs_stat.used_space.load(Ordering::SeqCst)
+            },
+        };
+
+        let meta = dyn_clone::clone_box(self);
+        let err = timeout(Duration::from_millis(150), async {
+            meta.get_counter(TOTAL_INODES).await
+        }).await;
+        let mut inodes = match err {
+            Ok(Ok(inodes)) => inodes,
+            other => {
+                warn!("Get total inodes failed: {:?}. Use cache instead.", other);
+                self.as_ref().fs_stat.used_inodes.load(Ordering::SeqCst)
+            },
+        };
+
+        used += self.as_ref().fs_stat.new_space.load(Ordering::SeqCst);
+        inodes += self.as_ref().fs_stat.new_inodes.load(Ordering::SeqCst);
+        if used < 0 {
+            used = 0;
+        }
+        if inodes < 0 {
+            inodes = 0;
+        }
+
+        let format = self.get_format();
+        let total_space = if format.capacity > 0 {
+            let total_space = format.capacity;
+            if total_space < used as u64 {
+                used as u64
+            } else {
+                total_space
+            }
+        } else {
+            let mut total_space = 1 << 50;
+            while total_space * 8 < used as u64 * 10 {
+                total_space *= 2;
+            }
+            total_space
+        };
+        let availspace = total_space - used as u64;
+
+        let iused = inodes as u64;
+        let iavail = if format.inodes > 0 {
+            if iused > format.inodes {
+                0
+            } else {
+                format.inodes - iused
+            }
+        } else {
+            let mut iavail = 10 << 20;
+            while iused * 10 > (iused + iavail) * 8 {
+                iavail *= 2;
+            }
+            iavail
+        };
+        (total_space, availspace, iused, iavail)
     }
 }

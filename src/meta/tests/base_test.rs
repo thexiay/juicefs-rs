@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime};
 
 use juice_meta::{
-    api::{Attr, Ino, Meta, OFlag, Slice},
+    api::{Attr, INodeType, Ino, Meta, OFlag, Slice},
     config::Format,
 };
 use tokio::time;
@@ -18,7 +18,7 @@ pub fn test_format() -> Format {
 
 #[cfg(test)]
 pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use std::time::UNIX_EPOCH;
+    use std::{sync::Arc, time::UNIX_EPOCH};
 
     use juice_meta::api::{
         Falloc, INodeType, ModeMask, OFlag, RenameMask, SetAttrMask, XattrF, ROOT_INODE,
@@ -273,7 +273,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::EXCHANGE)
         .await;
     assert!(rs.unwrap_err().is_no_entry_found(&ROOT_INODE, "f"));
-    m.create(ROOT_INODE, "f", 0o644, 0o22, OFlag::empty())
+    let (inode, _) = m.create(ROOT_INODE, "f", 0o644, 0o22, OFlag::empty())
         .await
         .expect("create f: ");
     m.close(inode).await.expect("close f: ");
@@ -475,44 +475,51 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert_eq!(value, "v2".as_bytes());
     let value = m.list_xattr(inode).await.expect("listxattr: ");
     assert_eq!(value, "a\0".as_bytes());
-    m.unlink(ROOT_INODE, "F3", false).await.expect("unlink F3: ");
+    m.unlink(ROOT_INODE, "F3", false)
+        .await
+        .expect("unlink F3: ");
     let value = m.get_xattr(inode, "a").await.expect("getxattr: ");
     assert_eq!(value, "v2".as_bytes());
     m.remove_xattr(inode, "a").await.expect("removexattr: ");
-    let rs = m.set_xattr(
-        inode,
-        "a",
-        "v".as_bytes().to_owned(),
-        XattrF::REPLACE,
-    ).await;
+    let rs = m
+        .set_xattr(inode, "a", "v".as_bytes().to_owned(), XattrF::REPLACE)
+        .await;
     assert!(rs.as_ref().unwrap_err().is_no_such_attr(), "got {:?}", rs);
-    m.set_xattr(
-        inode,
-        "a",
-        "v3".as_bytes().to_owned(),
-        XattrF::CREATE,
-    ).await.expect("setxattr: ");
-    let rs = m.set_xattr(
-        inode,
-        "a",
-        "v3".as_bytes().to_owned(),
-        XattrF::CREATE,
-    ).await;
-    assert!(rs.as_ref().unwrap_err().is_entry_exists2(&inode), "got {:?}", rs);
-    m.set_xattr(
-        inode,
-        "a",
-        "v3".as_bytes().to_owned(),
-        XattrF::REPLACE,
-    ).await.expect("setxattr: ");
-    m.set_xattr(
-        inode,
-        "a",
-        "v4".as_bytes().to_owned(),
-        XattrF::REPLACE,
-    ).await.expect("setxattr: ");
+    m.set_xattr(inode, "a", "v3".as_bytes().to_owned(), XattrF::CREATE)
+        .await
+        .expect("setxattr: ");
+    let rs = m
+        .set_xattr(inode, "a", "v3".as_bytes().to_owned(), XattrF::CREATE)
+        .await;
+    assert!(
+        rs.as_ref().unwrap_err().is_entry_exists2(&inode),
+        "got {:?}",
+        rs
+    );
+    m.set_xattr(inode, "a", "v3".as_bytes().to_owned(), XattrF::REPLACE)
+        .await
+        .expect("setxattr: ");
+    m.set_xattr(inode, "a", "v4".as_bytes().to_owned(), XattrF::REPLACE)
+        .await
+        .expect("setxattr: ");
 
-
+    // test statfs
+    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(totalspace, 1 << 50);
+    assert_eq!(iavail, 10 << 20);
+    let mut new_format = format.as_ref().clone();
+    new_format.capacity = 1 << 20;
+    new_format.inodes = 100;
+    m.init(new_format, false).await.expect("set quota failed");
+    // test async flush quota task
+    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    if totalspace != 1 << 20 || iavail != 97 {
+        // only tree inodes are used
+        time::sleep(Duration::from_millis(100)).await;
+        let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+        assert_eq!(totalspace, 1 << 20);
+        assert_eq!(iavail, 97);
+    }
 }
 
 pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
