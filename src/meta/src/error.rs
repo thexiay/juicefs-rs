@@ -144,6 +144,10 @@ pub enum MetaErrorEnum {
     RenameSameInoError,
     #[snafu(display("message queue closed"))]
     SemaphoraCloseError,
+    #[snafu(display("set quota err({file})"))]
+    SetQuotaError {
+        file: String,
+    },
     #[snafu(whatever, display("{message}, cause: {source:?}"))]
     GenericError {
         message: String,

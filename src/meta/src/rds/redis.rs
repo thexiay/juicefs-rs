@@ -25,7 +25,7 @@ use crate::api::{
 };
 use crate::base::{
     Cchunk, CommonMeta, DirStat, Engine, MetaOtherFunction, PendingFileScan, PendingSliceScan,
-    TrashSliceScan, NEXT_CHUNK, NEXT_INODE, TOTAL_INODES, USED_SPACE,
+    SetQuota, TrashSliceScan, NEXT_CHUNK, NEXT_INODE, USED_INODES, USED_SPACE,
 };
 use crate::config::{Config, Format};
 use crate::context::{Uid, UserExt, WithContext};
@@ -323,7 +323,8 @@ impl RedisHandle {
         format!("{}d{}", self.prefix, inode)
     }
 
-    /// Parent:     p$inode -> {parent -> count} // for hard links
+    /// Parent:     p$inode -> {parent -> count}
+    /// count for the number of inode hard links in parent directory
     fn parent_key(&self, inode: Ino) -> String {
         format!("{}p{}", self.prefix, inode)
     }
@@ -361,8 +362,8 @@ impl RedisHandle {
         format!("{}{}", self.prefix, USED_SPACE)
     }
 
-    fn total_inodes_key(&self) -> String {
-        format!("{}{}", self.prefix, TOTAL_INODES)
+    fn used_inodes_key(&self) -> String {
+        format!("{}{}", self.prefix, USED_INODES)
     }
 
     fn slice_key(id: u64, size: u32) -> String {
@@ -1021,7 +1022,7 @@ impl Engine for RedisEngine {
     }
 
     async fn update_stats(&self, space: i64, inodes: i64) {
-        self.meta.fs_stat.update_stats(space, inodes);
+        self.meta.fs_stat.update_used_stats(space, inodes);
     }
 
     // redisMeta updates the usage in each transaction
@@ -1364,7 +1365,7 @@ impl Engine for RedisEngine {
                         )
                         .del(self.inode_key(inode))
                         .decr(self.used_space_key(), delete_space)
-                        .decr(self.total_inodes_key(), 1)
+                        .decr(self.used_inodes_key(), 1)
                         .srem(self.sustained(sid), inode.to_string())
                         .query_async(conn)
                         .await?;
@@ -1460,34 +1461,81 @@ impl Engine for RedisEngine {
         pipe.hget(self.dir_quota_key(), inode);
         pipe.hget(self.dir_quota_used_space_key(), inode);
         pipe.hget(self.dir_quota_used_inodes_key(), inode);
-        let (quota, used_space, used_inodes): (Option<Vec<u8>>, Option<i64>, Option<i64>) =
-            pipe.query_async(conn).await?;
+        let (quota, used_space, used_inodes) = pipe
+            .query_async::<(Option<Vec<u8>>, Option<u64>, Option<u64>)>(conn)
+            .await?;
 
-        if quota.is_none() || used_space.is_none() || used_inodes.is_none() {
-            return Ok(None);
+        if let Some(max_quota) = quota
+            && let Some(used_space) = used_space
+            && let Some(used_inodes) = used_inodes
+        {
+            let (max_space, max_inodes) = bincode::deserialize(&max_quota)?;
+            Ok(Some(QuotaView {
+                max_space,
+                max_inodes,
+                used_space,
+                used_inodes,
+            }))
+        } else {
+            Ok(None)
         }
-        let (max_space, max_inodes) = bincode::deserialize::<(i64, i64)>(&quota.unwrap())
-            .with_whatever_context::<_, _, MetaErrorEnum>(|err| {
-            format!("invalid quota inode {}, err {}", inode, err)
-        })?;
-        Ok(Some(QuotaView {
-            max_space: max_space,
-            max_inodes: max_inodes,
-            used_space: used_space.unwrap(),
-            used_inodes: used_inodes.unwrap(),
-            new_space: 0,
-            new_inodes: 0,
-        }))
+    }
+
+    async fn do_set_quota(&self, inode: Ino, set: SetQuota) -> Result<Option<(u64, u64)>> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        let (quota_capacity, quota_used_repair) = match set {
+            SetQuota::Capacity { space, inodes } => (Some((space, inodes)), None),
+            SetQuota::Force(quota) => (
+                Some((quota.max_space, quota.max_inodes)),
+                Some((quota.used_space, quota.used_inodes)),
+            ),
+            SetQuota::Repair { space, inodes } => (None, Some((space, inodes))),
+        };
+        async_transaction!(conn, self.inode_key(inode), {
+            let origin_capacity: Option<Vec<u8>> = conn.hget(self.dir_quota_key(), inode).await?;
+            let origin = if let Some(bytes) = origin_capacity {
+                Some(bincode::deserialize::<(u64, u64)>(&bytes)?)
+            } else {
+                None
+            };
+                
+
+            let mut pipe = pipe();
+            pipe.atomic();
+            if let Some((max_space, max_inodes)) = quota_capacity {
+                pipe.hset(
+                    self.dir_quota_key(),
+                    inode,
+                    bincode::serialize(&(max_space, max_inodes)).unwrap(),
+                );
+            }
+            if let Some((used_space, used_inodes)) = quota_used_repair {
+                pipe.hset(self.dir_quota_used_space_key(), inode, used_space);
+                pipe.hset(self.dir_quota_used_inodes_key(), inode, used_inodes);
+            }
+            match pipe.query_async::<Option<Value>>(conn).await? {
+                Some(_) => Ok(Some(origin)),
+                None => Ok(None)
+            }
+        })
     }
 
     async fn do_del_quota(&self, inode: Ino) -> Result<()> {
-        unimplemented!()
+        let mut conn = self.share_conn();
+        let mut pipe = pipe();
+        pipe.atomic();
+        pipe.hdel(self.dir_quota_key(), inode);
+        pipe.hdel(self.dir_quota_used_space_key(), inode);
+        pipe.hdel(self.dir_quota_used_inodes_key(), inode);
+        pipe.query_async(&mut conn).await?;
+        Ok(())
     }
 
-    async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>> {
+    async fn do_load_quotas(&self) -> Result<HashMap<Ino, QuotaView>> {
         let mut shared_conn = self.share_conn();
         let mut iter = shared_conn
-            .hscan::<String, Vec<u8>>(self.dir_quota_key())
+            .hscan::<String, Value>(self.dir_quota_key())
             .await?
             .chunks(10000);
         let mut quotas = HashMap::new();
@@ -1497,37 +1545,24 @@ impl Engine for RedisEngine {
             }
             let mut conn = self.share_conn();
             for i in (0..keys.len()).step_by(2) {
-                let (mut key, mut value) = (
-                    Bytes::from(keys[i].clone()),
-                    Bytes::from(keys[i + 1].clone()),
-                );
-                if key.len() != std::mem::size_of::<u64>() {
-                    error!("Invalid key: {:?}", key);
-                    continue;
-                }
-                let inode = key.get_u64();
-                if value.len() != 2 * std::mem::size_of::<i64>() {
-                    error!("Invalid value: {:?}", value);
-                    continue;
-                }
-                let max_space = value.get_i64();
-                let max_inodes = value.get_i64();
+                let inode = <u64 as FromRedisValue>::from_redis_value(&keys[i])?;
+                let max_quota = <Vec<u8> as FromRedisValue>::from_redis_value(&keys[i + 1])?;
+                let (max_space, max_inodes) = bincode::deserialize(&max_quota)?;
                 let used_space = conn
-                    .hget::<String, u64, Option<i64>>(self.dir_quota_used_space_key(), inode)
+                    .hget::<String, u64, Option<u64>>(self.dir_quota_used_space_key(), inode)
                     .await?
                     .unwrap_or(0);
                 let used_inodes = conn
-                    .hget::<String, u64, Option<i64>>(self.dir_quota_used_inodes_key(), inode)
+                    .hget::<String, u64, Option<u64>>(self.dir_quota_used_inodes_key(), inode)
                     .await?
                     .unwrap_or(0);
                 quotas.insert(
                     inode,
-                    Quota {
-                        max_space: AtomicI64::new(max_space),
-                        max_inodes: AtomicI64::new(max_inodes),
-                        used_space: AtomicI64::new(used_space),
-                        used_inodes: AtomicI64::new(used_inodes),
-                        ..Default::default()
+                    QuotaView {
+                        max_space,
+                        max_inodes,
+                        used_space,
+                        used_inodes,
                     },
                 );
             }
@@ -1852,7 +1887,7 @@ impl Engine for RedisEngine {
                 pipe.hset(self.dir_used_space_key(), inode, "0");
             }
             pipe.incr(self.used_space_key(), utils::align_4k(0));
-            pipe.incr(self.total_inodes_key(), 1);
+            pipe.incr(self.used_inodes_key(), 1);
             pipe.query_async(conn).await?;
             Ok(Some(attr.clone()))
         })
@@ -2141,28 +2176,27 @@ impl Engine for RedisEngine {
                                     ts,
                                 );
                                 pipe.del(self.inode_key(ino));
-                                let new_space = -utils::align_4k(attr.length);
+                                let (new_space, new_inode) = (-utils::align_4k(attr.length), -1);
                                 pipe.incr(self.used_space_key(), new_space);
-                                pipe.decr(self.total_inodes_key(), 1);
-                                (new_space, -1)
+                                pipe.incr(self.used_inodes_key(), new_inode);
+                                (new_space, new_inode)
                             }
                         }
                         INodeType::Symlink => {
                             pipe.del(self.inode_key(ino));
                             pipe.del(self.inode_key(ino));
-                            let new_space = -utils::align_4k(0);
+                            let (new_space, new_inode) = (-utils::align_4k(0), -1);
                             pipe.incr(self.used_space_key(), new_space);
-                            info!("delete inode ({ino})");
-                            pipe.decr(self.total_inodes_key(), 1);
-                            (new_space, -1)
+                            pipe.incr(self.used_inodes_key(), new_inode);
+                            (new_space, new_inode)
                         }
                         _ => {
                             pipe.del(self.inode_key(ino));
-                            let new_space = -utils::align_4k(0);
+                            let (new_space, new_inode) = (-utils::align_4k(0), -1);
+
                             pipe.incr(self.used_space_key(), new_space);
-                            info!("delete inode ({ino})");
-                            pipe.decr(self.total_inodes_key(), 1);
-                            (new_space, -1)
+                            pipe.incr(self.used_inodes_key(), new_inode);
+                            (new_space, new_inode)
                         }
                     };
                     pipe.del(self.xattr_key(ino));
@@ -2180,7 +2214,7 @@ impl Engine for RedisEngine {
                         ino,
                         attr.clone(),
                     ))),
-                    None => Ok(None)
+                    None => Ok(None),
                 }
             })?;
 
@@ -2289,8 +2323,9 @@ impl Engine for RedisEngine {
                 None => {
                     pipe.del(self.inode_key(ino));
                     pipe.del(self.xattr_key(ino));
-                    pipe.incr(self.used_space_key(), -utils::align_4k(0));
-                    pipe.decr(self.total_inodes_key(), 1);
+
+                    pipe.decr(self.used_space_key(), utils::align_4k(0));
+                    pipe.decr(self.used_inodes_key(), 1);
                 }
             }
             pipe.hdel(self.dir_data_length_key(), ino);
@@ -2300,10 +2335,7 @@ impl Engine for RedisEngine {
             pipe.hdel(self.dir_quota_used_space_key(), ino);
             pipe.hdel(self.dir_quota_used_inodes_key(), ino);
             match pipe.query_async::<Option<Value>>(conn).await? {
-                Some(_) => {
-                    info!("delete inode ({ino})");
-                    Ok::<_, MetaError>(Some(ino))
-                },
+                Some(_) => Ok::<_, MetaError>(Some(ino)),
                 None => Ok::<_, MetaError>(None),
             }
         })?;
@@ -2595,7 +2627,8 @@ impl Engine for RedisEngine {
                         }
                     );
                     attr_dst.ctime = now.as_nanos();
-                    if flags.intersects(RenameMask::EXCHANGE) {  // exchange
+                    if flags.intersects(RenameMask::EXCHANGE) {
+                        // exchange
                         if parent_src != parent_dst {
                             if *typ_dst == INodeType::Directory {
                                 attr_dst.parent = parent_src;
@@ -2606,7 +2639,8 @@ impl Engine for RedisEngine {
                                 attr_dst.parent = parent_src;
                             }
                         }
-                    } else {  // replace
+                    } else {
+                        // replace
                         if *typ_dst == INodeType::Directory {
                             let cnt: u64 = conn.hlen(self.entry_key(*ino_dst)).await?;
                             if cnt != 0 {
@@ -2627,15 +2661,16 @@ impl Engine for RedisEngine {
                             } else {
                                 attr_dst.nlink -= 1;
                                 if *typ_dst == INodeType::File && attr_dst.nlink == 0 {
-                                    delete_option = if self.meta.open_files.has_any_open(*ino_dst).await{
-                                        if self.meta.sid.read().is_some() {
-                                            Some(DeleteFileOption::Deferred)
+                                    delete_option =
+                                        if self.meta.open_files.has_any_open(*ino_dst).await {
+                                            if self.meta.sid.read().is_some() {
+                                                Some(DeleteFileOption::Deferred)
+                                            } else {
+                                                Some(DeleteFileOption::Immediate { force: false })
+                                            }
                                         } else {
-                                            Some(DeleteFileOption::Immediate { force: false })
-                                        }
-                                    } else {
-                                        None
-                                    };
+                                            None
+                                        };
                                     // TODO: InvalidateChunk
                                 }
                                 let file = self.meta.open_files.lock(*ino_dst);
@@ -2724,12 +2759,11 @@ impl Engine for RedisEngine {
                         pipe.hincr(self.parent_key(*ino_dst), parent_dst, -1);
                     }
                 } else {
-                    // replace or insert
+                    // replace: del exist inode
                     pipe.hdel(self.entry_key(parent_src), name_src);
                     if let Some((ref typ_dst, ref ino_dst, _)) = exists_dst
                         && let Some(ref attr_dst) = exists_attr_dst
                     {
-                        // do replace
                         let (typ_dst, ino_dst) = (typ_dst.clone(), ino_dst.clone());
                         if let Some(trash_ino) = trash {
                             pipe.set(
@@ -2772,18 +2806,22 @@ impl Engine for RedisEngine {
                                     );
                                     pipe.del(self.inode_key(ino_dst));
                                     (new_space, new_inode) =
-                                        (-utils::align_4k(attr_dst.length), 1);
+                                        (-utils::align_4k(attr_dst.length), -1);
+                                    debug!(
+                                        "change used space {ino_dst} {}",
+                                        -utils::align_4k(attr_dst.length)
+                                    );
                                     pipe.incr(self.used_space_key(), new_space);
-                                    pipe.decr(self.total_inodes_key(), new_inode);
+                                    pipe.incr(self.used_inodes_key(), new_inode);
                                 }
                             } else {
                                 if typ_dst == INodeType::Symlink {
                                     pipe.del(self.sym_key(ino_dst));
                                 }
                                 pipe.del(self.inode_key(ino_dst));
-                                (new_space, new_inode) = (-utils::align_4k(0), 1);
+                                (new_space, new_inode) = (-utils::align_4k(0), -1);
                                 pipe.incr(self.used_space_key(), new_space);
-                                pipe.decr(self.total_inodes_key(), new_inode);
+                                pipe.incr(self.used_inodes_key(), new_inode);
                             }
                             pipe.del(self.xattr_key(ino_dst));
                             if attr_dst.parent == 0 {
@@ -2888,7 +2926,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>> {
-        let inode = inode.transfer_root(self.meta.root);
+        let inode = self.meta.check_root(inode);
         let mut conn = self.share_conn();
         let vbuff = conn
             .hget::<_, _, Option<Vec<u8>>>(self.xattr_key(inode), name)
@@ -2898,7 +2936,7 @@ impl Engine for RedisEngine {
     }
 
     async fn do_list_xattr(&self, inode: Ino) -> Result<Vec<u8>> {
-        let inode = inode.transfer_root(self.meta.root);
+        let inode = self.meta.check_root(inode);
         let mut conn = self.share_conn();
         let vals = conn
             .hkeys::<_, Option<Vec<Vec<u8>>>>(self.xattr_key(inode))
@@ -3030,10 +3068,13 @@ impl Engine for RedisEngine {
             if delta.space > 0 {
                 pipe.incr(self.used_space_key(), delta.space).ignore();
             }
-            let rs: Vec<u64> = pipe.query_async(conn).await?;
-            ensure_whatever!(rs.len() == 1, "Invalid len for write: {:?}", rs);
-            let num_slices = rs[0] as u32;
-            Ok::<_, MetaError>(Some((num_slices, delta, attr)))
+            match pipe.query_async::<Option<Vec<u32>>>(conn).await? {
+                Some(rs) => {
+                    ensure_whatever!(rs.len() == 1, "Invalid len for write: {:?}", rs);
+                    Ok(Some((rs[0], delta, attr)))
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -3146,6 +3187,10 @@ impl Engine for RedisEngine {
                     size -= len;
                 }
             }
+            debug!(
+                "change used space {inode} {}",
+                align_4k(length) - align_4k(old)
+            );
             pipe.incr(self.used_space_key(), align_4k(length) - align_4k(old));
             pipe.query_async(conn).await?;
             Ok::<_, MetaError>(Some((delta, attr)))
@@ -3167,35 +3212,69 @@ impl Engine for RedisEngine {
         unimplemented!()
     }
 
-    async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, i32> {
-        /*
-            vals, err := m.rdb.HGetAll(ctx, m.parentKey(inode)).Result()
-        if err != nil {
-            logger.Warnf("Scan parent key of inode %d: %s", inode, err)
-            return nil
-        }
-        ps := make(map[Ino]int)
-        for k, v := range vals {
-            if n, _ := strconv.Atoi(v); n > 0 {
-                ino, _ := strconv.ParseUint(k, 10, 64)
-                ps[Ino(ino)] = n
-            }
-        }
-        return ps
-             */
-        unimplemented!()
+    async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, u32> {
+        self.do_get_parents_inner(&mut self.share_conn(), inode)
+            .await
     }
 
     async fn do_flush_dir_stat(&self, batch: HashMap<Ino, DirStat>) -> Result<()> {
         unimplemented!()
     }
 
-    async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<DirStat> {
-        unimplemented!()
+    async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<Option<DirStat>> {
+        let mut conn = self.share_conn();
+        let len = conn
+            .hget::<_, _, Option<i64>>(self.dir_data_length_key(), ino)
+            .await?;
+        let used_space = conn
+            .hget::<_, _, Option<i64>>(self.dir_used_space_key(), ino)
+            .await?;
+        let used_inodes = conn
+            .hget::<_, _, Option<i64>>(self.dir_used_inodes_key(), ino)
+            .await?;
+        if let Some(len) = len
+            && let Some(used_space) = used_space
+            && let Some(used_inodes) = used_inodes
+        {
+            if try_sync && (len < 0 || used_space < 0 || used_inodes < 0) {
+                self.do_sync_dir_stat(ino).await.map(Some)
+            } else {
+                Ok(Some(DirStat {
+                    length: len,
+                    space: used_space,
+                    inodes: used_inodes,
+                }))
+            }
+        } else {
+            if try_sync {
+                self.do_sync_dir_stat(ino).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        }
     }
 
     async fn do_sync_dir_stat(&self, ino: Ino) -> Result<DirStat> {
-        unimplemented!()
+        if self.meta.conf.read_only {
+            return ReadFSSnafu.fail()?;
+        }
+
+        let stat = self.calc_dir_stat(ino).await?;
+        let mut conn = self.exclusive_conn().await?;
+        let conn = conn.deref_mut();
+        async_transaction!(conn, &self.inode_key(ino), {
+            let exists = conn.exists::<_, bool>(self.inode_key(ino)).await?;
+            ensure!(exists, NoEntryFound2Snafu { ino });
+            let mut pipe = pipe();
+            pipe.atomic();
+            pipe.hset(self.dir_data_length_key(), ino, stat.length);
+            pipe.hset(self.dir_used_space_key(), ino, stat.space);
+            pipe.hset(self.dir_used_inodes_key(), ino, stat.inodes);
+            match pipe.query_async::<Option<Value>>(conn).await? {
+                Some(_) => Ok(Some(stat.clone())),
+                None => Ok(None),
+            }
+        })
     }
 
     async fn scan_trash_slices(&self, trash_slice_scan: TrashSliceScan) -> Result<()> {

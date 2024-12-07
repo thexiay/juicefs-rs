@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -5,21 +6,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::api::{INodeType, Ino, Meta, Summary, ROOT_INODE};
-use crate::base::{CommonMeta, DirStat, Engine, TOTAL_INODES, USED_SPACE};
+use crate::base::{CommonMeta, DirStat, Engine, USED_INODES, USED_SPACE};
 use crate::error::{NoSpaceSnafu, QuotaExceededSnafu, Result};
 use crate::utils::align_4k;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaView {
-    pub max_space: i64,
-    pub max_inodes: i64,
-    pub used_space: i64,
-    pub used_inodes: i64,
-    pub new_space: i64,
-    pub new_inodes: i64,
+    pub max_space: u64,
+    pub max_inodes: u64,
+    pub used_space: u64,
+    pub used_inodes: u64,
 }
 
 impl QuotaView {
@@ -40,13 +39,26 @@ impl QuotaView {
 }
 
 #[derive(Default, Debug)]
-pub struct Quota {
+pub(crate) struct Quota {
     pub max_space: AtomicI64,
     pub max_inodes: AtomicI64,
     pub used_space: AtomicI64,
     pub used_inodes: AtomicI64,
     pub new_space: AtomicI64,
     pub new_inodes: AtomicI64,
+}
+
+impl From<QuotaView> for Quota {
+    fn from(value: QuotaView) -> Self {
+        Quota {
+            max_space: AtomicI64::new(value.max_space as i64),
+            max_inodes: AtomicI64::new(value.max_inodes as i64),
+            used_space: AtomicI64::new(value.used_space as i64),
+            used_inodes: AtomicI64::new(value.used_inodes as i64),
+            new_space: AtomicI64::new(0),
+            new_inodes: AtomicI64::new(0),
+        }
+    }
 }
 
 impl Quota {
@@ -78,16 +90,20 @@ impl Quota {
     }
 
     pub fn update(&self, space: i64, inodes: i64) {
-        self.new_space.fetch_add(space, std::sync::atomic::Ordering::SeqCst);
-        self.new_inodes.fetch_add(inodes, std::sync::atomic::Ordering::SeqCst);
+        self.new_space
+            .fetch_add(space, std::sync::atomic::Ordering::SeqCst);
+        self.new_inodes
+            .fetch_add(inodes, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 #[async_trait]
-pub trait MetaQuota {
+pub(crate) trait MetaQuota {
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
     async fn update_parent_stats(&self, inode: Ino, parent: Ino, length: i64, space: i64);
+
+    async fn calc_dir_stat(&self, ino: Ino) -> Result<DirStat>;
 
     /// check if the space and inodes exceed the quota limit for parents ino
     async fn check_quotas(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()>;
@@ -113,15 +129,14 @@ pub trait MetaQuota {
     /// Get summary of a dir ino
     async fn get_dir_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary>;
 
-    /// Get the stat of the root fs
+    /// Get the stat of the rootfs
     async fn stat_root_fs(&self) -> (u64, u64, u64, u64);
-    
 }
 
 #[async_trait]
 impl<E> MetaQuota for E
 where
-    E: Engine + AsRef<CommonMeta>, 
+    E: Engine + AsRef<CommonMeta>,
 {
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino> {
         let parent = {
@@ -171,6 +186,21 @@ where
                 }
             });
         }
+    }
+
+    async fn calc_dir_stat(&self, ino: Ino) -> Result<DirStat> {
+        let entries = self.do_readdir(ino, true, None).await?;
+        let mut stat = DirStat::default();
+        for entry in entries {
+            stat.inodes += 1;
+            if entry.attr.typ == INodeType::File {
+                stat.length += entry.attr.length as i64;
+                stat.space += align_4k(entry.attr.length);
+            } else {
+                stat.space += align_4k(0);
+            }
+        }
+        Ok(stat)
     }
 
     async fn check_quotas(&self, space: i64, inodes: i64, parents: Vec<Ino>) -> Result<()> {
@@ -274,26 +304,34 @@ where
         match self.do_load_quotas().await {
             Ok(loaded_quotas) => {
                 let base = self.as_ref();
-                let mut quotas = base.dir_quotas.write();
+                let mut dir_quotas = base.dir_quotas.write();
 
-                quotas.iter().for_each(|(ino, _)| {
+                dir_quotas.retain(|ino, _| {
+                    let retained = loaded_quotas.contains_key(ino);
                     if !loaded_quotas.contains_key(ino) {
                         // quota cache should be consistent with the meta persist layer
                         error!("Quota for inode {} is deleted", ino);
                     }
+                    retained
                 });
 
-                loaded_quotas.iter().for_each(|(ino, quota)| {
-                    if let Some(q) = quotas.get(ino) {
-                        quota
-                            .new_space
-                            .fetch_add(q.new_space.load(Ordering::SeqCst), Ordering::SeqCst);
-                        quota
-                            .new_inodes
-                            .fetch_add(q.new_inodes.load(Ordering::SeqCst), Ordering::SeqCst);
-                    }
+                loaded_quotas.into_iter().for_each(|(ino, quota)| {
+                    dir_quotas
+                        .entry(ino)
+                        .and_modify(|dir_quota| {
+                            dir_quota.max_space.store(quota.max_space as i64, Ordering::SeqCst);
+                            dir_quota
+                                .max_inodes
+                                .store(quota.max_inodes as i64, Ordering::SeqCst);
+                            dir_quota
+                                .used_space
+                                .store(quota.used_space as i64, Ordering::SeqCst);
+                            dir_quota
+                                .used_inodes
+                                .store(quota.used_inodes as i64, Ordering::SeqCst);
+                        })
+                        .or_insert(Quota::from(quota));
                 });
-                *quotas = loaded_quotas;
             }
             Err(e) => warn!("Load quotas: {}", e),
         }
@@ -435,54 +473,52 @@ where
         let meta = dyn_clone::clone_box(self);
         let err = timeout(Duration::from_millis(150), async {
             meta.get_counter(USED_SPACE).await
-        }).await;
-        let mut used = match err {
-            Ok(Ok(used)) => used,
-            other => { 
+        })
+        .await;
+        let mut used_space = match err {
+            Ok(Ok(space)) => space,
+            other => {
                 warn!("Get used space failed: {:?}. Use cache instead.", other);
                 self.as_ref().fs_stat.used_space.load(Ordering::SeqCst)
-            },
+            }
         };
 
         let meta = dyn_clone::clone_box(self);
         let err = timeout(Duration::from_millis(150), async {
-            meta.get_counter(TOTAL_INODES).await
-        }).await;
-        let mut inodes = match err {
+            meta.get_counter(USED_INODES).await
+        })
+        .await;
+        let mut used_inodes: i64 = match err {
             Ok(Ok(inodes)) => inodes,
             other => {
-                warn!("Get total inodes failed: {:?}. Use cache instead.", other);
+                warn!("Get used inodes failed: {:?}. Use cache instead.", other);
                 self.as_ref().fs_stat.used_inodes.load(Ordering::SeqCst)
-            },
+            }
         };
 
-        used += self.as_ref().fs_stat.new_space.load(Ordering::SeqCst);
-        inodes += self.as_ref().fs_stat.new_inodes.load(Ordering::SeqCst);
-        if used < 0 {
-            used = 0;
+        used_space += self.as_ref().fs_stat.new_space.load(Ordering::SeqCst);
+        used_inodes += self.as_ref().fs_stat.new_inodes.load(Ordering::SeqCst);
+        if used_space < 0 {
+            used_space = 0;
         }
-        if inodes < 0 {
-            inodes = 0;
+        if used_inodes < 0 {
+            used_inodes = 0;
         }
 
+        // TODO: why format default value not set, below wired calculation
         let format = self.get_format();
         let total_space = if format.capacity > 0 {
-            let total_space = format.capacity;
-            if total_space < used as u64 {
-                used as u64
-            } else {
-                total_space
-            }
+            max(format.capacity, used_space as u64)
         } else {
             let mut total_space = 1 << 50;
-            while total_space * 8 < used as u64 * 10 {
+            while total_space * 8 < used_space as u64 * 10 {
                 total_space *= 2;
             }
             total_space
         };
-        let availspace = total_space - used as u64;
+        let availspace = total_space - used_space as u64;
 
-        let iused = inodes as u64;
+        let iused = used_inodes as u64;
         let iavail = if format.inodes > 0 {
             if iused > format.inodes {
                 0

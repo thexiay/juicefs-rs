@@ -6,17 +6,19 @@
 #![feature(if_let_guard)]
 #![feature(linked_list_cursors)]
 
+pub use utils::align_4k;
+
 pub mod config;
 pub mod error;
 pub mod api;
 pub mod acl;
 pub mod context;
+pub mod quota;
 
-pub(crate) mod rds;
-pub(crate) mod utils;
-pub(crate) mod base;
-pub(crate) mod quota;
-pub(crate) mod slice;
-pub(crate) mod session;
-pub(crate) mod openfile;
-pub(crate) mod random_test;
+mod rds;
+mod utils;
+mod base;
+mod slice;
+mod session;
+mod openfile;
+mod random_test;

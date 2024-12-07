@@ -49,9 +49,10 @@ pub enum DeleteFileOption {
 
 pub fn align_4k(length: u64) -> i64 {
     if length == 0 {
-        return 1 << 12;
+        1 << 12
+    } else {
+        (((length - 1) >> 12 + 1) << 12) as i64
     }
-    (((length - 1) >> 12 + 1) << 12) as i64
 }
 
 pub fn access_mode(attr: &Attr, uid: &Uid, gids: &Vec<Gid>) -> ModeMask {

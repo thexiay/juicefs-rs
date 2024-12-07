@@ -20,16 +20,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, RenameMask, Session,
-    SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE,
-    ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask,
+    Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION,
+    RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{
     BadFDSnafu, DirNotEmptySnafu, InterruptedSnafu, InvalidArgSnafu, MetaErrorEnum,
-    NoEntryFoundSnafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu, OpNotSupportedSnafu,
-    PermissionDeniedSnafu, QuotaExceededSnafu, ReadFSSnafu, Result,
+    NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu,
+    OpNotSupportedSnafu, PermissionDeniedSnafu, QuotaExceededSnafu, ReadFSSnafu, Result,
+    SetQuotaSnafu,
 };
 use crate::openfile::{OpenFileChunkGuard, OpenFiles, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
 use crate::quota::{MetaQuota, Quota, QuotaView};
@@ -52,8 +53,8 @@ pub const NEXT_INODE: &str = "nextinode";
 pub const NEXT_CHUNK: &str = "nextchunk";
 pub const NEXT_SESSION: &str = "nextsession";
 pub const NEXT_TRASH: &str = "nexttrash";
-pub const USED_SPACE: &str = "usedSpace";  // used space 
-pub const TOTAL_INODES: &str = "totalInodes"; // used inodes
+pub const USED_SPACE: &str = "usedSpace";
+pub const USED_INODES: &str = "usedInodes";
 
 // (ss, ts) -> clean
 pub type TrashSliceScan = Box<dyn Fn(Vec<Slice>, i64) -> Result<bool> + Send>;
@@ -94,13 +95,13 @@ pub struct FsStat {
 }
 
 impl FsStat {
-    pub fn update_stats(&self, space: i64, inodes: i64) {
-        self.new_space.fetch_add(space, Ordering::SeqCst);
+    pub fn update_used_stats(&self, space: i64, inodes: i64) {
+        self.used_space.fetch_add(space, Ordering::SeqCst);
         self.used_inodes.fetch_add(inodes, Ordering::SeqCst);
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DirStat {
     // length of all files
     pub(crate) length: i64,
@@ -113,6 +114,12 @@ pub struct DirStat {
 pub struct InternalNode {
     inode: Ino,
     name: String,
+}
+
+pub enum SetQuota {
+    Capacity { space: u64, inodes: u64 },
+    Force(QuotaView),
+    Repair { space: u64, inodes: u64 },
 }
 
 #[async_trait]
@@ -159,8 +166,10 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_cleanup_detached_node(&self, detached_node: Ino) -> Result<()>;
     // quota manage
     async fn do_get_quota(&self, inode: Ino) -> Result<Option<QuotaView>>;
+    // this function is dangerous, it will cause quota inconsistency
+    async fn do_set_quota(&self, inode: Ino, set: SetQuota) -> Result<Option<(u64, u64)>>;
     async fn do_del_quota(&self, inode: Ino) -> Result<()>;
-    async fn do_load_quotas(&self) -> Result<HashMap<Ino, Quota>>;
+    async fn do_load_quotas(&self) -> Result<HashMap<Ino, QuotaView>>;
     async fn do_flush_quotas(&self, quotas: &HashMap<Ino, (i64, i64)>) -> Result<()>;
     // meta functions
     async fn do_get_attr(&self, inode: Ino) -> Result<Attr>;
@@ -251,11 +260,11 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         delayed: &[u8],
     ) -> Result<()>;
 
-    async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, i32>;
+    async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, u32>;
     /// do add dirstats batch periodly
     async fn do_flush_dir_stat(&self, batch: HashMap<Ino, DirStat>) -> Result<()>;
     // @trySync: try sync dir stat if broken or not existed
-    async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<DirStat>;
+    async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<Option<DirStat>>;
     async fn do_sync_dir_stat(&self, ino: Ino) -> Result<DirStat>;
 
     async fn scan_trash_slices(&self, trash_slice_scan: TrashSliceScan) -> Result<()>;
@@ -368,7 +377,7 @@ pub trait MetaOtherFunction {
 
 pub struct CommonMeta {
     pub addr: String,
-    pub root: Ino,
+    root: AtomicU64,
     pub current_trash_dir: Mutex<Option<InternalNode>>,
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
@@ -405,7 +414,7 @@ impl CommonMeta {
         let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
             addr: addr.to_string(),
-            root: ROOT_INODE,
+            root: AtomicU64::new(ROOT_INODE),
             current_trash_dir: Mutex::new(None),
             removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
@@ -429,12 +438,21 @@ impl CommonMeta {
         }
     }
 
+    // -------------- root func --------------
     pub fn check_root(&self, ino: Ino) -> Ino {
         match ino {
             RESERVED_INODE => ROOT_INODE,
-            ROOT_INODE => self.root,
+            ROOT_INODE => self.root(),
             _ => ino,
         }
+    }
+
+    pub fn root(&self) -> Ino {
+        self.root.load(Ordering::SeqCst)
+    }
+
+    pub fn chroot(&self, ino: Ino) {
+        self.root.store(ino, Ordering::SeqCst);
     }
 
     pub fn get_format(&self) -> Arc<Format> {
@@ -497,15 +515,9 @@ where
     }
 
     async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>> {
-        let trash_enable = {
-            if parent.is_trash() {
-                false
-            } else {
-                self.as_ref().get_format().trash_days > 0
-            }
-        };
-
-        if !trash_enable {
+        let no_need_trash = parent.is_trash();
+        let trash_enable = self.as_ref().get_format().trash_days > 0;
+        if no_need_trash || !trash_enable {
             return Ok(None);
         }
         // use current trash dir as cache
@@ -678,7 +690,10 @@ where
         loop {
             // readdir把自己读进去了？不应该readdir包含自己
             let mut entries = self.do_readdir(inode, false, Some(1_0000)).await?;
-            info!("the read dir result of {inode} is {:?}", entries.iter().map(|e| e.inode).collect::<Vec<_>>());
+            info!(
+                "the read dir result of {inode} is {:?}",
+                entries.iter().map(|e| e.inode).collect::<Vec<_>>()
+            );
             if entries.is_empty() {
                 return Ok(());
             }
@@ -1107,9 +1122,9 @@ where
                 Ok(v) => base.fs_stat.used_space.store(v, Ordering::SeqCst),
                 Err(e) => warn!("Get counter {}: {}", USED_SPACE, e),
             }
-            match self.get_counter(TOTAL_INODES).await {
+            match self.get_counter(USED_INODES).await {
                 Ok(v) => base.fs_stat.used_inodes.store(v, Ordering::SeqCst),
-                Err(e) => warn!("Get counter {}: {}", TOTAL_INODES, e),
+                Err(e) => warn!("Get counter {}: {}", USED_INODES, e),
             }
             self.load_quotas().await;
 
@@ -1434,7 +1449,92 @@ where
 
     // GetPaths returns all paths of an inode
     async fn get_paths(&self, inode: Ino) -> Vec<String> {
-        todo!()
+        if inode.is_root() || inode == self.as_ref().root() {
+            return vec!["/".to_string()];
+        }
+        if inode.is_trash() {
+            return vec!["/.trash".to_string()];
+        }
+
+        const OUTSIDE: &str = "path not shown because it's outside of the mounted root";
+        async fn get_dir_path(
+            meta: &(impl Engine + AsRef<CommonMeta>),
+            mut ino: Ino,
+        ) -> std::result::Result<String, String> {
+            let mut names = vec![];
+            while !ino.is_root() && ino != meta.as_ref().root() {
+                let attr = meta
+                    .do_get_attr(ino)
+                    .await
+                    .map_err(|err| format!("getattr inode {}: {}", ino, err))?;
+                if attr.typ != INodeType::Directory {
+                    return Err(format!("inode {} is not a directory", ino));
+                }
+                let entries = meta
+                    .do_readdir(attr.parent, false, None)
+                    .await
+                    .map_err(|err| format!("readdir inode {}: {}", ino, err))?;
+                let name = None
+                    .or_else(|| {
+                        if attr.parent.is_root() && ino.is_trash() {
+                            Some(TRASH_NAME.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| entries.into_iter().find(|e| e.inode == ino).map(|e| e.name))
+                    .ok_or_else(|| format!("entry {} not found", ino))?;
+                names.push(name);
+                ino = attr.parent;
+            }
+
+            if !meta.as_ref().root().is_root() && ino == ROOT_INODE {
+                return Err(OUTSIDE.to_string());
+            }
+            names.push("/".to_string());
+            names.reverse();
+            Ok(names.join("/"))
+        }
+
+        let mut paths = vec![];
+        // inode != RootInode, parent is the real parent inode
+        for (parent, count) in self.get_parents(inode).await {
+            if count <= 0 {
+                continue;
+            }
+            let dir = match get_dir_path(self, parent).await {
+                Ok(dir) => dir,
+                Err(err) => {
+                    if err == OUTSIDE {
+                        paths.push(OUTSIDE.to_string());
+                    } else {
+                        warn!("Get directory path of {}: {}", parent, err);
+                    }
+                    continue;
+                }
+            };
+            let entries = match self.do_readdir(parent, false, None).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    warn!("Readdir inode {}: {}", parent, err);
+                    continue;
+                }
+            };
+            let mut c = 0;
+            for e in entries {
+                if e.inode == inode {
+                    c += 1;
+                    paths.push(format!("{}/{}", dir, e.name));
+                }
+            }
+            if c != count {
+                warn!(
+                    "Expect to find {} entries under parent {}, but got {}",
+                    count, parent, c
+                );
+            }
+        }
+        paths
     }
 
     // Check integrity of an absolute path and repair it if asked
@@ -1458,13 +1558,145 @@ where
 
     async fn handle_quota(
         &self,
-        cmd: u8,
-        dpath: String,
-        quotas: HashMap<String, Quota>,
+        op: QuotaOp,
+        dpath: &str,
         strict: bool,
         repair: bool,
-    ) -> Result<()> {
-        todo!()
+    ) -> Result<HashMap<String, QuotaView>> {
+        // TODO: check only volumn mount point can handle quota
+        let ino = if op != QuotaOp::List {
+            let (ino, attr) = self.resolve(ROOT_INODE, dpath, true).await?;
+            ensure!(attr.typ == INodeType::Directory, NotDir2Snafu { ino });
+            if ino.is_trash() {
+                whatever!("No quota for any trash directory");
+            }
+            Some(ino)
+        } else {
+            None
+        };
+
+        match op {
+            QuotaOp::Set(quota) => {
+                let inode = ino.unwrap();
+                let format = self.get_format();
+                if !format.enable_dir_stats {
+                    let mut format = self.get_format().as_ref().clone();
+                    format.enable_dir_stats = true;
+                    self.do_init(format, false).await?;
+                }
+                let origin_capacity = self
+                    .do_set_quota(
+                        inode,
+                        SetQuota::Capacity {
+                            space: quota.max_space,
+                            inodes: quota.max_inodes,
+                        },
+                    )
+                    .await?;
+                if origin_capacity.is_none() {
+                    // new quota need to update used space and used inodes
+                    let sum = self.get_summary(inode, true, strict).await.map_err(|err| {
+                        error!(
+                            "set quota usage for file({}), please repair it later: {}",
+                            dpath, err
+                        );
+                        SetQuotaSnafu {
+                            file: dpath.to_string(),
+                        }
+                        .build()
+                    })?;
+                    self.do_set_quota(
+                        inode,
+                        SetQuota::Repair {
+                            space: sum.size - align_4k(0) as u64,
+                            inodes: sum.dirs + sum.files - 1,
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        error!(
+                            "set quota usage for file({}), please repair it later: {}",
+                            dpath, err
+                        );
+                        SetQuotaSnafu {
+                            file: dpath.to_string(),
+                        }
+                        .build()
+                    })?;
+                }
+                Ok(HashMap::new())
+            }
+            QuotaOp::Get => {
+                let inode = ino.unwrap();
+                let quota = self.do_get_quota(inode).await?;
+                ensure_whatever!(quota.is_some(), "no quota for inode {inode}");
+                let mut quotas = HashMap::new();
+                quotas.insert(dpath.to_string(), quota.unwrap());
+                Ok(quotas)
+            }
+            QuotaOp::Del => {
+                let inode = ino.unwrap();
+                self.do_del_quota(inode).await?;
+                Ok(HashMap::new())
+            }
+            QuotaOp::List => {
+                let quota_map = self.do_load_quotas().await?;
+                let mut quotas = HashMap::new();
+                for (ino, quota) in quota_map {
+                    let p = self.get_paths(ino).await;
+                    // TODO: should expose other path user can't see in current rootfs?
+                    let p = if p.is_empty() {
+                        format!("inode:{}", ino)
+                    } else {
+                        p[0].clone()
+                    };
+                    quotas.insert(p, quota);
+                }
+                Ok(quotas)
+            }
+            QuotaOp::Check => {
+                let ino = ino.unwrap();
+                let quota = self.do_get_quota(ino).await?;
+                ensure_whatever!(quota.is_some(), "no quota for inode {ino}");
+                let mut quotas = HashMap::new();
+                let sum = self.get_summary(ino, true, strict).await?;
+                let used_inodes = sum.dirs + sum.files - 1;
+                let used_space = sum.size - align_4k(0) as u64;
+                let mut quota = quota.unwrap();
+                if quota.used_inodes == used_inodes && quota.used_space == used_space {
+                    info!("quota of {} is consistent", dpath);
+                    quotas.insert(dpath.to_string(), quota);
+                    return Ok(quotas);
+                }
+                warn!(
+                    "{}: quota({} {}) != summary({} {})",
+                    dpath,
+                    quota.used_inodes,
+                    quota.used_space as u64,
+                    used_inodes,
+                    used_space as u64,
+                );
+                if repair {
+                    quota.used_inodes = used_inodes;
+                    quota.used_space = used_space;
+                    quotas.insert(dpath.to_string(), quota.clone());
+                    info!("repairing...");
+                    self.do_set_quota(
+                        ino,
+                        SetQuota::Repair {
+                            space: used_space,
+                            inodes: used_inodes,
+                        },
+                    )
+                    .await?;
+                    Ok(quotas)
+                } else {
+                    whatever!(
+                        "quota of {dpath} is inconsistent, please repair it with --repair flag"
+                    );
+                }
+            }
+        }
     }
 
     // Dump the tree under root, which may be modified by checkRoot
@@ -1486,55 +1718,54 @@ where
 
     // ---------------------------------------- sys call -----------------------------------------------------------
     // StatFS returns summary statistics of a volume.
-    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)> {
-        let (mut total_space, mut avail_space, mut i_used, mut i_avail) = self.stat_root_fs().await;
-        let inode = inode.transfer_root(self.as_ref().root);
-        if inode.is_root() {
-            return Ok((total_space, avail_space, i_used, i_avail));
+    async fn stat_fs(&self, ino: Ino) -> Result<(u64, u64, u64, u64)> {
+        let (mut space_total, mut space_avail, mut i_used, mut i_avail) = self.stat_root_fs().await;
+        let ino = self.as_ref().check_root(ino);
+        if ino.is_root() {
+            return Ok((space_total, space_avail, i_used, i_avail));
         }
 
+        // For Not root, means it's rootfs
         self.access(
-            inode,
+            ino,
             ModeMask::READ.union(ModeMask::EXECUTE),
             &Attr::default(),
         )
         .await?;
-        let mut root = inode;
+        let mut inode = ino;
         let mut usage = None;
-        // TODO:why here not use dirquota directly?
-        while root >= ROOT_INODE {
-            let attr = self.get_attr(root).await?;
-            if root == ROOT_INODE {
+        while inode >= ROOT_INODE {
+            let attr = self.get_attr(inode).await?;
+            if inode == ROOT_INODE {
                 break;
             }
-            let mut quota = match self.do_get_quota(root).await? {
-                Some(quota) => quota,
-                None => continue,
-            };
-
-            quota.sanitize();
-            if usage.is_none() {
-                usage = Some(quota.clone());
-            }
-            if quota.max_space > 0 {
-                let ls = (quota.max_space - quota.used_space) as u64;
-                if ls < avail_space {
-                    avail_space = ls;
+            if let Some(mut quota) = self.do_get_quota(inode).await? {
+                quota.sanitize();
+                if usage.is_none() {
+                    // usage is the first avaliable quota of inode path chain
+                    info!(inode = %inode, "Get quota: {quota:?} for statfs {ino}");
+                    usage = Some(quota.clone());
+                }
+                if quota.max_space > 0 {
+                    let ls = (quota.max_space - quota.used_space) as u64;
+                    if ls < space_avail {
+                        space_avail = ls; // minium avail space of all root chain
+                    }
+                }
+                if quota.max_inodes > 0 {
+                    let li = (quota.max_inodes - quota.used_inodes) as u64;
+                    if li < i_avail {
+                        i_avail = li; // minium avail inodes of all root chain
+                    }
                 }
             }
-            if quota.max_inodes > 0 {
-                let li = (quota.max_inodes - quota.used_inodes) as u64;
-                if li < i_avail {
-                    i_avail = li;
-                }
-            }
-            root = attr.parent;
+            inode = attr.parent;
         }
         if let Some(usage) = usage {
-            total_space = usage.used_space as u64 + avail_space;
+            space_total = usage.used_space as u64 + space_avail;
             i_used = usage.used_inodes as u64;
         }
-        Ok((total_space, avail_space, i_used, i_avail))
+        Ok((space_total, space_avail, i_used, i_avail))
     }
 
     // Access checks the access permission on given inode.
@@ -1580,7 +1811,7 @@ where
             self.access(parent, ModeMask::EXECUTE, &par_attr).await?;
         }
         let name = match name {
-            ".." if parent == base.root => ".",
+            ".." if parent == base.root() => ".",
             other => other,
         };
         match name {
@@ -1637,15 +1868,37 @@ where
         }
     }
 
-    async fn resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)> {
-        let (ino, attr) = self.do_resolve(parent, path).await?;
-        Ok((ino, attr))
+    async fn resolve(&self, parent: Ino, path: &str, fallback: bool) -> Result<(Ino, Attr)> {
+        match self.do_resolve(parent, path).await {
+            Ok((ino, attr)) => Ok((ino, attr)),
+            Err(e) => {
+                if e.is_op_not_supported() && fallback {
+                    let level_path = path.split("/").collect::<Vec<&str>>();
+                    ensure!(
+                        level_path.iter().any(|p| !p.is_empty()),
+                        InvalidArgSnafu {
+                            arg: format!("resolve: path: {path}")
+                        }
+                    );
+                    let mut p = parent;
+                    let mut ino_attr = None;
+                    for path in level_path.iter().filter(|p| !p.is_empty()) {
+                        let (ino, attr) = self.lookup(p, *path, false).await?;
+                        ino_attr.replace((ino, attr));
+                        p = ino;
+                    }
+                    Ok(ino_attr.unwrap())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     // GetAttr returns the attributes for given node.
     async fn get_attr(&self, inode: Ino) -> Result<Attr> {
         let base = self.as_ref();
-        let inode = inode.transfer_root(base.root);
+        let inode = base.check_root(inode);
         let attr = {
             let file = base.open_files.lock(inode);
             let of = file.lock().await;
@@ -1697,7 +1950,7 @@ where
         attr: &Attr,
     ) -> Result<()> {
         let base = self.as_ref();
-        let inode = inode.transfer_root(base.root);
+        let inode = base.check_root(inode);
         let res = self.do_set_attr(inode, set, sggid_clear_mode, attr).await;
         {
             let file = base.open_files.lock(inode);
@@ -1943,7 +2196,7 @@ where
             return ReadFSSnafu.fail()?;
         }
 
-        let parent = parent.transfer_root(base.root);
+        let parent = base.check_root(parent);
         let attr = self.do_unlink(parent, name, skip_check_trash).await?;
         let diff_length = if attr.typ == INodeType::File {
             attr.length
@@ -1991,10 +2244,8 @@ where
             return ReadFSSnafu.fail()?;
         }
 
-        let parent = parent.transfer_root(base.root);
-        let ino = self
-            .do_rmdir(parent, name, skip_check_trash)
-            .await?;
+        let parent = base.check_root(parent);
+        let ino = self.do_rmdir(parent, name, skip_check_trash).await?;
         if !parent.is_trash() {
             let mut dir_parents = base.dir_parents.lock();
             dir_parents.remove(&ino);
@@ -2075,8 +2326,8 @@ where
             }
         }
 
-        let parent_src = parent_src.transfer_root(base.root);
-        let parent_dst = parent_dst.transfer_root(base.root);
+        let parent_src = base.check_root(parent_src);
+        let parent_dst = base.check_root(parent_dst);
         let quota_src = if parent_src.is_trash() {
             None
         } else {
@@ -2222,7 +2473,7 @@ where
             .fail()?;
         }
 
-        let parent = parent.transfer_root(self.as_ref().root);
+        let parent = self.as_ref().check_root(parent);
         let attr = self.get_attr(inode).await?;
         if attr.typ == INodeType::Directory {
             return OpNotPermittedSnafu {
@@ -2247,15 +2498,15 @@ where
     // Readdir returns all entries for given directory, which include attributes if plus is true.
     async fn readdir(&self, inode: Ino, wantattr: bool) -> Result<Vec<Entry>> {
         let base = self.as_ref();
-        let inode = inode.transfer_root(base.root);
+        let inode = base.check_root(inode);
         let mut attr = self.get_attr(inode).await?;
         let mut mmask = ModeMask::READ;
         if wantattr {
             mmask.insert(ModeMask::EXECUTE);
         }
         self.access(inode, mmask, &attr).await?;
-        if inode == base.root {
-            attr.parent = base.root;
+        if inode == base.root() {
+            attr.parent = base.root();
         }
         let mut base_entries = vec![
             Entry {
@@ -2524,7 +2775,16 @@ where
 
     // GetDirStat returns the space and inodes usage of a directory.
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat> {
-        todo!()
+        match self
+            .do_get_dir_stat(
+                self.as_ref().check_root(inode),
+                !self.as_ref().conf.read_only,
+            )
+            .await?
+        {
+            Some(stat) => Ok(stat),
+            None => self.calc_dir_stat(inode).await,
+        }
     }
 
     // GetXattr returns the value of extended attribute for given name.
@@ -2559,7 +2819,7 @@ where
             }
         );
 
-        self.do_remove_xattr(inode.transfer_root(self.as_ref().root), name)
+        self.do_remove_xattr(self.as_ref().check_root(inode), name)
             .await
     }
 
@@ -2623,7 +2883,7 @@ where
     // Remove all files and directories recursively.
     async fn remove(&self, parent: Ino, name: &str) -> Result<u64> {
         let base = self.as_ref();
-        let parent = parent.transfer_root(base.root);
+        let parent = base.check_root(parent);
         self.access(
             parent,
             ModeMask::WRITE.union(ModeMask::EXECUTE),
@@ -2657,14 +2917,19 @@ where
     async fn get_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary> {
         let attr = self.get_attr(ino).await?;
         if attr.typ != INodeType::Directory {
+            let length = if attr.typ == INodeType::File {
+                attr.length
+            } else {
+                0
+            };
             Ok(Summary {
                 dirs: 0,
                 files: 1,
                 size: align_4k(0) as u64,
-                length: attr.length,
+                length: length,
             })
         } else {
-            let inode = ino.transfer_root(self.as_ref().root);
+            let inode = self.as_ref().check_root(ino);
             let mut summary = self.get_dir_summary(inode, recursive, strict).await?;
             summary.dirs += 1;
             summary.size += align_4k(0) as u64;
@@ -2699,13 +2964,54 @@ where
     }
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> Result<()> {
-        todo!()
+    async fn chroot(&self, subdir: &str) -> Result<Ino> {
+        let level_subdir = subdir.split("/").collect::<Vec<&str>>();
+        let mut tmp_root = self.as_ref().root();
+        for subdir in level_subdir {
+            ensure!(
+                !subdir.is_empty(),
+                NoEntryFoundSnafu {
+                    parent: tmp_root,
+                    name: subdir.to_string()
+                }
+            );
+            let (inode, attr) = match self.lookup(tmp_root, subdir, false).await {
+                Ok((inode, attr)) => (inode, attr),
+                Err(e) => {
+                    if e.is_no_entry_found(&tmp_root, subdir) {
+                        self.mkdir(tmp_root, subdir, 0o777, 0, 0).await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            ensure!(
+                attr.typ == INodeType::Directory,
+                NotDir2Snafu { ino: inode }
+            );
+            tmp_root = inode;
+        }
+        self.as_ref().chroot(tmp_root);
+        Ok(tmp_root)
     }
 
     // GetParents returns a map of node parents (> 1 parents if hardlinked)
-    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize> {
-        todo!()
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, u32> {
+        if inode.is_root() || inode.is_trash() {
+            return [(1, 1)].into();
+        }
+        let attr = match self.get_attr(inode).await {
+            Ok(attr) => attr,
+            Err(_) => {
+                warn!("GetAttr inode err {}: {}", inode, "st");
+                return HashMap::new();
+            }
+        };
+        if attr.parent > 0 {
+            [(attr.parent, 1)].into()
+        } else {
+            self.do_get_parents(inode).await
+        }
     }
 
     fn get_base(&self) -> &CommonMeta {

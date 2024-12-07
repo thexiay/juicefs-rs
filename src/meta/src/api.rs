@@ -19,7 +19,7 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
 use crate::error::{DriverSnafu, Result};
-use crate::quota::Quota;
+use crate::quota::{Quota, QuotaView};
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
@@ -39,7 +39,6 @@ pub trait InoExt {
     fn is_root_trash(&self) -> bool;
     fn is_sub_trash(&self) -> bool;
     fn is_root(&self) -> bool;
-    fn transfer_root(&self, real_root: Ino) -> Ino;
 }
 
 impl InoExt for Ino {
@@ -58,14 +57,6 @@ impl InoExt for Ino {
     fn is_root(&self) -> bool {
         *self == ROOT_INODE
     }
-
-    fn transfer_root(&self, real_root: Ino) -> Ino {
-        match *self {
-            0 => ROOT_INODE, // force using Root inode
-            ROOT_INODE => real_root,
-            _ => *self,
-        }
-    }
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +69,15 @@ pub enum INodeType {
     BlockDev = 5,  // type for block device
     CharDev = 6,   // type for character device
     Socket = 7,    // type for socket
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotaOp {
+    Set(QuotaView),
+    Get,
+    Del,
+    List,
+    Check,
 }
 
 // Entry is an entry inside a directory.
@@ -329,7 +329,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         incre_process: Box<dyn Fn(isize) + Send>,
     );
 
-    // GetPaths returns all paths of an inode
+    /// GetPaths returns all paths of an inode.
     async fn get_paths(&self, inode: Ino) -> Vec<String>;
 
     // Check integrity of an absolute path and repair it if asked
@@ -347,14 +347,21 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // OnReload register a callback for any change founded after reloaded.
     async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>);
 
+    /// Handle quota operation
+    /// 
+    /// # Arguments
+    /// 
+    /// * `op` - operation type
+    /// * `dpath` - directory path relative to the current root path
+    /// * `strict` - if true, it will check the quota of the parent directory
+    /// * `repair` - if true, it will repair the quota if it's not correct
     async fn handle_quota(
         &self,
-        cmd: u8,
-        dpath: String,
-        quotas: HashMap<String, Quota>,
+        op: QuotaOp,
+        dpath: &str,
         strict: bool,
         repair: bool,
-    ) -> Result<()>;
+    ) -> Result<HashMap<String, QuotaView>>;
 
     // Dump the tree under root, which may be modified by checkRoot
     async fn dump_meta(
@@ -373,6 +380,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// # Returns
     ///
     /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
+    ///    total space is the total size of the current rootfs.
     async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
 
     // Access checks the current user can access (mode)permission on given inode.
@@ -381,17 +389,22 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // Lookup returns the inode and attributes for the given entry in a directory.
     async fn lookup(&self, parent: Ino, name: &str, check_permission: bool) -> Result<(Ino, Attr)>;
 
-    /// Resolve fetches the inode and attributes for an entry identified by the given path.
+    /// Resolve fetches the inode and attributes for an entry identified by the given path
+    /// (The last file of the path).
     /// The different between with lookup and resolve is that resolve deep search in path,
     /// but lookup only search in current directory.
     ///
     /// # Arguments
+    /// 
+    /// * `parent` - parent inode
+    /// * `path` - path of the multiple level entry
+    /// * `fallback` - if true, it will use lookup to find the entry
     ///
     /// # Errors
     ///
     /// * `ENOTSUP` - will be returned if there's no natural implementation for this operation or
     /// if there are any symlink following involved.
-    async fn resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)>;
+    async fn resolve(&self, parent: Ino, path: &str, fallback: bool) -> Result<(Ino, Attr)>;
 
     /// GetAttr returns the attributes for given node.
     ///
@@ -682,10 +695,10 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> Result<()>;
+    async fn chroot(&self, subdir: &str) -> Result<Ino>;
 
     // GetParents returns a map of node parents (> 1 parents if hardlinked)
-    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize>;
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, u32>;
     // ---------------------------------------- sys call -----------------------------------------------------------
 
     // just for test
