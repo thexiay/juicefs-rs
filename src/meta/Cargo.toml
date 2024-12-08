@@ -1,0 +1,43 @@
+[package]
+name = "juice-meta"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+juice-utils = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+redis = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hostname = { workspace = true }
+get_if_addrs = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+bincode = { workspace = true }
+regex = { workspace = true }
+bitflags = { workspace = true }
+futures = { workspace = true }
+deadpool = { workspace = true }
+deadpool-redis = { workspace = true }
+crc32fast = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+dyn-clone = { workspace = true }
+nix = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5"
+ctor = "0.2.8"

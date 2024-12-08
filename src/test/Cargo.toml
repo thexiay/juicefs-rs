@@ -1,0 +1,13 @@
+[package]
+name = "juice-test"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+libc ={ workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }
