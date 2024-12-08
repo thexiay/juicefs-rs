@@ -1395,7 +1395,7 @@ where
 
     // GetSession retrieves information of session with sid
     async fn get_session(&self, sid: u64, detail: bool) -> Result<Session> {
-        todo!()
+        self.do_get_session(sid, detail).await
     }
 
     // ListSessions returns all client sessions.
@@ -1644,7 +1644,6 @@ where
                 let mut quotas = HashMap::new();
                 for (ino, quota) in quota_map {
                     let p = self.get_paths(ino).await;
-                    // TODO: should expose other path user can't see in current rootfs?
                     let p = if p.is_empty() {
                         format!("inode:{}", ino)
                     } else {
@@ -1725,7 +1724,7 @@ where
             return Ok((space_total, space_avail, i_used, i_avail));
         }
 
-        // For Not root, means it's rootfs
+        // Not rootfs, fallback to dir ino
         self.access(
             ino,
             ModeMask::READ.union(ModeMask::EXECUTE),
@@ -1734,6 +1733,7 @@ where
         .await?;
         let mut inode = ino;
         let mut usage = None;
+        // `space_avail` and `i_avail` is the minium of all path chain(/ROOT/.../ino)
         while inode >= ROOT_INODE {
             let attr = self.get_attr(inode).await?;
             if inode == ROOT_INODE {
@@ -1762,8 +1762,8 @@ where
             inode = attr.parent;
         }
         if let Some(usage) = usage {
-            space_total = usage.used_space as u64 + space_avail;
-            i_used = usage.used_inodes as u64;
+            space_total = usage.used_space + space_avail;
+            i_used = usage.used_inodes;
         }
         Ok((space_total, space_avail, i_used, i_avail))
     }
@@ -2680,7 +2680,7 @@ where
     // Read returns the list of slices on the given chunk.
     async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>> {
         let base = self.as_ref();
-        let file = base.open_files.lock(inode);
+        let file = base.open_files.lock(inode);  // 这里注意死锁，lock不可重入的
         let of = file.lock().await;
         if let Some(ss) = of.read_chunk(indx) {
             return Ok(ss);
@@ -2689,7 +2689,7 @@ where
         ensure_whatever!(pslices.is_some(), "read chunk not found");
         let pslices = pslices.unwrap();
         if pslices.is_empty() {
-            let attr = self.get_attr(inode).await?;
+            let attr = self.do_get_attr(inode).await?;
             if attr.typ != INodeType::File {
                 return InvalidArgSnafu {
                     arg: format!("read: inode is not file."),

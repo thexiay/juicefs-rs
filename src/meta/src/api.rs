@@ -104,7 +104,7 @@ pub struct Slice {
     pub len: u32,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 pub struct Summary {
@@ -348,9 +348,9 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>);
 
     /// Handle quota operation
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `op` - operation type
     /// * `dpath` - directory path relative to the current root path
     /// * `strict` - if true, it will check the quota of the parent directory
@@ -380,7 +380,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// # Returns
     ///
     /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
-    ///    total space is the total size of the current rootfs.
+    ///    total space is the total size of the inode.
     async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
 
     // Access checks the current user can access (mode)permission on given inode.
@@ -395,7 +395,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// but lookup only search in current directory.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `parent` - parent inode
     /// * `path` - path of the multiple level entry
     /// * `fallback` - if true, it will use lookup to find the entry
@@ -717,13 +717,12 @@ pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
-    let res: Result<Box<dyn Meta>> = match driver {
-        "redis" => RedisEngine::new(driver, addr, conf).await,
-        _ => Err(DriverSnafu {
-            driver: driver.to_string(),
-        }
-        .build()
-        .into()),
-    };
-    res.expect(&format!("Meta {uri} is not available."))
+    match driver {
+        "redis" => Box::new(
+            RedisEngine::new(driver, addr, conf)
+                .await
+                .expect(&format!("Meta {uri} is not available")),
+        ),
+        _ => panic!("unknown driver {driver}"),
+    }
 }

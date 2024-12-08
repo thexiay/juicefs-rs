@@ -22,3 +22,6 @@ mod slice;
 mod session;
 mod openfile;
 mod random_test;
+
+#[cfg(test)]
+mod test;

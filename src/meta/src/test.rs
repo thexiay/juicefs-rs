@@ -1,12 +1,18 @@
-#![feature(let_chains)]
-
 use std::time::{Duration, SystemTime};
 
-use juice_meta::{
-    api::{Attr, INodeType, Ino, Meta, OFlag, Slice},
+use crate::{
+    align_4k,
+    api::{
+        Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice,
+        Summary, XattrF, ROOT_INODE,
+    },
+    base::{CommonMeta, Engine},
     config::Format,
+    quota::{MetaQuota, QuotaView},
 };
-use tokio::time;
+use std::time::UNIX_EPOCH;
+use tokio::time::{self, sleep};
+use tracing::info;
 
 pub fn test_format() -> Format {
     Format {
@@ -16,20 +22,7 @@ pub fn test_format() -> Format {
     }
 }
 
-#[cfg(test)]
-pub async fn test_meta_client(mut m: Box<dyn Meta>) {
-    use std::{collections::HashMap, sync::Arc, time::UNIX_EPOCH};
-
-    use juice_meta::{
-        align_4k,
-        api::{
-            Falloc, INodeType, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, XattrF,
-            ROOT_INODE,
-        },
-        quota::QuotaView,
-    };
-    use tracing::info;
-
+pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     let attr = m.get_attr(ROOT_INODE).await.unwrap();
     assert_eq!(attr.mode, 0o777);
 
@@ -54,8 +47,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.new_session(true).await.expect("new session: ");
     let sessions = m.list_sessions().await.expect("list sessions: ");
     assert!(sessions.len() == 1, "list sessions cnt should be 1");
-    let base = m.get_base();
-    let base_sid = { base.sid.read().clone() };
+    let base_sid = { m.as_ref().sid.read().clone() };
     assert!(
         base_sid.unwrap() == sessions[0].sid,
         "base sid: {:?} != registered sid {}",
@@ -63,7 +55,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         sessions[0].sid
     );
 
-    let meta = m.clone();
+    let meta = dyn_clone::clone_box(m);
     tokio::spawn(async move {
         meta.cleanup_stale_sessions().await;
     });
@@ -87,7 +79,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         "got {:?}",
         rs
     );
-    // test lookup
+    // ----------------------------------------- test lookup -----------------------------------------
     let (parent, _) = m.lookup(ROOT_INODE, "d", true).await.expect("lookup d: ");
     let (inode, _) = m.lookup(ROOT_INODE, "..", true).await.expect("lookup ..: ");
     assert_eq!(inode, ROOT_INODE);
@@ -133,7 +125,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     );
     let (_, _) = m.lookup(parent, "f", true).await.expect("lookup f: ");
 
-    // test resolve
+    // ----------------------------------------- test resolve -----------------------------------------
     let rs = m.resolve(ROOT_INODE, "d/f", false).await;
     assert!(
         rs.as_ref().unwrap_err().is_op_not_supported(),
@@ -170,7 +162,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         rs
     );
 
-    // check owner permission
+    // ----------------------------------------- test access -----------------------------------------
     let (p1, mut attr) = m
         .mkdir(ROOT_INODE, "d1", 0o2777, 0, 0)
         .await
@@ -298,7 +290,8 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert!(renamed_entry.is_some());
     let after_stat = m.stat_fs(ROOT_INODE).await.unwrap();
     assert_eq!(before_stat.2 - after_stat.2, 1); // used inode decr 1
-    assert_eq!(  // avaiable space incr attr length
+    assert_eq!(
+        // avaiable space incr attr length
         (after_stat.1 - before_stat.1) as i64,
         align_4k(renamed_entry.unwrap().1.length)
     );
@@ -315,6 +308,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .mkdir(ROOT_INODE, "d", 0o640, 0o22, 0)
         .await
         .expect("mkdir d: ");
+    let d_parent = parent;
     // Test rename with parent change
     let (parent2, _) = m
         .mkdir(ROOT_INODE, "d4", 0o777, 0, 0)
@@ -393,7 +387,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert!(err.is_invalid_arg(), "got {:?}", err);
     let (inode, _) = m.lookup(ROOT_INODE, "f", true).await.expect("lookup f: ");
 
-    // data test
+    // ----------------------------------------- test data write read -----------------------------------------
     // try to open a file that does not exist
     let err = m.open(99999, OFlag::O_RDWR).await.unwrap_err();
     assert!(err.is_no_entry_found2(&99999), "got {:?}", err);
@@ -522,7 +516,7 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         .await
         .expect("setxattr: ");
 
-    // test statfs
+    // ----------------------------------------- test quota -----------------------------------------
     let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
     assert_eq!(totalspace, 1 << 50);
     assert_eq!(iavail, 10 << 20);
@@ -553,9 +547,9 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     m.handle_quota(QuotaOp::Set(QuotaView::default()), ".", false, false)
         .await
         .expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
     assert_eq!(total_space, (1 << 20) - 4 * align_4k(0) as u64);
-    assert_eq!(iavail, 96);
+    assert_eq!(i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -566,10 +560,12 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         ".",
         false,
         false,
-    ).await.expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    )
+    .await
+    .expect("set quota: ");
+    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
     assert_eq!(total_space, 1 << 10);
-    assert_eq!(iavail, 96);
+    assert_eq!(i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -580,7 +576,9 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         ".",
         false,
         false,
-    ).await.expect("set quota: ");
+    )
+    .await
+    .expect("set quota: ");
     let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
     assert_eq!(total_space, (1 << 20) as u64 - 4 * align_4k(0) as u64);
     assert_eq!(iavail, 10);
@@ -594,7 +592,9 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
         ".",
         false,
         false,
-    ).await.expect("set quota: ");
+    )
+    .await
+    .expect("set quota: ");
     let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
     assert_eq!(total_space, 1 << 10);
     assert_eq!(iavail, 10);
@@ -608,74 +608,94 @@ pub async fn test_meta_client(mut m: Box<dyn Meta>) {
     assert_eq!(totalspace, 1 << 10);
     assert_eq!(iavail, 10);
 
-    //m.load_quotas().await.expect("load quotas: ");
-    /*
+    // mock flush quota cache into persist layer
+    m.load_quotas().await;
+    {
+        let mut dir_quotas = m.as_ref().dir_quotas.write();
+        dir_quotas
+            .entry(sub_ino)
+            .and_modify(|quota| quota.update(4 << 10, 15));  // test used space > total space
+    }
+    m.flush_quotas().await;
+    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(total_space, 4 << 10);
+    assert_eq!(avail_space, 0);
+    assert_eq!(i_used, 15);
+    assert_eq!(i_avail, 0);
+    {
+        let mut dir_quotas = m.as_ref().dir_quotas.write();
+        dir_quotas
+            .entry(sub_ino)
+            .and_modify(|quota| quota.update(-8 << 10, -20)); // invalid used space
+    }
+    m.flush_quotas().await;
+    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(total_space, 1 << 10);
+    assert_eq!(avail_space, 1 << 10);
+    assert_eq!(i_used, 0);
+    assert_eq!(i_avail, 10);
 
-    base.loadQuotas()
-    base.quotaMu.RLock()
-    q := base.dirQuotas[subIno]
-    base.quotaMu.RUnlock()
-    q.update(4<<10, 15) // used > max
-    base.doFlushQuotas()
-    if st := m.StatFS(ctx, subIno, &totalspace, &availspace, &iused, &iavail); st != 0 {
-        t.Fatalf("statfs: %s", st)
-    }
-    if totalspace != 4<<10 || availspace != 0 || iused != 15 || iavail != 0 {
-        t.Fatalf("total space %d, availspace %d, iused %d, iavail %d", totalspace, availspace, iused, iavail)
-    }
-    q.update(-8<<10, -20) // used < 0
-    base.doFlushQuotas()
-    if st := m.StatFS(ctx, subIno, &totalspace, &availspace, &iused, &iavail); st != 0 {
-        t.Fatalf("statfs: %s", st)
-    }
-    if totalspace != 1<<10 || availspace != 1<<10 || iused != 0 || iavail != 10 {
-        t.Fatalf("total space %d, availspace %d, iused %d, iavail %d", totalspace, availspace, iused, iavail)
-    }
+    m.rmdir(ROOT_INODE, "subdir", false)
+        .await
+        .expect("rmdir subdir: ");
+    let summary = m
+        .get_summary(d_parent, false, true)
+        .await
+        .expect("get summary: ");
+    assert_eq!(
+        summary,
+        Summary {
+            length: 0,
+            size: 4096,
+            files: 0,
+            dirs: 1
+        }
+    );
+    let symmary = m
+        .get_summary(ROOT_INODE, true, true)
+        .await
+        .expect("get summary: ");
+    assert_eq!(
+        symmary,
+        Summary {
+            length: 400,
+            size: 20480,
+            files: 3,
+            dirs: 2
+        }
+    );
+    let summary = m
+        .get_summary(inode, true, true)
+        .await
+        .expect("get summary: ");
+    assert_eq!(
+        summary,
+        Summary {
+            length: 200,
+            size: 4096,
+            files: 1,
+            dirs: 0
+        }
+    );
+    m.unlink(ROOT_INODE, "f", false)
+        .await
+        .expect("unlink f3: ");
+    m.unlink(ROOT_INODE, "f3", false)
+        .await
+        .expect("unlink f3: ");
+    
+    sleep(Duration::from_millis(100)).await;  // wait for delete
+    
+    let rs = m.read(inode, 0).await;
+    assert!(rs.as_ref().unwrap_err().is_no_entry_found2(&inode), "got {:?}", rs);
 
-    if st := m.Rmdir(ctx, 1, "subdir"); st != 0 {
-        t.Fatalf("rmdir subdir: %s", st)
-    }
+    info!("4444");
+    // release resource
+    m.rmdir(ROOT_INODE, "d", false).await.expect("rmdir d: ");
 
-    var summary Summary
-    if st := m.GetSummary(ctx, parent, &summary, false, true); st != 0 {
-        t.Fatalf("summary: %s", st)
-    }
-    expected := Summary{Length: 0, Size: 4096, Files: 0, Dirs: 1}
-    if summary != expected {
-        t.Fatalf("summary %+v not equal to expected: %+v", summary, expected)
-    }
-    summary = Summary{}
-    if st := m.GetSummary(ctx, 1, &summary, true, true); st != 0 {
-        t.Fatalf("summary: %s", st)
-    }
-    expected = Summary{Length: 400, Size: 20480, Files: 3, Dirs: 2}
-    if summary != expected {
-        t.Fatalf("summary %+v not equal to expected: %+v", summary, expected)
-    }
-    if st := m.GetSummary(ctx, inode, &summary, true, true); st != 0 {
-        t.Fatalf("summary: %s", st)
-    }
-    expected = Summary{Length: 600, Size: 24576, Files: 4, Dirs: 2}
-    if summary != expected {
-        t.Fatalf("summary %+v not equal to expected: %+v", summary, expected)
-    }
-    if st := m.Unlink(ctx, 1, "f"); st != 0 {
-        t.Fatalf("unlink f: %s", st)
-    }
-    if st := m.Unlink(ctx, 1, "f3"); st != 0 {
-        t.Fatalf("unlink f3: %s", st)
-    }
-    time.Sleep(time.Millisecond * 100) // wait for delete
-    if st := m.Read(ctx, inode, 0, &slices); st != syscall.ENOENT {
-        t.Fatalf("read chunk: %s", st)
-    }
-    if st := m.Rmdir(ctx, 1, "d"); st != 0 {
-        t.Fatalf("rmdir d: %s", st)
-    }
-     */
 }
 
-pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
+pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     let mut format = m.load(false).await.unwrap().as_ref().clone();
     format.capacity = 0;
     m.init(format, false).await.unwrap();
@@ -739,11 +759,11 @@ pub async fn test_truncate_and_delete(mut m: Box<dyn Meta>) {
     m.unlink(1, "f", false).await.expect("unlink f:")
 }
 
-pub async fn test_trash(mut m: Box<dyn Meta>) {}
+pub async fn test_trash(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-pub async fn test_parents(mut m: Box<dyn Meta>) {}
+pub async fn test_parents(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-pub async fn test_remove(mut m: Box<dyn Meta>) {
+pub async fn test_remove(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     let (_, _) = m
         .create(1, "f", 0644, 0, OFlag::empty())
         .await
@@ -782,42 +802,42 @@ pub async fn test_remove(mut m: Box<dyn Meta>) {
     let _ = m.remove(1, "d").await.expect("rmr d: ");
 }
 
-async fn test_resolve(mut m: Box<dyn Meta>) {}
+async fn test_resolve(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_sticky_bit(mut m: Box<dyn Meta>) {}
+async fn test_sticky_bit(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_locks(mut m: Box<dyn Meta>) {}
+async fn test_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_list_locks(mut m: Box<dyn Meta>) {}
+async fn test_list_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_concurrent_write(mut m: Box<dyn Meta>) {}
+async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
 async fn test_compaction<M: Meta>(m: M, flag: bool) {}
 
-async fn test_copy_file_range(mut m: Box<dyn Meta>) {}
+async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_close_session(mut m: Box<dyn Meta>) {}
+async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_concurrent_dir(mut m: Box<dyn Meta>) {}
+async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_attr_flags(mut m: Box<dyn Meta>) {}
+async fn test_attr_flags(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_quota(mut m: Box<dyn Meta>) {}
+async fn test_quota(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_atime(mut m: Box<dyn Meta>) {}
+async fn test_atime(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_access(mut m: Box<dyn Meta>) {}
+async fn test_access(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_open_cache(mut m: Box<dyn Meta>) {}
+async fn test_open_cache(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_case_incensi(mut m: Box<dyn Meta>) {}
+async fn test_case_incensi(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_check_and_repair(mut m: Box<dyn Meta>) {}
+async fn test_check_and_repair(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_dir_stat(mut m: Box<dyn Meta>) {}
+async fn test_dir_stat(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_clone(mut m: Box<dyn Meta>) {}
+async fn test_clone(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_acl(mut m: Box<dyn Meta>) {}
+async fn test_acl(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_read_only(mut m: Box<dyn Meta>) {}
+async fn test_read_only(m: &mut (impl Engine + AsRef<CommonMeta>)) {}

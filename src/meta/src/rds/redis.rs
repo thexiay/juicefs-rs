@@ -535,7 +535,7 @@ impl AsRef<CommonMeta> for RedisEngine {
 impl RedisEngine {
     /// redis URL:
     /// `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
-    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Box<dyn Meta>> {
+    pub async fn new(driver: &str, addr: &str, conf: Config) -> Result<Self> {
         let url = format!("{}://{}", driver, addr);
         let conn_info = url.into_connection_info()?;
         let prefix = conn_info.redis.db.to_string();
@@ -569,13 +569,13 @@ impl RedisEngine {
         };
 
         engine.check_server_config().await?;
-        Ok(Box::new(RedisEngine {
+        Ok(RedisEngine {
             engine: Arc::new(engine),
             uid: 0,
             gid: 0,
             gids: Vec::new(),
             token: CancellationToken::new(),
-        }))
+        })
     }
 
     async fn do_delete_file_data_inner(&self, inode: Ino, length: u64, tracking: &str) {
@@ -795,7 +795,10 @@ impl RedisEngine {
                     }
                     let owner = match u64::from_str_radix(parts[1], 16) {
                         Ok(owner) => owner,
-                        Err(err) => continue,
+                        Err(err) => {
+                            warn!("Invalid owner {} in lock {}, {err}", parts[1], lock);
+                            continue;
+                        }
                     };
                     if is_flock {
                         flocks.push(Flock {
@@ -1462,19 +1465,24 @@ impl Engine for RedisEngine {
         pipe.hget(self.dir_quota_used_space_key(), inode);
         pipe.hget(self.dir_quota_used_inodes_key(), inode);
         let (quota, used_space, used_inodes) = pipe
-            .query_async::<(Option<Vec<u8>>, Option<u64>, Option<u64>)>(conn)
+            .query_async::<(Option<Vec<u8>>, Option<i64>, Option<i64>)>(conn)
             .await?;
 
         if let Some(max_quota) = quota
-            && let Some(used_space) = used_space
-            && let Some(used_inodes) = used_inodes
+            && let Some(mut used_space) = used_space
+            && let Some(mut used_inodes) = used_inodes
         {
             let (max_space, max_inodes) = bincode::deserialize(&max_quota)?;
+            if used_space < 0 || used_inodes < 0 {
+                warn!("used space({used_space}) or used inodes({used_inodes}) is neg invalid.");
+                used_space = 0;
+                used_inodes = 0;
+            }
             Ok(Some(QuotaView {
                 max_space,
                 max_inodes,
-                used_space,
-                used_inodes,
+                used_space: used_space as u64,
+                used_inodes: used_inodes as u64,
             }))
         } else {
             Ok(None)
@@ -1499,7 +1507,6 @@ impl Engine for RedisEngine {
             } else {
                 None
             };
-                
 
             let mut pipe = pipe();
             pipe.atomic();
@@ -1516,7 +1523,7 @@ impl Engine for RedisEngine {
             }
             match pipe.query_async::<Option<Value>>(conn).await? {
                 Some(_) => Ok(Some(origin)),
-                None => Ok(None)
+                None => Ok(None),
             }
         })
     }
@@ -3218,7 +3225,46 @@ impl Engine for RedisEngine {
     }
 
     async fn do_flush_dir_stat(&self, batch: HashMap<Ino, DirStat>) -> Result<()> {
-        unimplemented!()
+        let mut conn = self.share_conn();
+        let mut p = pipe();
+        p.atomic();
+        batch.keys().for_each(|ino| {
+            p.hexists(self.dir_used_space_key(), ino);
+        });
+        let exists = p.query_async::<Vec<bool>>(&mut conn).await?;
+        ensure_whatever!(batch.keys().len() == exists.len(), "Invalid len for flush redis return list");
+        let used_space_exists = batch
+            .keys()
+            .zip(exists.iter())
+            .map(|(ino, exist)| (*ino, *exist))
+            .collect::<HashMap<_, _>>();
+        
+        // TODO: force sync dir stat, it's more precise
+        
+
+        // flush dir stat cache, it's not so precise
+        let mut inos = batch.keys().collect::<Vec<_>>();
+        inos.sort();
+        for inos_batch in inos.chunks(1000) {
+            let mut pipe = pipe();
+            pipe.atomic();
+            for ino in inos_batch {
+                if used_space_exists[ino] {
+                    let stat = &batch[ino];
+                    if stat.length != 0 {
+                        pipe.hset(self.dir_data_length_key(), *ino, stat.length);
+                    }
+                    if stat.space != 0 {
+                        pipe.hset(self.dir_used_space_key(), *ino, stat.space);
+                    }
+                    if stat.inodes != 0 {
+                        pipe.hset(self.dir_used_inodes_key(), *ino, stat.inodes);
+                    }
+                }
+            }
+            pipe.query_async(&mut conn).await?;
+        }
+        Ok(())
     }
 
     async fn do_get_dir_stat(&self, ino: Ino, try_sync: bool) -> Result<Option<DirStat>> {

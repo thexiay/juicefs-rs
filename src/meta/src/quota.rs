@@ -22,15 +22,10 @@ pub struct QuotaView {
 }
 
 impl QuotaView {
+    // Format the maximum data capacity to match the data capacity that has been used
     pub fn sanitize(&mut self) {
-        if self.used_space < 0 {
-            self.used_space = 0;
-        }
         if self.max_space > 0 && self.max_space < self.used_space {
             self.max_space = self.used_space;
-        }
-        if self.used_inodes < 0 {
-            self.used_inodes = 0;
         }
         if self.max_inodes > 0 && self.max_inodes < self.used_inodes {
             self.max_inodes = self.used_inodes;
@@ -114,13 +109,13 @@ pub(crate) trait MetaQuota {
     /// update the new space and new inode for quota
     async fn update_quota(&self, inode: Ino, space: i64, inodes: i64);
 
-    /// load quotas from persist layer
+    /// Load all quotas from persist layer and cache it.
     async fn load_quotas(&self);
 
-    /// flush quotas once
+    /// Flush all quotas cache into persist layer.
     async fn flush_quotas(&self);
 
-    /// flush dir stats once
+    /// Flush dir stats into persist layer.
     async fn flush_dir_stat(&self);
 
     /// get inode of the first parent (or myself) with quota
@@ -372,7 +367,7 @@ where
                     }
                 }
             }
-            Err(e) => warn!("Flush quotas: {}", e),
+            Err(e) => warn!("Flush quotas failed: {}", e),
         }
     }
 
@@ -387,7 +382,10 @@ where
             std::mem::take(&mut *dir_stats)
         };
         if !dir_stats.is_empty() {
-            self.do_flush_dir_stat(dir_stats).await;
+            match self.do_flush_dir_stat(dir_stats).await {
+                Ok(_) => {}
+                Err(e) => error!("Flush dir stats failed: {}", e),
+            }
         }
     }
 
