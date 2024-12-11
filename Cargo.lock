@@ -565,6 +565,14 @@ dependencies = [
 [[package]]
 name = "juice-object"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "snafu",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "juice-test"

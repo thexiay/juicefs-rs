@@ -1,14 +1,11 @@
-use std::{
-    fmt::{Display, Formatter},
-    ops::Deref,
-};
+use std::fmt::{Display, Formatter};
 
 use deadpool::managed::PoolError;
 use redis::RedisError;
 use snafu::{FromString, GenerateImplicitData, Snafu};
 use tracing::{error, Span};
 
-use crate::{api::{Attr, Ino}, context::Uid};
+use crate::api::{Attr, Ino};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), display("{source}\n{span:?}:{loc}"))]
