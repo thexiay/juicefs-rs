@@ -41,15 +41,18 @@ pub struct FLockItem {
 pub enum DeleteFileOption {
     Deferred,
     Immediate {
+        // if force, it will wait semaphore to be acquired
+        // if not, it will skip this delete
         force: bool,
     },
 }
 
 pub fn align_4k(length: u64) -> i64 {
     if length == 0 {
-        return 1 << 12;
+        1 << 12
+    } else {
+        ((((length - 1) >> 12) + 1) << 12) as i64
     }
-    (((length - 1) >> 12 + 1) << 12) as i64
 }
 
 pub fn access_mode(attr: &Attr, uid: &Uid, gids: &Vec<Gid>) -> ModeMask {
@@ -86,4 +89,16 @@ pub async fn sleep_with_jitter(d: Duration) {
         rng.gen_range((-j)..j)
     };
     sleep(Duration::from_millis((d.as_millis() as i64 + num) as u64)).await;
+}
+
+#[cfg(test)]
+mod test {
+    use crate::align_4k;
+
+    #[test]
+    fn test_align() {
+        let a = 200;
+        assert_eq!(4096, align_4k(a));
+    }
+    
 }

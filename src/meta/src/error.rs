@@ -1,14 +1,11 @@
-use std::{
-    fmt::{Display, Formatter},
-    ops::Deref,
-};
+use std::fmt::{Display, Formatter};
 
 use deadpool::managed::PoolError;
 use redis::RedisError;
 use snafu::{FromString, GenerateImplicitData, Snafu};
 use tracing::{error, Span};
 
-use crate::{api::{Attr, Ino}, context::Uid};
+use crate::api::{Attr, Ino};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), display("{source}\n{span:?}:{loc}"))]
@@ -38,6 +35,11 @@ pub enum MetaErrorEnum {
         parent: Ino,
         name: String,
         exist_ino: Ino,
+        exist_attr: Option<Attr>,
+    },
+    #[snafu(display("Entry alreay exists: {ino}"))]
+    EntryExists2 {
+        ino: Ino,
         exist_attr: Option<Attr>,
     },
     #[snafu(display("Bad file descriptor: {fd}"))]
@@ -86,6 +88,8 @@ pub enum MetaErrorEnum {
     BrokenPipe {
         ino: Ino
     },
+    #[snafu(display("No such attribute."))]
+    NoSuchAttr,
 
     // ----------------- other error  -------------------
     #[snafu(display("An connection error occurred: {:?}", source))]
@@ -137,6 +141,10 @@ pub enum MetaErrorEnum {
     RenameSameInoError,
     #[snafu(display("message queue closed"))]
     SemaphoraCloseError,
+    #[snafu(display("set quota err({file})"))]
+    SetQuotaError {
+        file: String,
+    },
     #[snafu(whatever, display("{message}, cause: {source:?}"))]
     GenericError {
         message: String,
@@ -174,6 +182,14 @@ impl MetaError {
             self.inner(),
             MetaErrorEnum::EntryExists { parent: parent_, name: name_, .. }
             if parent == parent_ && name == name_
+        )
+    }
+
+    pub fn is_entry_exists2(&self, ino: &Ino) -> bool {
+        matches!(
+            self.inner(),
+            MetaErrorEnum::EntryExists2 { ino: ino_, .. }
+            if ino == ino_
         )
     }
 
@@ -217,6 +233,10 @@ impl MetaError {
 
     pub fn is_op_not_permitted(&self) -> bool {
         matches!(self.inner(), MetaErrorEnum::OpNotPermitted { .. })
+    }
+
+    pub fn is_no_such_attr(&self) -> bool {
+        matches!(self.inner(), MetaErrorEnum::NoSuchAttr)
     }
 }
 

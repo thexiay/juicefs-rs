@@ -161,14 +161,10 @@ impl PSlices {
         let mut root: Option<PSlice> = None;
         for mut pslice in self.pslices {
             if let Some(prev) = root {
-                debug!("cut before pslices: {prev:#?}");
                 let (left, right) = prev.cut(pslice.pos);
-                debug!("cut after pslices: left: {left:#?}, right: {right:#?}",);
                 pslice.left = left.map(Box::new);
                 if let Some(right) = right {
-                    debug!("cut before pslices: {right:#?}");
                     let (_left, right) = right.cut(pslice.pos + pslice.len);
-                    debug!("cut after pslices: left: {_left:#?}, right: {right:#?}",);
                     pslice.right = right.map(Box::new);
                 }
             }

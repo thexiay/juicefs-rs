@@ -8,3 +8,9 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [dependencies]
+snafu = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }

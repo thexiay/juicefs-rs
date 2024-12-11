@@ -27,10 +27,6 @@ pub struct OpenFile {
 
 impl OpenFile {
     pub fn put_attr(&mut self, attr: &mut Attr) {
-        if self.attr.is_some() {
-            debug!("put attr to a non empty cache");
-        }
-
         if let Some(cached_attr) = &self.attr
             && cached_attr.mtime == attr.mtime
         {

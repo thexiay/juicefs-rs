@@ -19,7 +19,7 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
 use crate::error::{DriverSnafu, Result};
-use crate::quota::Quota;
+use crate::quota::{Quota, QuotaView};
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
@@ -39,7 +39,6 @@ pub trait InoExt {
     fn is_root_trash(&self) -> bool;
     fn is_sub_trash(&self) -> bool;
     fn is_root(&self) -> bool;
-    fn transfer_root(&self, real_root: Ino) -> Ino;
 }
 
 impl InoExt for Ino {
@@ -58,14 +57,6 @@ impl InoExt for Ino {
     fn is_root(&self) -> bool {
         *self == ROOT_INODE
     }
-
-    fn transfer_root(&self, real_root: Ino) -> Ino {
-        match *self {
-            0 => ROOT_INODE, // force using Root inode
-            ROOT_INODE => real_root,
-            _ => *self,
-        }
-    }
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +69,15 @@ pub enum INodeType {
     BlockDev = 5,  // type for block device
     CharDev = 6,   // type for character device
     Socket = 7,    // type for socket
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotaOp {
+    Set(QuotaView),
+    Get,
+    Del,
+    List,
+    Check,
 }
 
 // Entry is an entry inside a directory.
@@ -104,7 +104,7 @@ pub struct Slice {
     pub len: u32,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 pub struct Summary {
@@ -225,6 +225,12 @@ bitflags! {
         const ZERO_RANGE = 1 << 4;
         const INSERT_RANGE = 1 << 5;
     }
+
+    pub struct XattrF: u32 {
+        const CREATE_OR_REPLACE = 0;
+        const CREATE = 1 << 0;
+        const REPLACE = 1 << 1;
+    }
 }
 
 // Attr represents attributes of a node.
@@ -323,7 +329,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         incre_process: Box<dyn Fn(isize) + Send>,
     );
 
-    // GetPaths returns all paths of an inode
+    /// GetPaths returns all paths of an inode.
     async fn get_paths(&self, inode: Ino) -> Vec<String>;
 
     // Check integrity of an absolute path and repair it if asked
@@ -341,14 +347,21 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // OnReload register a callback for any change founded after reloaded.
     async fn on_reload(&self, cb: Box<dyn Fn(Format) + Send>);
 
+    /// Handle quota operation
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - operation type
+    /// * `dpath` - directory path relative to the current root path
+    /// * `strict` - if true, it will check the quota of the parent directory
+    /// * `repair` - if true, it will repair the quota if it's not correct
     async fn handle_quota(
         &self,
-        cmd: u8,
-        dpath: String,
-        quotas: HashMap<String, Quota>,
+        op: QuotaOp,
+        dpath: &str,
         strict: bool,
         repair: bool,
-    ) -> Result<()>;
+    ) -> Result<HashMap<String, QuotaView>>;
 
     // Dump the tree under root, which may be modified by checkRoot
     async fn dump_meta(
@@ -362,15 +375,13 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
     async fn load_meta(&self, r: Box<dyn Read + Send>) -> Result<()>;
     // ---------------------------------------- sys call -----------------------------------------------------------
-    // StatFS returns summary statistics of a volume.
-    async fn stat_fs(
-        &self,
-        inode: Ino,
-        totalspace: AtomicU64,
-        availspace: AtomicU64,
-        iused: AtomicU64,
-        iavail: AtomicU64,
-    ) -> Result<()>;
+    /// StatFS returns summary statistics of a volume.
+    ///
+    /// # Returns
+    ///
+    /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
+    ///    total space is the total size of the inode.
+    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
 
     // Access checks the current user can access (mode)permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;
@@ -378,17 +389,22 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // Lookup returns the inode and attributes for the given entry in a directory.
     async fn lookup(&self, parent: Ino, name: &str, check_permission: bool) -> Result<(Ino, Attr)>;
 
-    /// Resolve fetches the inode and attributes for an entry identified by the given path.
+    /// Resolve fetches the inode and attributes for an entry identified by the given path
+    /// (The last file of the path).
     /// The different between with lookup and resolve is that resolve deep search in path,
     /// but lookup only search in current directory.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
+    /// * `parent` - parent inode
+    /// * `path` - path of the multiple level entry
+    /// * `fallback` - if true, it will use lookup to find the entry
+    ///
     /// # Errors
-    /// 
+    ///
     /// * `ENOTSUP` - will be returned if there's no natural implementation for this operation or
     /// if there are any symlink following involved.
-    async fn resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)>;
+    async fn resolve(&self, parent: Ino, path: &str, fallback: bool) -> Result<(Ino, Attr)>;
 
     /// GetAttr returns the attributes for given node.
     ///
@@ -418,13 +434,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
 
     /// Fallocate preallocate given space for given file.
     /// Returns the length of the file after fallocate.
-    async fn fallocate(
-        &self,
-        inode: Ino,
-        flag: Falloc,
-        off: u64,
-        size: u64,
-    ) -> Result<u64>;
+    async fn fallocate(&self, inode: Ino, flag: Falloc, off: u64, size: u64) -> Result<u64>;
 
     // ReadLink returns the target of a symlink.
     ///
@@ -470,11 +480,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// The file will be deleted if it's not linked by any entries and not open by any sessions.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `parent`: parent inode
     /// * `name`: entry name
     /// * `skip_check_trash`: skip check trash or not
-    /// 
+    ///
     /// # Erorr
     ///
     /// * `EPERM` - if current user has no permission
@@ -563,7 +573,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// Write put a slice of data on top of the given chunk.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `inode` - inode of the file
     /// * `indx` - index of the chunk
     /// * `off` - offset of the chunk
@@ -598,16 +608,16 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
 
     // GetXattr returns the value of extended attribute for given name.
-    async fn get_xattr(&self, inode: Ino, name: String, v_buff: &Vec<u8>) -> Result<()>;
+    async fn get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>>;
 
     // ListXattr returns all extended attributes of a node.
-    async fn list_xattr(&self, inode: Ino, dbuff: &Vec<u8>) -> Result<()>;
+    async fn list_xattr(&self, inode: Ino) -> Result<Vec<u8>>;
 
     // SetXattr update the extended attribute of a node.
-    async fn set_xattr(&self, inode: Ino, name: String, value: &Vec<u8>, flags: u32) -> Result<()>;
+    async fn set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()>;
 
     // RemoveXattr removes the extended attribute of a node.
-    async fn remove_xattr(&self, inode: Ino, name: String) -> Result<()>;
+    async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<()>;
 
     // Flock tries to put a lock on given file.
     async fn flock(&self, inode: Ino, owner: u64, ltype: u32, block: bool) -> Result<()>;
@@ -685,10 +695,10 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
 
     // Change root to a directory specified by subdir
-    async fn chroot(&self, subdir: String) -> Result<()>;
+    async fn chroot(&self, subdir: &str) -> Result<Ino>;
 
     // GetParents returns a map of node parents (> 1 parents if hardlinked)
-    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, isize>;
+    async fn get_parents(&self, inode: Ino) -> HashMap<Ino, u32>;
     // ---------------------------------------- sys call -----------------------------------------------------------
 
     // just for test
@@ -707,13 +717,12 @@ pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
-    let res: Result<Box<dyn Meta>> = match driver {
-        "redis" => RedisEngine::new(driver, addr, conf).await,
-        _ => Err(DriverSnafu {
-            driver: driver.to_string(),
-        }
-        .build()
-        .into()),
-    };
-    res.expect(&format!("Meta {uri} is not available."))
+    match driver {
+        "redis" => Box::new(
+            RedisEngine::new(driver, addr, conf)
+                .await
+                .expect(&format!("Meta {uri} is not available")),
+        ),
+        _ => panic!("unknown driver {driver}"),
+    }
 }
