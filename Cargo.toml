@@ -3,7 +3,7 @@ members = [
     "src/test",
     "src/vfs",
     "src/meta", 
-    "src/object",
+    "src/storage",
     "src/utils",
 ]
 resolver = "2"
@@ -46,3 +46,4 @@ rand = "0.8"
 uuid = "1.11"
 dyn-clone = "1"
 nix = { version = "0.29", features = ["fs"] }
+opendal = { version = "0.50" }

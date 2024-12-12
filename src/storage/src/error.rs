@@ -3,8 +3,8 @@ use tracing::Span;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), display("{source}\n{span:?}:{loc}"))]
-pub struct ObjectStorageError {
-    source: ObjectStorageEnum,
+pub struct StorageError {
+    source: StorageErrorEnum,
     #[snafu(implicit)]
     loc: snafu::Location,
     #[snafu(implicit)]
@@ -13,7 +13,7 @@ pub struct ObjectStorageError {
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
-pub enum ObjectStorageEnum {
+pub enum StorageErrorEnum {
 
 }
 
@@ -27,4 +27,4 @@ impl GenerateImplicitData for SpanGuard {
 }
 
 
-pub type Result<T> = std::result::Result<T, ObjectStorageError>;
+pub type Result<T> = std::result::Result<T, StorageError>;

@@ -1,5 +1,5 @@
 [package]
-name = "juice-object"
+name = "juice-storage"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -14,3 +14,6 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+opendal = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
