@@ -18,3 +18,5 @@ opendal = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
 governor = { workspace = true }
+hashring = { workspace = true }
+dashmap = { workspace = true }

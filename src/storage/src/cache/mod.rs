@@ -1,3 +1,8 @@
+mod disk;
+mod mem;
+
+pub use disk::DiskCacheManager;
+
 use std::future::Future;
 
 use crate::{api::SliceReader, error::Result, page::Page};
