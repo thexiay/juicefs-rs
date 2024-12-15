@@ -17,3 +17,4 @@ async-trait = { workspace = true }
 opendal = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
+governor = { workspace = true }

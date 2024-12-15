@@ -1,10 +1,9 @@
-use std::{collections::HashMap, fs::Permissions, sync::Mutex, time::Duration};
+use std::{fs::Permissions, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
-use opendal::raw::Accessor;
+use opendal::Operator;
 
 use crate::{cache::CacheManager, compress::Compressor, pre_fetcher::PreFetcher, single_flight::Controller};
-
 
 // Config contains options for cachedStore
 pub struct Config {
@@ -50,17 +49,16 @@ where
     CM: CacheManager,
     COMP: Compressor,
 {
-    storage: Accessor,
-    cache_manager: CM,
-    fetcher: PreFetcher,
+    /// concurrent limit and rate limit and retry limit
+    /// all of those could put it in accesssor layer
+    /// TODO: modify upload limit and download limit at runtime, add compressor at runtime
+    storage: Arc<Operator>,
+    cache_manager: Arc<CM>,
+    compressor: Arc<COMP>,
+    fetcher: Arc<PreFetcher>,
+    group: Arc<Controller>,
     conf: Config,
-    group: Controller,
-    current_upload: bool,  // 双向队列
-    pending_ch: PendingItem,  // 双向队列
-    pending_keys: HashMap<String, PendingItem>,
-    pending_mutex: Mutex<()>,
     start_hour: u32,
     end_hour: u32,
-    compressor: COMP,
-    seekable: bool,
 }
+

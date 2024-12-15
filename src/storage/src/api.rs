@@ -1,21 +1,26 @@
 use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
+use tokio::task::JoinHandle;
 
 use crate::error::Result;
 
 pub trait SliceWriter {
     fn id(&self) -> u64;
-    fn set_id(&mut self, id: u64);
 
-    // write whole buffer at offset of slice
+    /// write whole buffer at offset of slice
     fn write_at(&mut self, buffer: &[u8], off: usize) -> impl Future<Output = Result<usize>> + Send;
-    fn flush_to(&mut self, offset: usize) -> impl Future<Output = Result<()>> + Send;
-    fn finish(&mut self, length: usize) -> impl Future<Output = Result<()>> + Send;
-    fn abort(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    /// flush data from 0 to offset into storage
+    fn flush_to(&mut self, offset: usize) -> JoinHandle<Result<()>>;
+
+    /// Abort the write and flush progress.
+    fn abort(&mut self);
 }
 
 pub trait SliceReader {
+    fn id(&self) -> u64;
+
     fn read_at(&mut self, buffer: &mut [u8], off: usize) -> impl Future<Output = Result<usize>> + Send;
 }
 
@@ -45,6 +50,6 @@ pub trait ChunkStore {
     /// Get cache size
     fn used_memory(&self) -> i64;
 
-    /// Update limit
-    fn update_limit(&self, upload: i64, download: i64);
+    /// Update rate limit
+    fn set_update_limit(&self, upload: i64, download: i64);
 }

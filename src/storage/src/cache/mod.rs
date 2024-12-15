@@ -37,19 +37,3 @@ pub trait CacheManager {
     fn used_memory(&self) -> i64;
     fn is_empty(&self) -> bool;
 }
-
-/*
-type CacheManager interface {
-	cache(key string, p *Page, force bool)
-	remove(key string)
-	load(key string) (ReadCloser, error)
-	uploaded(key string, size int)
-	stage(key string, data []byte, keepCache bool) (string, error)
-	removeStage(key string) error
-	stagePath(key string) string
-	stats() (int64, int64)
-	usedMemory() int64
-	isEmpty() bool
-	getMetrics() *cacheManagerMetrics
-}
- */
