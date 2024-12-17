@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fs::Permissions, sync::{atomic::AtomicI64, Arc, Mutex, RwLock}};
 
+use bytes::Bytes;
 use chrono::Duration;
 use dashmap::DashMap;
 use hashring::HashRing;
 use tokio::task::JoinHandle;
 
-use crate::page::Page;
 use crate::error::Result;
 
 /// A cache manager that manage lots of [ `DiskCache` ] keyed by a object key
@@ -60,7 +60,7 @@ struct Cache {
     /// cache unique id
     id: String,
     /// cached pages
-    pages: DashMap<String, Page>,
+    pages: DashMap<String, Bytes>,
     /// cached pages statistics, it will be scanned to correct it.
     pages_stats: RwLock<HashMap<CacheKey, CacheItem>>,
     /// used page space in bytes

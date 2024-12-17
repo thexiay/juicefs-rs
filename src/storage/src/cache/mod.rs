@@ -1,25 +1,30 @@
 mod disk;
 mod mem;
 
+use bytes::Bytes;
 pub use disk::DiskCacheManager;
+use opendal::Buffer;
 
 use std::future::Future;
 
-use crate::{api::SliceReader, error::Result, page::Page};
+use crate::{api::SliceReader, error::Result};
 
 pub type TotalAndUsed = (i64, i64);
-pub trait CacheManager {
+/// CacheManager is a trait for managing cache
+/// Key: {slice}_{block_idx}_{block_size}
+/// Cache: bytes, aligned at block and at least larger than block size
+pub trait CacheManager: Send + Sync + 'static {
     /// Cache a page
-    fn cache(&self, key: String, p: Page, force: bool) -> impl Future<Output = Result<usize>> + Send;
+    fn put(&self, key: &str, p: Bytes, force: bool) -> impl Future<Output = Result<usize>> + Send;
 
     /// Remove a page
-    fn remove(&self, key: String) -> impl Future<Output = Result<usize>> + Send;
+    fn remove(&self, key: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Load a page reader
-    fn load<R: SliceReader>(&self, key: String) -> impl Future<Output = Result<R>> + Send;
+    fn get(&self, key: &str) -> impl Future<Output = Result<Bytes>> + Send;
 
 
-    fn uploaded(&self, key: String, size: i32) -> impl Future<Output = ()> + Send;
+    fn uploaded(&self, key: &str, size: i32) -> impl Future<Output = ()> + Send;
 
     /// Stage data. 
     /// Returns a path to the staged data 

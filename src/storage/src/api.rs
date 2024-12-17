@@ -1,15 +1,18 @@
 use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use opendal::Buffer;
 use tokio::task::JoinHandle;
 
 use crate::error::Result;
 
-pub trait SliceWriter {
+pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
 
-    /// write whole buffer at offset of slice
-    fn write_at(&mut self, buffer: &[u8], off: usize) -> impl Future<Output = Result<usize>> + Send;
+    /// Read data from buffer, and write data into slice at offset.
+    /// Returns the number of bytes written.
+    fn write_all_at(&mut self, buffer: Buffer, off: usize) -> impl Future<Output = Result<()>> + Send;
 
     /// flush data from 0 to offset into storage
     fn flush_to(&mut self, offset: usize) -> JoinHandle<Result<()>>;
@@ -18,10 +21,32 @@ pub trait SliceWriter {
     fn abort(&mut self);
 }
 
-pub trait SliceReader {
+pub trait SliceReader: Send + Sync {
     fn id(&self) -> u64;
 
-    fn read_at(&mut self, buffer: &mut [u8], off: usize) -> impl Future<Output = Result<usize>> + Send;
+    /// Read data from slice at offset, and write it into buffer.
+    /// Returns the bytes readed.
+    fn read_at(&self, off: usize, len: usize) -> impl Future<Output = Result<Buffer>> + Send;
+
+    fn read_all_at(&self, off: usize, len: usize) -> impl Future<Output = Result<Buffer>> + Send {
+        async move {
+            let mut bufs = vec![];
+            let mut off = off;
+            let mut len = len;
+            loop {
+                match self.read_at(off, len).await {
+                    Ok(buf) if buf.is_empty() => break,
+                    Ok(buf) => {
+                        off += buf.len();
+                        len -= buf.len();
+                        bufs.push(buf);
+                    },
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(bufs.into_iter().flatten().collect())
+        }
+    }
 }
 
 #[async_trait]
@@ -30,10 +55,10 @@ pub trait ChunkStore {
     type Reader: SliceReader;
 
     /// Create a new reader for a slice
-    fn new_reader(self: Arc<Self>, id: u64, length: usize) -> Self::Reader;
+    fn new_reader(&self, id: u64, length: usize) -> Self::Reader;
 
     /// Create a new writer for a slice
-    fn new_writer(self: Arc<Self>, id: u64) -> Self::Writer;
+    fn new_writer(&self, id: u64) -> Self::Writer;
 
     /// Remove a slice from the store
     async fn remove(&self, id: u64, length: usize) -> Result<()>;
