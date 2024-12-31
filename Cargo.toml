@@ -1,11 +1,5 @@
 [workspace]
-members = [
-    "src/test",
-    "src/vfs",
-    "src/meta", 
-    "src/storage",
-    "src/utils",
-]
+members = ["src/test", "src/vfs", "src/meta", "src/storage", "src/utils"]
 resolver = "2"
 
 [workspace.package]
@@ -18,11 +12,16 @@ repository = "https://github.com/thexiay/juicefs-rs"
 
 [workspace.dependencies]
 libc = "0.2"
-snafu = { version = "0.8.4", features = ["backtrace"]}
+snafu = { version = "0.8.4", features = ["backtrace"] }
 async-trait = "0.1"
 bytes = "1.7"
 chrono = "0.4"
-redis = { version = "0.27", features = ["script", "aio", "tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = [
+    "script",
+    "aio",
+    "tokio-comp",
+    "connection-manager",
+] }
 deadpool = { version = "0.12", features = ["rt_tokio_1", "managed"] }
 deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
 parking_lot = "0.12"
@@ -50,3 +49,7 @@ opendal = { version = "0.50" }
 governor = { version = "0.6.0", features = ["std"] }
 hashring = "0.3"
 dashmap = "6.1"
+either = "1.11"
+tempfile = "3"
+assert_matches = "1"
+walkdir = "2"

@@ -1,20 +1,21 @@
 use std::{collections::HashMap, ops::AsyncFnOnce, sync::Arc};
 
 use bytes::Bytes;
+use opendal::Buffer;
 use parking_lot::{Mutex, RwLock};
 use snafu::whatever;
 use tokio::sync::Notify;
-use crate::error::Result;
+use crate::{cache::CacheKey, error::Result};
 
 struct Request {
     /// This lock to modify the val when necessary
-    val: RwLock<Result<Bytes>>,
+    val: RwLock<Result<Buffer>>,
     wait_group: Notify,
 }
 
 pub struct SingleFlight {
     /// this lock to make sure the request is unique
-    requests: Mutex<HashMap<String, Arc<Request>>>,
+    requests: Mutex<HashMap<CacheKey, Arc<Request>>>,
 }
 
 impl SingleFlight {
@@ -26,9 +27,9 @@ impl SingleFlight {
 
     /// execute and get Bytes
     /// TODO: modify key and val to generic type
-    pub async fn execute<F>(&self, key: &str, f: F) -> Result<Bytes>
+    pub async fn execute<F>(&self, key: &CacheKey, f: F) -> Result<Buffer>
     where
-        F: AsyncFnOnce() -> Result<Bytes>,
+        F: AsyncFnOnce() -> Result<Buffer>,
     {
         let mut _waiter_holder = None;
         let (request, waiter) = {
@@ -38,10 +39,10 @@ impl SingleFlight {
                 (request.clone(), _waiter_holder.as_ref().map(|r| r.wait_group.notified()))
             } else {
                 let request = Arc::new(Request {
-                    val: RwLock::new(Ok(Bytes::new())),
+                    val: RwLock::new(Ok(Buffer::new())),
                     wait_group: Notify::new(),
                 });
-                lock.insert(key.to_string(), request.clone());
+                lock.insert(key.clone(), request.clone());
                 (request, None)
             }
         };

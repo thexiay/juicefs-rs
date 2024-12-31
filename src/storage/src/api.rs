@@ -11,14 +11,17 @@ pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
 
     /// Read data from buffer, and write data into slice at offset.
-    /// Returns the number of bytes written.
+    /// This is a overwrite write.
     fn write_all_at(&mut self, buffer: Buffer, off: usize) -> impl Future<Output = Result<()>> + Send;
 
-    /// flush data from 0 to offset into storage
-    fn flush_to(&mut self, offset: usize) -> JoinHandle<Result<()>>;
+    /// Flush data from `0..offset` into storage
+    fn spawn_flush_to(&mut self, offset: usize) -> Result<()>;
 
     /// Abort the write and flush progress.
-    fn abort(&mut self);
+    fn abort(&mut self) -> impl Future<Output = ()> + Send;
+
+    /// Finish the flush progress.
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub trait SliceReader: Send + Sync {
@@ -63,13 +66,13 @@ pub trait ChunkStore {
     /// Remove a slice from the store
     async fn remove(&self, id: u64, length: usize) -> Result<()>;
 
-    /// Fill cache
+    /// Fill cache for a slice
     async fn fill_cache(&self, id: u64, length: u32) -> Result<()>;
 
-    /// Evict cache
+    /// Evict cache for a slice
     async fn evict_cache(&self, id: u64, length: u32) -> Result<()>;
 
-    /// Check cache
+    /// Check missed cache for a slice
     async fn check_cache(&self, id: u64, length: u32) -> Result<u64>;
 
     /// Get cache size

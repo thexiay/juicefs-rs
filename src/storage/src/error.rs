@@ -1,6 +1,15 @@
 use snafu::{FromString, GenerateImplicitData, Snafu};
 use tracing::Span;
 
+#[derive(Debug)]
+pub struct SpanGuard(tracing::Span);
+
+impl GenerateImplicitData for SpanGuard {
+    fn generate() -> Self {
+        SpanGuard(Span::current())
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), display("{source}\n{span:?}:{loc}"))]
 pub struct StorageError {
@@ -17,10 +26,9 @@ pub enum StorageErrorEnum {
     #[snafu(display("IO error: {}", source), context(false))]
     IoError { source: std::io::Error },
     #[snafu(display("Opendal IO error: {}", source), context(false))]
-    ObjectIoError {
-        source: opendal::Error,
-    },
-
+    ObjectIoError { source: opendal::Error },
+    #[snafu(display("Send error"))]
+    SenderError,
     #[snafu(whatever, display("{message}, cause: {source:?}"))]
     GenericError {
         message: String,
@@ -32,12 +40,20 @@ pub enum StorageErrorEnum {
     },
 }
 
-#[derive(Debug)]
-pub struct SpanGuard(tracing::Span);
+impl StorageError {
+    pub fn is_stage_concurrency(&self) -> bool {
+        false
+    }
 
-impl GenerateImplicitData for SpanGuard {
-    fn generate() -> Self {
-        SpanGuard(Span::current())
+    pub fn is_io_error(&self) -> bool {
+        matches!(self.source, StorageErrorEnum::IoError { .. })
+    }
+
+    pub fn try_into_io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        match &self.source {
+            StorageErrorEnum::IoError { source } => Some(source.kind()),
+            _ => None,
+        }
     }
 }
 
@@ -58,11 +74,19 @@ where
 impl FromString for StorageError {
     type Source = Box<dyn std::error::Error + Send + Sync>;
     fn without_source(message: String) -> Self {
-        StorageErrorEnum::GenericError { message, source: None }.into()
+        StorageErrorEnum::GenericError {
+            message,
+            source: None,
+        }
+        .into()
     }
-    
+
     fn with_source(source: Self::Source, message: String) -> Self {
-        StorageErrorEnum::GenericError { message, source: Some(source) }.into()
+        StorageErrorEnum::GenericError {
+            message,
+            source: Some(source),
+        }
+        .into()
     }
 }
 

@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::ops::{Add, AddAssign, BitAnd};
-use std::sync::atomic::AtomicU64;
+use std::ops::AddAssign;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -18,8 +17,8 @@ use crate::base::{
 };
 use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
-use crate::error::{DriverSnafu, Result};
-use crate::quota::{Quota, QuotaView};
+use crate::error::Result;
+use crate::quota::QuotaView;
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 

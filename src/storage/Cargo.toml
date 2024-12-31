@@ -22,3 +22,14 @@ hashring = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+regex = { workspace = true }
+either = { workspace = true }
+crc32fast = { workspace = true }
+nix = { workspace = true }
+walkdir = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+assert_matches = { workspace = true }

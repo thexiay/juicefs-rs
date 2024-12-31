@@ -1,79 +1,85 @@
 use std::cmp::min;
 use std::io::ErrorKind;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::sync::LazyLock;
 use std::{fs::Permissions, future::Future, sync::Arc};
 
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
+use either::Either;
 use futures::future::FutureExt;
 use opendal::{Buffer, Operator};
+use regex::Regex;
+use snafu::whatever;
+use tokio::task::JoinSet;
 use tracing::{error, warn};
 
+use crate::api::{ChunkStore, SliceWriter};
+use crate::buffer::{ChecksumLevel, FileBuffer};
+use crate::cache::CacheKey;
 use crate::error::Result;
+use crate::uploader::Uploader;
 use crate::{
     api::SliceReader, cache::CacheManager, compress::Compressor, pre_fetcher::PreFetcher,
     single_flight::SingleFlight,
 };
 
+const CHUNK_SIZE: usize = 64 << 20; // 64MB
+const PAGE_SIZE: usize = 64 << 10; // 64KB
+
+// object stroage file name format
+pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)_(\d+)_(\d+)$").unwrap());
+
 // Config contains options for cachedStore
 pub struct Config {
-    cache_dir: String,
-    cache_mode: Permissions,
-    cache_size: u64,
-    cache_checksum: String,
-    cache_eviction: String,
-    cache_scan_interval: Duration,
-    cache_expire: Duration,
-    free_space: f32,
-    auto_create: bool,
-    compress: String,
-    max_upload: isize,
-    max_stage_write: isize,
-    max_retries: isize,
-    upload_limit: i64,
-    download_limit: i64,
-    writeback: bool,
-    upload_delay: Duration,
-    upload_hours: String,
-    is_hash_prefix: bool,
-    max_block_size: usize,
-    get_timeout: Duration,
-    put_timeout: Duration,
-    cache_full_block: bool,
-    buffer_size: u64,
-    readahead: isize,
-    prefetch: isize,
+    pub cache_dir: String,
+    pub cache_file_mode: Permissions,
+    pub cache_size: u64,
+    pub cache_checksum: ChecksumLevel,
+    pub cache_eviction: bool,
+    pub cache_scan_interval: Duration,
+    pub cache_expire: Duration,
+    pub free_space: f32,
+    pub auto_create: bool,
+    pub compress: String,
+    pub max_upload: isize,
+    pub max_stage_write: isize,
+    pub max_retries: isize,
+    pub upload_limit: i64,
+    pub download_limit: i64,
+    pub writeback: bool,
+    pub upload_delay: Duration,
+    pub upload_hours: (u32, u32),
+    pub is_hash_prefix: bool,
+    pub max_block_size: usize,
+    pub get_timeout: Duration,
+    pub put_timeout: Duration,
+    pub cache_full_block: bool,
+    pub buffer_size: u64,
+    pub readahead: isize,
+    pub prefetch: isize,
 }
 
 impl Config {
     pub fn should_cache(&self, size: usize) -> bool {
+        // cache_full_block意味着永远cache
+        // size <= max_block_size意味着小内存块cache
+        // upload_delay不为0意味着，stage块不会立即上传远端存储
         self.cache_full_block || size <= self.max_block_size || !self.upload_delay.is_zero()
     }
 }
 
-pub struct PendingItem {
-    key: String,
-    /// full path of local file corresponding
-    fpath: String,
-    /// timestamp when this item is added
-    ts: DateTime<Utc>,
-    uploading: bool,
-}
-
-pub struct RSlice<CM: CacheManager, COMP: Compressor> {
-    storage: Arc<Operator>,
-    cache_manager: Option<Arc<CM>>,
-    compressor: Arc<COMP>,
-    fetcher: Arc<PreFetcher>,
-    group: Arc<SingleFlight>,
-    conf: Arc<Config>,
-
-    /// slice id
+#[derive(Clone)]
+pub struct SliceHelper {
     id: u64,
-    /// slice length
     length: usize,
+    conf: Arc<Config>,
 }
 
-impl<CM: CacheManager, COMP: Compressor> RSlice<CM, COMP> {
+impl SliceHelper {
     /// The index of the block that first contains the offset
     fn block_index(&self, off: usize) -> usize {
         off / self.conf.max_block_size
@@ -89,118 +95,104 @@ impl<CM: CacheManager, COMP: Compressor> RSlice<CM, COMP> {
         }
     }
 
-    fn key(&self, indx: usize) -> String {
-        if self.conf.is_hash_prefix {
-            format!(
-                "chunks/{:02X}/{}/{}_{}_{}",
-                self.id % 256,
-                self.id / 1000 / 1000,
-                self.id,
-                indx,
-                self.block_size(indx)
-            )
-        } else {
-            format!(
-                "chunks/{}/{}/{}_{}_{}",
-                self.id / 1000 / 1000,
-                self.id / 1000,
-                self.id,
-                indx,
-                self.block_size(indx)
-            )
-        }
-    }
-
-    fn should_partial_read(&self, off: usize, len: usize) -> bool {
-        off % self.conf.max_block_size > 0 && len <= self.conf.max_block_size / 4
-    }
-
-    /// read data from storage and cache it
-    async fn read_block(&self, key: &str, cache: bool, force_cache: bool) -> Result<Bytes> {
-        /*
-        defer func() {
-		e := recover()
-		if e != nil {
-			err = fmt.Errorf("recovered from %s", e)
-		}
-	}()
-	needed := store.compressor.CompressBound(len(page.Data))
-	compressed := needed > len(page.Data)
-	// we don't know the actual size for compressed block
-	if store.downLimit != nil && !compressed {
-		store.downLimit.Wait(int64(len(page.Data)))
-	}
-	err = errors.New("Not downloaded")
-	var in io.ReadCloser
-	tried := 0
-	start := time.Now()
-	var p *Page
-	if compressed {
-		c := NewOffPage(needed)
-		defer c.Release()
-		p = c
-	} else {
-		p = page
-	}
-	p.Acquire()
-	var n int
-	var (
-		reqID string
-		sc    = object.DefaultStorageClass
-	)
-	err = utils.WithTimeout(func() error {
-		defer p.Release()
-		// it will be retried outside
-		for err != nil && tried < 2 {
-			time.Sleep(time.Second * time.Duration(tried*tried))
-			if tried > 0 {
-				logger.Warnf("GET %s: %s; retrying", key, err)
-				store.objectReqErrors.Add(1)
-				start = time.Now()
-			}
-			in, err = store.storage.Get(key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
-			tried++
-		}
-		if err == nil {
-			n, err = io.ReadFull(in, p.Data)
-			_ = in.Close()
-		}
-		if compressed && err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		return err
-	}, store.conf.GetTimeout)
-	used := time.Since(start)
-	logRequest("GET", key, "", reqID, err, used)
-	if store.downLimit != nil && compressed {
-		store.downLimit.Wait(int64(n))
-	}
-	store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
-	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
-	if err != nil {
-		store.objectReqErrors.Add(1)
-		return fmt.Errorf("get %s: %s", key, err)
-	}
-	if compressed {
-		n, err = store.compressor.Decompress(page.Data, p.Data[:n])
-	}
-	if err != nil || n < len(page.Data) {
-		return fmt.Errorf("read %s fully: %s (%d < %d) after %s (tried %d)", key, err, n, len(page.Data),
-			used, tried)
-	}
-	if cache {
-		store.bcache.cache(key, page, forceCache)
-	}
-	return nil
-         */
-        todo!()
+    fn key(&self, indx: usize) -> CacheKey {
+        CacheKey::new(self.id, indx, self.block_size(indx))
     }
 }
 
-impl<CM, COMP> SliceReader for RSlice<CM, COMP>
+pub struct RSlice<CM: CacheManager> {
+    slice_helper: SliceHelper,
+    // timeout layer, retry layer
+    storage: Arc<Operator>,
+    cache_manager: Arc<CM>,
+    compressor: Option<Arc<Box<dyn Compressor>>>,
+    fetcher: Arc<PreFetcher>,
+    group: Arc<SingleFlight>,
+}
+
+impl<CM: CacheManager> Deref for RSlice<CM> {
+    type Target = SliceHelper;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slice_helper
+    }
+}
+
+impl<CM: CacheManager> RSlice<CM> {
+    fn keys(&self) -> Vec<CacheKey> {
+        if self.length <= 0 {
+            return vec![];
+        }
+        let last_indx = (self.length - 1) / self.conf.max_block_size;
+        let mut keys = Vec::with_capacity(last_indx + 1);
+        for i in 0..=last_indx {
+            keys.push(self.key(i));
+        }
+        keys
+    }
+
+    fn should_random_partial_read(&self, off: usize, len: usize) -> bool {
+        self.compressor.is_none()
+            && off % self.conf.max_block_size > 0
+            && len <= self.conf.max_block_size / 4
+    }
+
+    fn parse_block_size(key: &str) -> usize {
+        key.rfind('_')
+            .map(usize::from)
+            .expect("failed to parse block size")
+    }
+
+    /// read data from storage and cache it
+    async fn read_block(&self, key: &CacheKey, cache: bool, force_cache: bool) -> Result<Buffer> {
+        let page_len = key.size();
+        let start = Utc::now();
+        let key_path = key.to_path(self.conf.is_hash_prefix);
+        let reader = self.storage.reader(&key_path).await?;
+        let buffer = reader.read(0..page_len as u64).await?;
+        if buffer.len() < page_len {
+            whatever!(
+                "read {} not fully: ({} < {}) after {}",
+                key_path,
+                buffer.len(),
+                page_len,
+                Utc::now().signed_duration_since(start)
+            )
+        }
+        if cache {
+            self.cache_manager
+                .put(key, Either::Left(buffer.clone()), force_cache)
+                .await?;
+        }
+        Ok(buffer)
+    }
+
+    async fn delete(&self) -> Result<()> {
+        if self.length == 0 {
+            return Ok(());
+        }
+
+        let last_block_idx = self.block_index(self.length - 1);
+        for i in 0..=last_block_idx {
+            // there could be multiple clients try to remove the same chunk in the same time,
+            // any of them should succeed if any blocks is removed
+            let key = self.key(i);
+            self.cache_manager.remove(&key).await;
+        }
+
+        for i in 0..=last_block_idx {
+            let key = self.key(i);
+            self.storage
+                .delete(&key.to_path(self.conf.is_hash_prefix))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl<CM> SliceReader for RSlice<CM>
 where
     CM: CacheManager,
-    COMP: Compressor,
 {
     fn id(&self) -> u64 {
         self.id
@@ -247,28 +239,29 @@ where
             // read current block page
             // read data from cache if cache is enable
             let key = self.key(indx);
-            if let Some(cache_manager) = &self.cache_manager {
-                match cache_manager.get(&key).await {
-                    Ok(p) => {
-                        return Ok(p.slice(0..min(len, p.len())).into());
-                    }
-                    Err(e) => {
-                        cache_manager.remove(&key).await.unwrap_or_else(|err| {
-                            error!("remove cache failed: {}", err);
-                        });
-                        warn!("read partial cached block {} fail: {}", key, e);
-                    }
+            let key_path = key.to_path(self.conf.is_hash_prefix);
+            match self.cache_manager.get(&key).await {
+                Ok(Some(Either::Left(p))) => {
+                    return Ok(p.slice(0..min(len, p.len())).into());
                 }
+                Ok(Some(Either::Right(mut p))) => {
+                    return Ok(p.read_at(0, min(len, p.len())).await?);
+                }
+                Err(e) => {
+                    self.cache_manager.remove(&key).await;
+                    warn!("read partial cached block {} fail: {}", &key_path, e);
+                }
+                _ => (),
             }
 
             // read from object storage
-            if self.should_partial_read(off, len) {
-                let reader = self.storage.reader(&key).await?;
+            if self.should_random_partial_read(off, len) {
+                let reader = self.storage.reader(&key_path).await?;
                 let range = boff as u64..(boff + len) as u64;
                 match reader.read(range).await {
                     Ok(buffer) => return Ok(buffer),
                     // fallback to full read
-                    Err(e) => error!("read partial block {} fail: {}", key, e),
+                    Err(e) => error!("read partial block {} fail: {}", &key_path, e),
                 }
             }
             let cache = self
@@ -283,38 +276,295 @@ where
     }
 }
 
-pub struct WSlice<CM, COMP, const N: usize>
+pub struct WSlice<CM, U, const N: usize>
 where
     CM: CacheManager,
-    COMP: Compressor,
+    U: Uploader,
 {
+    slice_helper: SliceHelper,
     storage: Arc<Operator>,
     cache_manager: Arc<CM>,
-    compressor: Arc<COMP>,
+    compressor: Option<Arc<Box<dyn Compressor>>>,
+    uploader: Arc<U>,
     fetcher: Arc<PreFetcher>,
     group: Arc<SingleFlight>,
 
-    id: u64,
-    length: isize,
     /// For every block, has a vector of pages
-    block_pages: [Vec<Bytes>; N],
-    uploaded: isize,
+    /// block pages always be equal or larger than block size
+    block_pages: [Vec<BytesMut>; N],
+    /// The length of submitted uploading data length, but maybe not finished
+    uploaded_len: usize,
+    pengind_upload_tasks: JoinSet<Result<Either<Buffer, FileBuffer>>>,
 }
 
-struct CachedStore<CM, COMP>
+impl<CM: CacheManager, U: Uploader, const N: usize> Deref for WSlice<CM, U, N> {
+    type Target = SliceHelper;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slice_helper
+    }
+}
+
+impl<CM: CacheManager, U: Uploader, const N: usize> DerefMut for WSlice<CM, U, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slice_helper
+    }
+}
+
+impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U, N> {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn write_all_at(
+        &mut self,
+        buffer: Buffer,
+        off: usize,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            if off + buffer.len() > CHUNK_SIZE {
+                whatever!(
+                    "write out of chunk boudary: {} > {}",
+                    off + buffer.len(),
+                    CHUNK_SIZE
+                );
+            }
+            if off < self.uploaded_len {
+                whatever!(
+                    "cannot overwrite uploadded block: {} < {}",
+                    off,
+                    self.uploaded_len
+                );
+            }
+
+            // Fill pages with zeros until the offset
+            if self.length < off {
+                let zeros = Buffer::from(vec![0; off - self.length]);
+                self.write_all_at(zeros, self.length).boxed().await?;
+            }
+
+            let mut n = 0;
+            while n < buffer.len() {
+                let indx = self.block_index(off + n);
+                let b_off = (off + n) % self.conf.max_block_size;
+                // first block have multiple pages, the rest have only one page
+                let p_size = if indx > 0 || self.conf.max_block_size < PAGE_SIZE {
+                    self.conf.max_block_size
+                } else {
+                    PAGE_SIZE
+                };
+                let p_idx = b_off / p_size;
+                let p_off = b_off % p_size;
+                let page_cnt = self.block_pages[indx].len();
+                let page = if p_idx < page_cnt {
+                    &mut self.block_pages[indx][p_idx]
+                } else {
+                    let page = BytesMut::with_capacity(p_size);
+                    self.block_pages[indx].push(page);
+                    &mut self.block_pages[indx][page_cnt]
+                };
+                let left = buffer.len() - n;
+                // every time copy until page finish
+                let copied = min(page.len() - p_off, left);
+                page[p_off..p_off + copied]
+                    .copy_from_slice(&buffer.slice(n..n + copied).to_bytes());
+                n += copied;
+            }
+            // if write beyond current length, update length
+            if off + n > self.length {
+                self.length = off + n;
+            }
+
+            Ok(())
+        }
+    }
+
+    fn spawn_flush_to(&mut self, offset: usize) -> Result<()> {
+        if offset < self.uploaded_len {
+            whatever!("Invalid offset: {} < {}", offset, self.uploaded_len);
+        }
+
+        for i in 0..self.block_pages.len() {
+            let start = i * self.conf.max_block_size;
+            let end = start + self.conf.max_block_size;
+            if start >= self.uploaded_len && end <= offset {
+                if !self.block_pages[i].is_empty() {
+                    let block_len = self.block_size(i);
+                    let key_path = self.key(i).to_path(self.conf.is_hash_prefix);
+                    let block = std::mem::take(&mut self.block_pages[i])
+                        .into_iter()
+                        .map(|a| a.freeze())
+                        .flatten()
+                        .collect::<Buffer>()
+                        .slice(0..block_len);
+                    let uploader = self.uploader.clone();
+                    self.pengind_upload_tasks.spawn(async move {
+                        uploader
+                            .upload(&key_path, block)
+                            .await
+                    });
+                }
+                self.uploaded_len = end;
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort(&mut self) {
+        self.length = self.uploaded_len;
+        let r_slice = RSlice {
+            slice_helper: self.slice_helper.clone(),
+            storage: self.storage.clone(),
+            cache_manager: self.cache_manager.clone(),
+            compressor: self.compressor.clone(),
+            fetcher: self.fetcher.clone(),
+            group: self.group.clone(),
+        };
+        match r_slice.delete().await {
+            Ok(_) => (),
+            Err(e) => {
+                warn!("abort delete error: {}", e);
+            }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        let n = (self.length - 1) / self.conf.max_block_size + 1;
+        self.spawn_flush_to(n * self.conf.max_block_size)?;
+        while let Some(join_res) = self.pengind_upload_tasks.join_next().await {
+            match join_res {
+                Ok(task_res) => {
+                    if let Err(e) = task_res {
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    whatever!("upload task cancel or panic error: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct CachedStore<CM, U, const N: usize>
 where
     CM: CacheManager,
-    COMP: Compressor,
+    U: Uploader,
 {
     /// concurrent limit and rate limit and retry limit
     /// all of those could put it in accesssor layer
     /// TODO: modify upload limit and download limit at runtime, add compressor at runtime
+    /// retry 2 times, timeouit layer
     storage: Arc<Operator>,
     cache_manager: Arc<CM>,
-    compressor: Arc<COMP>,
+    compressor: Option<Arc<Box<dyn Compressor>>>,
+    uploader: Arc<U>,
     fetcher: Arc<PreFetcher>,
     group: Arc<SingleFlight>,
-    conf: Config,
+    conf: Arc<Config>,
     start_hour: u32,
     end_hour: u32,
+    _phantom: PhantomData<[(); N]>,
+}
+
+#[async_trait]
+impl<CM, U, const N: usize> ChunkStore for CachedStore<CM, U, N>
+where
+    CM: CacheManager,
+    U: Uploader,
+{
+    type Writer = WSlice<CM, U, 1>;
+    type Reader = RSlice<CM>;
+
+    /// Create a new reader for a slice
+    fn new_reader(&self, id: u64, length: usize) -> Self::Reader {
+        RSlice {
+            slice_helper: SliceHelper {
+                id,
+                length,
+                conf: self.conf.clone(),
+            },
+            storage: self.storage.clone(),
+            cache_manager: self.cache_manager.clone(),
+            compressor: self.compressor.clone(),
+            fetcher: self.fetcher.clone(),
+            group: self.group.clone(),
+        }
+    }
+
+    /// Create a new writer for a slice
+    fn new_writer(&self, id: u64) -> Self::Writer {
+        WSlice {
+            slice_helper: SliceHelper {
+                id,
+                length: 0,
+                conf: self.conf.clone(),
+            },
+            storage: self.storage.clone(),
+            cache_manager: self.cache_manager.clone(),
+            compressor: self.compressor.clone(),
+            uploader: self.uploader.clone(),
+            fetcher: self.fetcher.clone(),
+            group: self.group.clone(),
+            block_pages: Default::default(),
+            uploaded_len: 0,
+            pengind_upload_tasks: Default::default(),
+        }
+    }
+
+    /// Remove a slice from the store
+    async fn remove(&self, id: u64, length: usize) -> Result<()> {
+        let reader = self.new_reader(id, length);
+        reader.delete().await
+    }
+
+    /// Fill cache
+    async fn fill_cache(&self, id: u64, length: u32) -> Result<()> {
+        let reader = self.new_reader(id, length as usize);
+        let keys = reader.keys();
+        for key in keys {
+            if let Ok(Some(_)) = self.cache_manager.get(&key).await {
+                continue;
+            }
+            reader.read_block(&key, true, true).await.inspect_err(|e| {
+                warn!("fill cache {} fail: {}", key.to_path(self.conf.is_hash_prefix), e);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Evict cache
+    async fn evict_cache(&self, id: u64, length: u32) -> Result<()> {
+        let reader = self.new_reader(id, length as usize);
+        let keys = reader.keys();
+        for key in keys {
+            self.cache_manager.remove(&key).await;
+        }
+        Ok(())
+    }
+
+    /// Check cache
+    async fn check_cache(&self, id: u64, length: u32) -> Result<u64> {
+        let reader = self.new_reader(id, length as usize);
+        let keys = reader.keys();
+        let mut miss_bytes = 0;
+        for (i, key) in keys.iter().enumerate() {
+            if let Ok(Some(_)) = self.cache_manager.get(&key).await {
+                continue;
+            }
+            miss_bytes += reader.block_size(i) as u64;
+        }
+        Ok(miss_bytes)
+    }
+
+    /// Get cache size
+    fn used_memory(&self) -> i64 {
+        self.cache_manager.used_memory()
+    }
+
+    /// Update rate limit
+    fn set_update_limit(&self, upload: i64, download: i64) {
+        todo!()
+    }
 }
