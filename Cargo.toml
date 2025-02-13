@@ -27,6 +27,7 @@ deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time"] }
+tracing-test = "0.2.5"
 tokio = { version = "1.40", features = ["full"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tokio-util = "0.7"
@@ -45,7 +46,7 @@ rand = "0.8"
 uuid = "1.11"
 dyn-clone = "1"
 nix = { version = "0.29", features = ["fs"] }
-opendal = { version = "0.50" }
+opendal = { version = "0.50", features = ["default", "services-fs"] }
 governor = { version = "0.6.0", features = ["std"] }
 hashring = "0.3"
 dashmap = "6.1"

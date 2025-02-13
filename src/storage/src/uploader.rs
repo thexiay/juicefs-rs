@@ -18,7 +18,7 @@ pub struct NormalUploader {
 }
 
 impl NormalUploader {
-    fn new (
+    pub fn new (
         storage: Arc<Operator>,
         compressor: Option<Arc<Box<dyn Compressor>>>,
     ) -> Self {

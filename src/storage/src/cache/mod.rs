@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use either::Either;
 use opendal::Buffer;
 use std::future::Future;
+pub use disk::DiskEvent;
 
 use crate::{buffer::FileBuffer, error::Result};
 

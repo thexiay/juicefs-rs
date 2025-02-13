@@ -6,7 +6,6 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::StreamExt;
 use opendal::Buffer;
 use snafu::whatever;
 use tokio::{
@@ -16,7 +15,7 @@ use tokio::{
 };
 use tracing::error;
 
-use crate::error::Result;
+use crate::{cache::DiskEvent, error::Result};
 
 const CHECKSUM_BLOCK: u64 = 32 << 10; // 32KB
 
@@ -65,7 +64,7 @@ pub struct FileBuffer {
     /// data length(non include checksum)
     length: usize,
     checksim_level: ChecksumLevel,
-    disk_err_notifier: Option<Sender<io::ErrorKind>>,
+    disk_event_notifier: Option<Sender<DiskEvent>>,
 }
 
 impl FileBuffer {
@@ -73,14 +72,14 @@ impl FileBuffer {
         path: &Path,
         length: usize,
         checksum_level: ChecksumLevel,
-        sender: Sender<io::ErrorKind>,
+        sender: Sender<DiskEvent>,
     ) -> io::Result<Self> {
         let meta = fs::metadata(path)?;
         let cache_file = FileBuffer {
             file_path: path.to_path_buf(),
             length,
             checksim_level: checksum_level.clone(),
-            disk_err_notifier: Some(sender),
+            disk_event_notifier: Some(sender),
         };
         let err = Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -110,22 +109,21 @@ impl FileBuffer {
     }
 
     pub async fn read_at(&mut self, off: usize, len: usize) -> Result<Buffer> {
-        match self.read(off, len).await {
-            Ok(buf) => Ok(buf),
-            Err(e) => {
-                if let Some(kind) = e.try_into_io_error_kind()
-                    && let Some(notifier) = &self.disk_err_notifier
-                {
-                    notifier
-                        .send(kind)
-                        .await
-                        .err()
-                        .iter()
-                        .for_each(|e| error!("failed to send disk error {e}"));
-                }
-                Err(e)
-            }
+        let res = self.read(off, len).await;
+        let event = match &res {
+            Ok(_) => Some(DiskEvent::IOSuccess),
+            Err(e) if e.is_io_error() => Some(DiskEvent::IOError),
+            _ => None,
+        };
+        if let Some(event) = event && let Some(notifier) = &self.disk_event_notifier {
+            notifier
+                .send(event)
+                .await
+                .err()
+                .iter()
+                .for_each(|e| error!("failed to send disk error {e}"));
         }
+        res
     }
 
     pub fn len(&self) -> usize {
@@ -220,7 +218,7 @@ mod test {
             file_path: file.path().to_path_buf(),
             length: data.len(),
             checksim_level: ChecksumLevel::Full,
-            disk_err_notifier: None,
+            disk_event_notifier: None,
         };
         let res1 = full_file.read_at(0, data.len()).await.unwrap();
         assert_eq!(&res1.to_vec(), &data);

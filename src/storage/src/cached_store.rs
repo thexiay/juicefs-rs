@@ -1,7 +1,10 @@
 use std::cmp::min;
+use std::env;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{fs::Permissions, future::Future, sync::Arc};
 
@@ -19,6 +22,7 @@ use tracing::{error, warn};
 use crate::api::{ChunkStore, SliceWriter};
 use crate::buffer::{ChecksumLevel, FileBuffer};
 use crate::cache::CacheKey;
+use crate::compress::CompressArgo;
 use crate::error::Result;
 use crate::uploader::Uploader;
 use crate::{
@@ -35,32 +39,73 @@ pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
 
 // Config contains options for cachedStore
 pub struct Config {
-    pub cache_dir: String,
+    pub cache_dirs: Vec<PathBuf>,
     pub cache_file_mode: Permissions,
     pub cache_size: u64,
     pub cache_checksum: ChecksumLevel,
     pub cache_eviction: bool,
     pub cache_scan_interval: Duration,
-    pub cache_expire: Duration,
+    pub cache_expire: Option<Duration>,
     pub free_space: f32,
+    /// whether auto create cache dir
     pub auto_create: bool,
-    pub compress: String,
+    pub compress: Option<CompressArgo>,
     pub max_upload: isize,
-    pub max_stage_write: isize,
+    /// max concurrent stage write
+    pub max_stage_write: Option<usize>,
     pub max_retries: isize,
-    pub upload_limit: i64,
-    pub download_limit: i64,
+    /// max upload Bytes to object storage per second
+    pub upload_limit: Option<u64>,
+    /// max download Bytes from object storage per second
+    pub download_limit: Option<u64>,
     pub writeback: bool,
-    pub upload_delay: Duration,
-    pub upload_hours: (u32, u32),
+    /// the time to delay upload data to object storage
+    pub upload_delay: Option<Duration>,
+    /// the time range to allow upload data to object storage
+    pub upload_hours: Option<(u32, u32)>,
     pub is_hash_prefix: bool,
     pub max_block_size: usize,
+    /// timeout of download from object storage
     pub get_timeout: Duration,
+    /// timeout of upload to object storage
     pub put_timeout: Duration,
     pub cache_full_block: bool,
     pub buffer_size: u64,
-    pub readahead: isize,
-    pub prefetch: isize,
+    pub read_ahead: isize,
+    pub prefetch_parallelism: Option<u32>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            cache_dirs: vec![env::temp_dir().join("cache")],
+            cache_file_mode: Permissions::from_mode(0o666),
+            cache_size: 10 << 20,  // 10MB
+            cache_checksum: ChecksumLevel::None,
+            cache_eviction: false,
+            cache_scan_interval: Duration::seconds(300),
+            cache_expire: None,
+            free_space: 0.0,
+            auto_create: false,
+            compress: None,
+            max_upload: 1,
+            max_stage_write: None,
+            max_retries: 10,
+            upload_limit: None,
+            download_limit: None,
+            writeback: false,
+            upload_delay: None,
+            upload_hours: None,
+            is_hash_prefix: false,
+            max_block_size: 1 << 20,
+            get_timeout: Duration::seconds(60),
+            put_timeout: Duration::seconds(60),
+            cache_full_block: false,
+            buffer_size: 32 << 20,  // 32MB
+            read_ahead: 0,
+            prefetch_parallelism: None,
+        }
+    }
 }
 
 impl Config {
@@ -68,7 +113,7 @@ impl Config {
         // cache_full_block意味着永远cache
         // size <= max_block_size意味着小内存块cache
         // upload_delay不为0意味着，stage块不会立即上传远端存储
-        self.cache_full_block || size <= self.max_block_size || !self.upload_delay.is_zero()
+        self.cache_full_block || size <= self.max_block_size || !self.upload_delay.is_none()
     }
 }
 
@@ -398,11 +443,8 @@ impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U
                         .collect::<Buffer>()
                         .slice(0..block_len);
                     let uploader = self.uploader.clone();
-                    self.pengind_upload_tasks.spawn(async move {
-                        uploader
-                            .upload(&key_path, block)
-                            .await
-                    });
+                    self.pengind_upload_tasks
+                        .spawn(async move { uploader.upload(&key_path, block).await });
                 }
                 self.uploaded_len = end;
             }
@@ -528,7 +570,11 @@ where
                 continue;
             }
             reader.read_block(&key, true, true).await.inspect_err(|e| {
-                warn!("fill cache {} fail: {}", key.to_path(self.conf.is_hash_prefix), e);
+                warn!(
+                    "fill cache {} fail: {}",
+                    key.to_path(self.conf.is_hash_prefix),
+                    e
+                );
             })?;
         }
         Ok(())

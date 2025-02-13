@@ -27,6 +27,8 @@ pub enum StorageErrorEnum {
     IoError { source: std::io::Error },
     #[snafu(display("Opendal IO error: {}", source), context(false))]
     ObjectIoError { source: opendal::Error },
+    #[snafu(display("Disk is unstable, limit operation during this time"))]
+    DiskUnstableError,
     #[snafu(display("Send error"))]
     SenderError,
     #[snafu(whatever, display("{message}, cause: {source:?}"))]
@@ -49,12 +51,11 @@ impl StorageError {
         matches!(self.source, StorageErrorEnum::IoError { .. })
     }
 
-    pub fn try_into_io_error_kind(&self) -> Option<std::io::ErrorKind> {
-        match &self.source {
-            StorageErrorEnum::IoError { source } => Some(source.kind()),
-            _ => None,
-        }
+    pub fn is_disk_unstable_error(&self) -> bool {
+        matches!(self.source, StorageErrorEnum::DiskUnstableError)
     }
+
+    
 }
 
 impl<E> From<E> for StorageError
