@@ -1,5 +1,7 @@
 mod disk;
 mod mem;
+#[cfg(test)]
+mod tests;
 
 use async_trait::async_trait;
 use either::Either;
@@ -72,7 +74,7 @@ pub trait CacheManager: Send + Sync + 'static {
     /// Cost memory
     fn used_memory(&self) -> i64;
 
-    /// Whether the cache is invalid
+    /// Whether the cache is invalid, it's use for fallback CacheManager
     fn is_invalid(&self) -> bool;
 }
 

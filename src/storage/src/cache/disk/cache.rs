@@ -68,7 +68,8 @@ const PROBE_BUFF: [u8; 3] = [0; 3];
 
 /// A cache manager that manage lots of [ `DiskCache` ] keyed by a object key
 pub struct DiskCacheManager {
-    cache_stores: RwLock<ConsistentHashDiskCache>,
+    cache_stores: Arc<RwLock<ConsistentHashDiskCache>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl DiskCacheManager {
@@ -101,9 +102,22 @@ impl DiskCacheManager {
             cache_stores.hash_ring.add(dir.clone());
             cache_stores.caches.insert(dir.clone(), store);
         }
-        Ok(DiskCacheManager {
-            cache_stores: RwLock::new(cache_stores),
-        })
+        let cache_stores = Arc::new(RwLock::new(cache_stores));
+        let cache_stores_cloned = cache_stores.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_cloned = stopped.clone();
+        tokio::spawn(async move {
+            while !stopped_cloned.load(Ordering::SeqCst) {
+                sleep(std::time::Duration::from_secs(1)).await;
+                let mut cache_store = cache_stores_cloned.write();
+                cache_store.caches.retain(|_, store| store.available());
+            }
+        });
+        let manager = DiskCacheManager {
+            cache_stores,
+            stopped,
+        };
+        Ok(manager)
     }
 
     fn get_store(&self, key: &CacheKey) -> Option<Arc<CacheStore>> {
@@ -117,6 +131,12 @@ impl DiskCacheManager {
         } else {
             None
         }
+    }
+}
+
+impl Drop for DiskCacheManager {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -700,6 +720,7 @@ impl CacheStore {
                         }
                     };
                     let path = entry.path();
+                    let relative_path = path.strip_prefix(cache_prefix.as_path()).unwrap();
                     if entry.file_type().is_dir() || path.to_string_lossy().ends_with(".tmp") {
                         let mtime =
                             DateTime::from_timestamp(stat.st_mtime, stat.st_atime_nsec as u32)
@@ -722,6 +743,10 @@ impl CacheStore {
                                 continue;
                             }
                         };
+                        if !BLOCK_FILE_REGEX.is_match(&relative_path.to_string_lossy()) {
+                            warn!("Ignoring invalid cache file: {path:?}");
+                            continue;
+                        }
                         let atime =
                             DateTime::from_timestamp(stat.st_atime, stat.st_atime_nsec as u32)
                                 .unwrap();
@@ -1362,10 +1387,10 @@ mod tests {
     use crate::{
         buffer::ChecksumLevel,
         cache::{
-            disk::cache::{DiskState, MAX_CONCURRENCY_FOR_UNSTABLE, MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL},
+            disk::cache::{CacheStore, DiskState, MAX_CONCURRENCY_FOR_UNSTABLE, MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL},
             CacheKey, CacheManager, DiskEvent,
         },
-        cached_store::Config,
+        cached_store::{Config, BLOCK_FILE_REGEX},
         uploader::NormalUploader,
     };
 
@@ -1466,5 +1491,95 @@ mod tests {
     async fn test_cache_store_state() {
         test_cache_store_state_impl(1).await;
         test_cache_store_state_impl(10).await;
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_new_cache_store() {
+        let dir = tempdir().unwrap();
+        let operator = Operator::new(()).unwrap().finish();
+        let uploader = NormalUploader::new(Arc::new(operator), None);
+        CacheStore::new(&default_config(), dir.into_path(), 1 << 30, uploader)
+            .await
+            .expect("create new cache store failed");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_check_path() {
+        let cases = vec![
+            ("chunks/111/222/3333_3333_3333", true),
+            ("chunks/111/222/3333_3333_0", true),
+            ("chunks/0/0/0_0_0", true),
+            ("chunks/01/10/0_01_0", true),
+            ("achunks/111/222/3333_3333_3333", false),
+            ("chunksa/111/222/3333_3333_3333", false),
+            ("chunksa", false),
+            ("chunks/111", false),
+            ("chunks/111/2222", false),
+            ("chunks/111/2222/3", false),
+            ("chunks/111/2222/3333_3333", false),
+            ("chunks/111/2222/3333_3333_3333_4444", false),
+            ("chunks/111/2222/3333_3333_3333/4444", false),
+            ("chunks/111_/2222/3333_3333_3333", false),
+            ("chunks/111/22_22/3333_3333_3333", false),
+            ("chunks/111/22_22/3333_3333_3333", false),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(BLOCK_FILE_REGEX.is_match(path), expected);
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_cache_manager() {
+        let mut config = default_config();
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let dir3 = tempdir().unwrap();
+        
+        config.cache_dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf(), dir3.path().to_path_buf()];
+        let operator = Operator::new(()).unwrap().finish();
+        let uploader = NormalUploader::new(Arc::new(operator), None);
+        let manager = DiskCacheManager::new(&config, uploader).await.expect("create disk cache manager failed");
+        assert!(!manager.is_invalid());
+        {
+            let cache_stores = manager.cache_stores.read();
+            assert_eq!(cache_stores.caches.len(), 3);
+        }
+
+        fn shutdown_store(store: Arc<CacheStore>) {
+            let mut lock = store.state.write();
+            *lock = DiskState::Down;
+        }
+
+
+        // case: key rehash after store removal
+        let k1 = CacheKey {
+            id: 0,
+            indx: 0,
+            size: 3,
+        };
+        let p1 = Buffer::from(vec![1, 2, 3]);
+        manager.put(&k1, Either::Left(p1), true).await.expect("put cache failed");
+        let p1_1 = manager.get(&k1).await.expect("get cache failed");
+        assert!(p1_1.is_some());
+
+        shutdown_store(manager.get_store(&k1).unwrap());
+        let p1_2 = manager.get(&k1).await.expect("get cache failed");
+        assert!(p1_2.is_none());
+        let s1_1 = manager.get_store(&k1);
+        assert!(s1_1.is_none());
+
+
+        // case: remove all store
+        {
+            let cache_stores = manager.cache_stores.write();
+            for (_, store) in cache_stores.caches.iter() {
+                shutdown_store(store.clone());
+            }
+        }
+        sleep(Duration::seconds(1).to_std().unwrap()).await;
+        assert!(!manager.is_invalid());
     }
 }

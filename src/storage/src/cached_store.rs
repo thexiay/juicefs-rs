@@ -35,7 +35,7 @@ const PAGE_SIZE: usize = 64 << 10; // 64KB
 
 // object stroage file name format
 pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)_(\d+)_(\d+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^chunks/\d+/\d+/(\d+)_(\d+)_(\d+)$").unwrap());
 
 // Config contains options for cachedStore
 pub struct Config {

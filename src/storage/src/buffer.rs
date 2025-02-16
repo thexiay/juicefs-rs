@@ -195,9 +195,11 @@ mod test {
     use bytes::BufMut;
     use rand::Rng;
     use tempfile::NamedTempFile;
+    use tracing_test::traced_test;
 
     use crate::buffer::{ChecksumLevel, FileBuffer, CHECKSUM_BLOCK};
 
+    #[traced_test]
     #[tokio::test]
     async fn test_file_buffer_checksum() {
         let mut data = vec![0; 2 * CHECKSUM_BLOCK as usize + 4];
