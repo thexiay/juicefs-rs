@@ -64,7 +64,7 @@ impl SingleFlight {
         let result = request.val.read();
         match &*result {
             Ok(bytes) => Ok(bytes.clone()),
-            Err(e) => whatever!("single flight error: {}", e),
+            Err(e) => whatever!("single flight error: {}", e),  // TODO: clone storage Error
         }
     }
 }

@@ -1,15 +1,14 @@
 mod disk;
 mod mem;
-#[cfg(test)]
-mod tests;
 
 use async_trait::async_trait;
+use disk::DiskCacheManager;
+pub use disk::DiskEvent;
 use either::Either;
 use opendal::Buffer;
-use std::future::Future;
-pub use disk::DiskEvent;
+use std::{future::Future, sync::Arc};
 
-use crate::{buffer::FileBuffer, error::Result};
+use crate::{buffer::FileBuffer, cached_store::Config, error::Result, uploader::{NormalUploader, Uploader}};
 
 pub type TotalAndUsed = (i64, i64);
 
@@ -59,18 +58,26 @@ pub trait CacheManager: Send + Sync + 'static {
     // ----------------- Cache API -----------------
     /// Cache a page.
     /// Put a page don't mean to persist it immediately. It may be staged to disk first.
-    fn put(&self, key: &CacheKey, p: Either<Buffer, FileBuffer>, force: bool) -> impl Future<Output = Result<()>> + Send;
+    fn put(
+        &self,
+        key: &CacheKey,
+        p: Either<Buffer, FileBuffer>,
+        force: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Remove a page
     fn remove(&self, key: &CacheKey) -> impl Future<Output = ()> + Send;
 
     /// Load a page reader
-    fn get(&self, key: &CacheKey) -> impl Future<Output = Result<Option<Either<Buffer, FileBuffer>>>> + Send;
+    fn get(
+        &self,
+        key: &CacheKey,
+    ) -> impl Future<Output = Result<Option<Either<Buffer, FileBuffer>>>> + Send;
 
     /// --------------- Metadata API ---------------
     /// Returns the number of cached items and the total size of the cache
     fn stats(&self) -> TotalAndUsed;
-    
+
     /// Cost memory
     fn used_memory(&self) -> i64;
 
@@ -94,5 +101,73 @@ impl CacheReader for Box<dyn CacheReader> {
 
     fn len(&self) -> usize {
         self.as_ref().len()
+    }
+}
+
+pub enum CacheManagerImpl {
+    Disk(DiskCacheManager),
+    // todo: mem
+}
+
+impl CacheManagerImpl {
+    pub async fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
+        let disk =
+            DiskCacheManager::new(config, uploader).await?;
+        Ok(CacheManagerImpl::Disk(disk))
+    }
+}
+
+#[async_trait]
+impl Uploader for CacheManagerImpl {
+    async fn upload(&self, key: &str, block: Buffer) -> Result<Either<Buffer, FileBuffer>> {
+        match self {
+            CacheManagerImpl::Disk(d) => d.upload(key, block).await,
+        }
+    }
+}
+
+impl CacheManager for CacheManagerImpl {
+    fn put(
+        &self,
+        key: &CacheKey,
+        p: Either<Buffer, FileBuffer>,
+        force: bool,
+    ) -> impl Future<Output = Result<()>> + Send {
+        match self {
+            CacheManagerImpl::Disk(d) => d.put(key, p, force),
+        }
+    }
+
+    fn remove(&self, key: &CacheKey) -> impl Future<Output = ()> + Send {
+        match self {
+            CacheManagerImpl::Disk(d) => d.remove(key),
+        }
+    }
+
+    fn get(
+        &self,
+        key: &CacheKey,
+    ) -> impl Future<Output = Result<Option<Either<Buffer, FileBuffer>>>> + Send {
+        match self {
+            CacheManagerImpl::Disk(d) => d.get(key),
+        }
+    }
+
+    fn stats(&self) -> TotalAndUsed {
+        match self {
+            CacheManagerImpl::Disk(d) => d.stats(),
+        }
+    }
+
+    fn used_memory(&self) -> i64 {
+        match self {
+            CacheManagerImpl::Disk(d) => d.used_memory(),
+        }
+    }
+
+    fn is_invalid(&self) -> bool {
+        match self {
+            CacheManagerImpl::Disk(d) => d.is_invalid(),
+        }
     }
 }

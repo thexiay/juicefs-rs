@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Local, Timelike, Utc};
 use dashmap::DashMap;
 use either::Either;
@@ -74,6 +75,11 @@ pub struct DiskCacheManager {
 
 impl DiskCacheManager {
     pub async fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
+        if let Some(upload_hours) = config.upload_hours {
+            if upload_hours.0 != upload_hours.1 {
+                info!("background upload at {}:00 ~ {}:00", upload_hours.0, upload_hours.1)
+            }
+        }
         // TODO: use env to replace global default config
         let cache_dirs = if config.auto_create {
             for dir in config.cache_dirs.iter() {
@@ -140,11 +146,12 @@ impl Drop for DiskCacheManager {
     }
 }
 
+#[async_trait]
 impl Uploader for DiskCacheManager {
     async fn upload(&self, key: &str, buffer: Buffer) -> Result<Either<Buffer, FileBuffer>> {
         let cache_key = CacheKey::from_str(key)?;
         if let Some(cache) = self.get_store(&cache_key) {
-            cache.uploader.upload(key, buffer).await
+            cache.upload(key, buffer).await
         } else {
             whatever!("cache is err or not available")
         }
@@ -215,17 +222,17 @@ impl FromStr for CacheKey {
             .captures(s)
             .with_whatever_context::<_, _, StorageError>(|| format!("Invalid cache key: {s}"))?;
         Ok(CacheKey {
-            id: blocks[0]
+            id: blocks[1]
                 .parse()
                 .with_whatever_context::<_, _, StorageError>(|e| {
                     format!("Invalid cache key: {s}, e: {e}")
                 })?,
-            indx: blocks[1]
+            indx: blocks[2]
                 .parse()
                 .with_whatever_context::<_, _, StorageError>(|e| {
                     format!("Invalid cache key: {s}, e: {e}")
                 })?,
-            size: blocks[2]
+            size: blocks[3]
                 .parse()
                 .with_whatever_context::<_, _, StorageError>(|e| {
                     format!("Invalid cache key: {s}, e: {e}")
@@ -292,13 +299,7 @@ impl Ord for PendingStage {
     }
 }
 
-/// A cache store that stores pages on disk
-pub struct CacheStore {
-    /// cache unique id
-    id: String,
-    /// cached pages wait to flush to disk
-    pending_cache: Sender<(CacheKey, Buffer)>,
-    /// ----------- Stage manage -------------
+struct WriteBacker {
     /// staged pages wait to upload to object storage
     pending_stages: Sender<(String, FileBuffer)>,
     // TODO: 为什么go的代码这里要设置成map,需要判断去重吗，为什么会有重复的stage呢
@@ -306,6 +307,31 @@ pub struct CacheStore {
     /// the time range for staged pages can upload to object storage
     upload_hours: Option<(u32, u32)>,
     delay_upload: Option<Duration>,
+}
+
+impl WriteBacker {
+    fn can_upload(&self) -> bool {
+        let (start_hour, end_hour) = match self.upload_hours {
+            Some((start_hour, end_hour)) => (start_hour, end_hour),
+            None => return true,
+        };
+        if start_hour == end_hour {
+            return true;
+        }
+        let h = Local::now().hour();
+        start_hour < end_hour && h >= start_hour && h < end_hour
+            || start_hour > end_hour && (h >= start_hour || h < end_hour)
+    }
+}
+
+/// A cache store that stores pages on disk
+pub struct CacheStore {
+    /// cache unique id
+    id: String,
+    /// cached pages wait to flush to disk
+    pending_cache: Sender<(CacheKey, Buffer)>,
+    /// writer back
+    write_backer: Option<WriteBacker>,
 
     /// ----------- Mem manage -----------
     /// used page mem space in bytes
@@ -368,7 +394,6 @@ impl CacheStore {
         };
         // TODO: because here cann't determine buffer size, give a fixed channel for pending cache
         let (pending_cache_sender, pending_cache_reveiver) = channel::<(CacheKey, Buffer)>(1024);
-        let (pending_stage_sender, pending_stage_receiver) = channel::<(String, FileBuffer)>(1024);
         let state = if config.writeback {
             DiskState::Unchanged
         } else {
@@ -377,14 +402,22 @@ impl CacheStore {
             }
         };
         let (disk_event_sender, disk_event_receiver) = channel::<DiskEvent>(1024);
+        let (writer_backer, pending_stage_receiver) = if config.writeback {
+            let (pending_stage_sender, pending_stage_receiver) = channel::<(String, FileBuffer)>(1024);
+            (Some(WriteBacker {
+                pending_stages: pending_stage_sender,
+                deplayed_pending_stages: Mutex::new(BinaryHeap::new()),
+                upload_hours: config.upload_hours,
+                delay_upload: config.upload_delay,
+            }), Some(pending_stage_receiver))
+        } else {
+            (None, None)
+        };
 
         let mut cache_store = CacheStore {
             id: "".to_string(),
             pending_cache: pending_cache_sender,
-            pending_stages: pending_stage_sender,
-            deplayed_pending_stages: Mutex::new(BinaryHeap::new()),
-            upload_hours: config.upload_hours,
-            delay_upload: config.upload_delay,
+            write_backer: writer_backer,
             used_mem_page: AtomicI64::default(),
             mem_caches: DashMap::default(),
             state: RwLock::new(state),
@@ -483,19 +516,24 @@ impl CacheStore {
     /// Flush pending stage file into remote storage and cache intevally
     fn spawn_upload_stage(
         self: Arc<Self>,
-        mut pending_stages: Receiver<(String, FileBuffer)>,
+        pending_stages: Option<Receiver<(String, FileBuffer)>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            if pending_stages.is_none() {
+                return;
+            }
             let store = self.clone();
             let scaner = tokio::spawn(async move {
+                let mut pending_stages = pending_stages.unwrap();
+                let write_backer = store.write_backer.as_ref().unwrap();
                 while store.available() {
                     if let Some((key, stage_fb)) = pending_stages.recv().await {
                         let pending_stage = PendingStage {
                             key: key.clone(),
                             file_buffer: stage_fb.clone(),
-                            ts: Utc::now() + store.delay_upload.unwrap_or(Duration::zero()),
+                            ts: Utc::now() + write_backer.delay_upload.unwrap_or(Duration::zero()),
                         };
-                        let mut deplayed_pending_stages = store.deplayed_pending_stages.lock();
+                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
                         deplayed_pending_stages.push(Reverse(pending_stage));
                     }
                 }
@@ -504,12 +542,13 @@ impl CacheStore {
             let uploader = tokio::spawn(async move {
                 while self.available() {
                     sleep(std::time::Duration::from_secs(1)).await;
-                    if !self.can_upload() {
+                    let write_backer = self.write_backer.as_ref().unwrap();
+                    if !write_backer.can_upload() {
                         continue;
                     }
 
                     let pending_stages = {
-                        let mut deplayed_pending_stages = self.deplayed_pending_stages.lock();
+                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
                         let now = Utc::now();
                         let mut to_be_uploaded_pending_stages = vec![];
                         while let Some(Reverse(stage)) = deplayed_pending_stages.peek() {
@@ -555,7 +594,7 @@ impl CacheStore {
                     }
 
                     {
-                        let mut deplayed_pending_stages = self.deplayed_pending_stages.lock();
+                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
                         deplayed_pending_stages.extend(err_stage.into_iter().map(Reverse));
                     }
                 }
@@ -1170,41 +1209,38 @@ impl CacheStore {
             Ok(None)
         }
     }
-
-    fn can_upload(&self) -> bool {
-        let (start_hour, end_hour) = match self.upload_hours {
-            Some((start_hour, end_hour)) => (start_hour, end_hour),
-            None => return true,
-        };
-        if start_hour == end_hour {
-            return true;
-        }
-        let h = Local::now().hour();
-        start_hour < end_hour && h >= start_hour && h < end_hour
-            || start_hour > end_hour && (h >= start_hour || h < end_hour)
-    }
 }
 
+#[async_trait]
 impl Uploader for CacheStore {
     async fn upload(&self, key: &str, buffer: Buffer) -> Result<Either<Buffer, FileBuffer>> {
-        let staging_path = self.stage_path(key);
-        if self.stage_space_full.load(Ordering::SeqCst) {
-            whatever!("space not enough on device");
-        }
-        let _ = self.state_check()?;
-        let res_buffer = self.flush(staging_path.as_path(), buffer.clone()).await?;
-        // Save time loading from disk into memory
-        if self.delay_upload.is_none() && self.can_upload() {
-            if let Ok(res_buffer) = self.uploader.upload(key, buffer).await {
-                return Ok(res_buffer);
+        match self.write_backer {
+            Some(ref write_backer) => {
+                let staging_path = self.stage_path(key);
+                if self.stage_space_full.load(Ordering::SeqCst) {
+                    whatever!("space not enough on device");
+                }
+                let _ = self.state_check()?;
+                let res_buffer = self.flush(staging_path.as_path(), buffer.clone()).await?;
+                // Save time loading from disk into memory
+                if write_backer.delay_upload.is_none() && write_backer.can_upload() {
+                    if let Ok(res_buffer) = self.uploader.upload(key, buffer).await {
+                        return Ok(res_buffer);
+                    }
+                }
+
+                write_backer.pending_stages
+                    .send((key.to_string(), res_buffer.clone()))
+                    .await
+                    .map_err(|_| StorageErrorEnum::SenderError)?;
+                Ok(Either::Right(res_buffer))
+            }
+            None => {
+                self.uploader.upload(key, buffer).await
             }
         }
 
-        self.pending_stages
-            .send((key.to_string(), res_buffer.clone()))
-            .await
-            .map_err(|_| StorageErrorEnum::SenderError)?;
-        Ok(Either::Right(res_buffer))
+        
     }
 }
 
@@ -1236,6 +1272,7 @@ impl CacheManager for CacheStore {
                     return Ok(());
                 }
                 self.mem_caches.insert(key.clone(), buffer.clone());
+                self.used_mem_page.fetch_add(buffer.len() as i64, Ordering::SeqCst);
                 match self.pending_cache.try_send((key.clone(), buffer)) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full((key, buffer))) => {
@@ -1508,25 +1545,30 @@ mod tests {
     #[tokio::test]
     async fn test_check_path() {
         let cases = vec![
-            ("chunks/111/222/3333_3333_3333", true),
-            ("chunks/111/222/3333_3333_0", true),
-            ("chunks/0/0/0_0_0", true),
-            ("chunks/01/10/0_01_0", true),
-            ("achunks/111/222/3333_3333_3333", false),
-            ("chunksa/111/222/3333_3333_3333", false),
-            ("chunksa", false),
-            ("chunks/111", false),
-            ("chunks/111/2222", false),
-            ("chunks/111/2222/3", false),
-            ("chunks/111/2222/3333_3333", false),
-            ("chunks/111/2222/3333_3333_3333_4444", false),
-            ("chunks/111/2222/3333_3333_3333/4444", false),
-            ("chunks/111_/2222/3333_3333_3333", false),
-            ("chunks/111/22_22/3333_3333_3333", false),
-            ("chunks/111/22_22/3333_3333_3333", false),
+            ("chunks/0/0/1_0_1048576", Some(CacheKey { id: 1, indx: 0, size: 1048576 })),
+            ("chunks/111/222/3333_3333_3333", Some(CacheKey { id: 3333, indx: 3333, size: 3333 })),
+            ("chunks/111/222/3333_3333_0", Some(CacheKey { id: 3333, indx: 3333, size: 0 })),
+            ("chunks/0/0/0_0_0", Some(CacheKey { id: 0, indx: 0, size: 0 })),
+            ("chunks/01/10/0_01_0", Some(CacheKey { id: 0, indx: 1, size: 0 })),
+            ("achunks/111/222/3333_3333_3333", None),
+            ("chunksa/111/222/3333_3333_3333", None),
+            ("chunksa", None),
+            ("chunks/111", None),
+            ("chunks/111/2222", None),
+            ("chunks/111/2222/3", None),
+            ("chunks/111/2222/3333_3333", None),
+            ("chunks/111/2222/3333_3333_3333_4444", None),
+            ("chunks/111/2222/3333_3333_3333/4444", None),
+            ("chunks/111_/2222/3333_3333_3333", None),
+            ("chunks/111/22_22/3333_3333_3333", None),
+            ("chunks/111/22_22/3333_3333_3333", None),
         ];
         for (path, expected) in cases {
-            assert_eq!(BLOCK_FILE_REGEX.is_match(path), expected);
+            if let Some(expected) = expected {
+                assert_eq!(path.parse::<CacheKey>().ok(), Some(expected));
+            } else {
+                assert!(path.parse::<CacheKey>().is_err());
+            }
         }
     }
 

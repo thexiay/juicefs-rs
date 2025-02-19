@@ -1,7 +1,6 @@
 use std::cmp::min;
 use std::env;
 use std::io::ErrorKind;
-use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -10,7 +9,7 @@ use std::{fs::Permissions, future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use either::Either;
 use futures::future::FutureExt;
 use opendal::{Buffer, Operator};
@@ -21,10 +20,10 @@ use tracing::{error, warn};
 
 use crate::api::{ChunkStore, SliceWriter};
 use crate::buffer::{ChecksumLevel, FileBuffer};
-use crate::cache::CacheKey;
+use crate::cache::{CacheKey, CacheManagerImpl};
 use crate::compress::CompressArgo;
 use crate::error::Result;
-use crate::uploader::Uploader;
+use crate::uploader::{NormalUploader, Uploader};
 use crate::{
     api::SliceReader, cache::CacheManager, compress::Compressor, pre_fetcher::PreFetcher,
     single_flight::SingleFlight,
@@ -80,7 +79,7 @@ impl Default for Config {
         Config {
             cache_dirs: vec![env::temp_dir().join("cache")],
             cache_file_mode: Permissions::from_mode(0o666),
-            cache_size: 10 << 20,  // 10MB
+            cache_size: 10 << 20, // 10MB
             cache_checksum: ChecksumLevel::None,
             cache_eviction: false,
             cache_scan_interval: Duration::seconds(300),
@@ -97,11 +96,11 @@ impl Default for Config {
             upload_delay: None,
             upload_hours: None,
             is_hash_prefix: false,
-            max_block_size: 1 << 20,
+            max_block_size: 1 << 20, // 1MB
             get_timeout: Duration::seconds(60),
             put_timeout: Duration::seconds(60),
             cache_full_block: false,
-            buffer_size: 32 << 20,  // 32MB
+            buffer_size: 32 << 20, // 32MB
             read_ahead: 0,
             prefetch_parallelism: None,
         }
@@ -131,12 +130,24 @@ impl SliceHelper {
     }
 
     /// The size of the this block at index
-    fn block_size(&self, indx: usize) -> usize {
-        let bsize = self.length - indx * self.conf.max_block_size;
+    fn block_size(&self, idx: usize) -> usize {
+        let bsize = self.length - idx * self.conf.max_block_size;
         if bsize > self.conf.max_block_size {
             self.conf.max_block_size
         } else {
             bsize
+        }
+    }
+
+    fn page_size(&self, b_idx: usize) -> usize {
+        // First block have multiple pages,
+        // Rest have only one page
+        // TODO: why??Please explain it
+        // Small object optimization: If it is a very small file, store it according to page. If it is a large object, store it according to the granularity of the chunk.
+        if b_idx > 0 || self.conf.max_block_size < PAGE_SIZE {
+            self.conf.max_block_size
+        } else {
+            PAGE_SIZE
         }
     }
 
@@ -145,17 +156,17 @@ impl SliceHelper {
     }
 }
 
-pub struct RSlice<CM: CacheManager> {
+pub struct RSlice {
     slice_helper: SliceHelper,
     // timeout layer, retry layer
     storage: Arc<Operator>,
-    cache_manager: Arc<CM>,
+    cache_manager: Arc<CacheManagerImpl>,
     compressor: Option<Arc<Box<dyn Compressor>>>,
     fetcher: Arc<PreFetcher>,
     group: Arc<SingleFlight>,
 }
 
-impl<CM: CacheManager> Deref for RSlice<CM> {
+impl Deref for RSlice {
     type Target = SliceHelper;
 
     fn deref(&self) -> &Self::Target {
@@ -163,7 +174,7 @@ impl<CM: CacheManager> Deref for RSlice<CM> {
     }
 }
 
-impl<CM: CacheManager> RSlice<CM> {
+impl RSlice {
     fn keys(&self) -> Vec<CacheKey> {
         if self.length <= 0 {
             return vec![];
@@ -235,10 +246,7 @@ impl<CM: CacheManager> RSlice<CM> {
     }
 }
 
-impl<CM> SliceReader for RSlice<CM>
-where
-    CM: CacheManager,
-{
+impl SliceReader for RSlice {
     fn id(&self) -> u64 {
         self.id
     }
@@ -321,28 +329,27 @@ where
     }
 }
 
-pub struct WSlice<CM, U, const N: usize>
-where
-    CM: CacheManager,
-    U: Uploader,
-{
+pub struct WSlice {
     slice_helper: SliceHelper,
     storage: Arc<Operator>,
-    cache_manager: Arc<CM>,
+    cache_manager: Arc<CacheManagerImpl>,
     compressor: Option<Arc<Box<dyn Compressor>>>,
-    uploader: Arc<U>,
+    uploader: Arc<dyn Uploader>,
     fetcher: Arc<PreFetcher>,
     group: Arc<SingleFlight>,
 
     /// For every block, has a vector of pages
+    /// /------------------/------------------/-----/
+    /// /      block       /      block       / ... /
+    /// / page / page / .. / page / page / .. / ... /
     /// block pages always be equal or larger than block size
-    block_pages: [Vec<BytesMut>; N],
+    block_pages: Vec<Vec<BytesMut>>,
     /// The length of submitted uploading data length, but maybe not finished
     uploaded_len: usize,
     pengind_upload_tasks: JoinSet<Result<Either<Buffer, FileBuffer>>>,
 }
 
-impl<CM: CacheManager, U: Uploader, const N: usize> Deref for WSlice<CM, U, N> {
+impl Deref for WSlice {
     type Target = SliceHelper;
 
     fn deref(&self) -> &Self::Target {
@@ -350,13 +357,13 @@ impl<CM: CacheManager, U: Uploader, const N: usize> Deref for WSlice<CM, U, N> {
     }
 }
 
-impl<CM: CacheManager, U: Uploader, const N: usize> DerefMut for WSlice<CM, U, N> {
+impl DerefMut for WSlice {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.slice_helper
     }
 }
 
-impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U, N> {
+impl SliceWriter for WSlice {
     fn id(&self) -> u64 {
         self.id
     }
@@ -390,23 +397,19 @@ impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U
 
             let mut n = 0;
             while n < buffer.len() {
-                let indx = self.block_index(off + n);
+                let b_idx = self.block_index(off + n);
                 let b_off = (off + n) % self.conf.max_block_size;
-                // first block have multiple pages, the rest have only one page
-                let p_size = if indx > 0 || self.conf.max_block_size < PAGE_SIZE {
-                    self.conf.max_block_size
-                } else {
-                    PAGE_SIZE
-                };
+                let p_size = self.page_size(b_idx);
                 let p_idx = b_off / p_size;
                 let p_off = b_off % p_size;
-                let page_cnt = self.block_pages[indx].len();
+                let page_cnt = self.block_pages[b_idx].len();
                 let page = if p_idx < page_cnt {
-                    &mut self.block_pages[indx][p_idx]
+                    &mut self.block_pages[b_idx][p_idx]
                 } else {
-                    let page = BytesMut::with_capacity(p_size);
-                    self.block_pages[indx].push(page);
-                    &mut self.block_pages[indx][page_cnt]
+                    let mut page = BytesMut::new();
+                    page.resize(p_size, 0); // only resize will fill zeros
+                    self.block_pages[b_idx].push(page);
+                    &mut self.block_pages[b_idx][page_cnt]
                 };
                 let left = buffer.len() - n;
                 // every time copy until page finish
@@ -424,7 +427,7 @@ impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U
         }
     }
 
-    fn spawn_flush_to(&mut self, offset: usize) -> Result<()> {
+    fn spawn_flush_until(&mut self, offset: usize) -> Result<()> {
         if offset < self.uploaded_len {
             whatever!("Invalid offset: {} < {}", offset, self.uploaded_len);
         }
@@ -470,9 +473,9 @@ impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U
         }
     }
 
-    async fn finish(&mut self) -> Result<()> {
+    async fn finish(&mut self) -> Result<usize> {
         let n = (self.length - 1) / self.conf.max_block_size + 1;
-        self.spawn_flush_to(n * self.conf.max_block_size)?;
+        self.spawn_flush_until(n * self.conf.max_block_size)?;
         while let Some(join_res) = self.pengind_upload_tasks.join_next().await {
             match join_res {
                 Ok(task_res) => {
@@ -485,39 +488,46 @@ impl<CM: CacheManager, U: Uploader, const N: usize> SliceWriter for WSlice<CM, U
                 }
             }
         }
-        Ok(())
+        Ok(self.length)
     }
 }
 
-struct CachedStore<CM, U, const N: usize>
-where
-    CM: CacheManager,
-    U: Uploader,
-{
+pub struct CachedStore {
     /// concurrent limit and rate limit and retry limit
     /// all of those could put it in accesssor layer
     /// TODO: modify upload limit and download limit at runtime, add compressor at runtime
     /// retry 2 times, timeouit layer
     storage: Arc<Operator>,
-    cache_manager: Arc<CM>,
+    cache_manager: Arc<CacheManagerImpl>,
     compressor: Option<Arc<Box<dyn Compressor>>>,
-    uploader: Arc<U>,
+    uploader: Arc<dyn Uploader>,
     fetcher: Arc<PreFetcher>,
     group: Arc<SingleFlight>,
     conf: Arc<Config>,
-    start_hour: u32,
-    end_hour: u32,
-    _phantom: PhantomData<[(); N]>,
 }
 
-#[async_trait]
-impl<CM, U, const N: usize> ChunkStore for CachedStore<CM, U, N>
-where
-    CM: CacheManager,
-    U: Uploader,
-{
-    type Writer = WSlice<CM, U, 1>;
-    type Reader = RSlice<CM>;
+impl CachedStore {
+    pub async fn new(
+        storage: Arc<Operator>,
+        config: Config,
+        uploader: NormalUploader,
+    ) -> Result<Self> {
+        let cache_manager = Arc::new(CacheManagerImpl::new(&config, uploader).await?);
+        Ok(CachedStore {
+            storage,
+            cache_manager: cache_manager.clone(),
+            compressor: None,
+            uploader: cache_manager,
+            fetcher: Arc::new(PreFetcher::new()),
+            group: Arc::new(SingleFlight::new()),
+            conf: Arc::new(config),
+        })
+    }
+}
+
+impl ChunkStore for CachedStore {
+    type Writer = WSlice;
+    type Reader = RSlice;
 
     /// Create a new reader for a slice
     fn new_reader(&self, id: u64, length: usize) -> Self::Reader {
@@ -549,7 +559,7 @@ where
             uploader: self.uploader.clone(),
             fetcher: self.fetcher.clone(),
             group: self.group.clone(),
-            block_pages: Default::default(),
+            block_pages: vec![Vec::default(); CHUNK_SIZE / self.conf.max_block_size],
             uploaded_len: 0,
             pengind_upload_tasks: Default::default(),
         }
@@ -613,4 +623,152 @@ where
     fn set_update_limit(&self, upload: i64, download: i64) {
         todo!()
     }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use opendal::{services::Memory, Buffer, Operator};
+    use tempfile::tempdir;
+    use tokio::{task::JoinSet, time::sleep};
+    use tracing_test::traced_test;
+
+    use crate::{
+        api::{ChunkStore, SliceReader, SliceWriter},
+        cache::CacheManager,
+        cached_store::Config,
+        error::Result,
+        uploader::NormalUploader,
+    };
+
+    use super::CachedStore;
+
+    async fn new_cached_store(config: Config, op: Operator) -> Result<Arc<CachedStore>> {
+        let operator = Arc::new(op);
+        let uploader = NormalUploader::new(operator.clone(), None);
+        let cache_store = CachedStore::new(operator, config, uploader).await?;
+        Ok(Arc::new(cache_store))
+    }
+
+    fn new_config() -> Config {
+        let config = Config::default();
+        config
+    }
+
+    async fn forget_slice(
+        store: Arc<impl ChunkStore + 'static>,
+        slice_id: u64,
+        size: usize,
+    ) -> Result<()> {
+        let mut writer = store.new_writer(slice_id);
+        let buf = Buffer::from(vec![0x41_u8; size]);
+        writer.write_all_at(buf, 0).await?;
+        let s = writer.finish().await?;
+        assert_eq!(s, size);
+        Ok(())
+    }
+
+    async fn test_store(store: Arc<impl ChunkStore + 'static>) {
+        // write
+        let mut writer = store.new_writer(1);
+        let data = Buffer::from("hello world");
+        writer
+            .write_all_at(data.clone(), 0)
+            .await
+            .expect("write failed");
+        let conf = Config::default();
+        let offset = conf.max_block_size - 3;
+        writer
+            .write_all_at(data.clone(), offset)
+            .await
+            .expect("write failed");
+        writer
+            .spawn_flush_until(conf.max_block_size + 3)
+            .expect("flush failed");
+
+        let size = offset + data.len();
+        assert_eq!(size, writer.finish().await.expect("finish failed"));
+
+        // read
+        let reader = store.new_reader(1, size);
+        let n = reader.read_at(6, 5).await.expect("read failed");
+        assert_eq!(5, n.len());
+        let word = String::from_utf8(n.to_vec());
+        assert!(word.is_ok(), "word is not a valid utf8 string");
+        assert_eq!(word.unwrap(), "world");
+
+        let read_eof = reader.read_at(offset, 20).await;
+        assert!(read_eof.is_err());
+        assert!(read_eof.unwrap_err().is_eof());
+
+        let n = reader.read_at(offset, 11).await.expect("read failed");
+        let word = String::from_utf8(n.to_vec());
+        assert!(word.is_ok(), "word is not a valid utf8 string");
+        assert_eq!(word.unwrap(), "hello world");
+
+        let b_size = conf.max_block_size / 2;
+        let mut join_set = JoinSet::new();
+        for i in 2_u64..5 {
+            let store_cloned = store.clone();
+            join_set.spawn(async move {
+                forget_slice(store_cloned.clone(), i, b_size).await?;
+                sleep(std::time::Duration::from_millis(100)).await;
+                store_cloned.remove(i, b_size).await
+            });
+        }
+        while let Some(res) = join_set.join_next().await {
+            assert!(
+                res.is_ok(),
+                "test concurrent write failed: {}",
+                res.unwrap_err()
+            );
+        }
+        store.remove(1, size).await.expect("remove failed");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_default() {
+        let builder = Memory::default().root("/tmp");
+        let op = Operator::new(builder).unwrap().finish();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+
+        let store = new_cached_store(config, op)
+            .await
+            .expect("create chunk store failed");
+        test_store(store.clone()).await;
+
+        let used = store.used_memory();
+        assert_eq!(used, 0);
+        let stats = store.cache_manager.stats();
+        assert_eq!(stats.0, 0);
+        assert_eq!(stats.1, 0);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_mem_cache() {}
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_compressed() {}
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_limited() {}
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_full() {}
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_small_buffer() {}
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_store_async() {}
 }

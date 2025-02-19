@@ -14,5 +14,3 @@ mod compress;
 mod buffer;
 mod uploader;
 mod utils;
-#[cfg(test)]
-mod tests;

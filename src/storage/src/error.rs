@@ -51,11 +51,18 @@ impl StorageError {
         matches!(self.source, StorageErrorEnum::IoError { .. })
     }
 
+    pub fn is_eof(&self) -> bool {
+        matches!(
+            self.source, 
+            StorageErrorEnum::IoError {
+                ref source 
+            } if source.kind() == std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
     pub fn is_disk_unstable_error(&self) -> bool {
         matches!(self.source, StorageErrorEnum::DiskUnstableError)
     }
-
-    
 }
 
 impl<E> From<E> for StorageError
