@@ -106,10 +106,11 @@ impl DiskCacheManager {
             whatever!("no cache dir existed, use memory cache instead");
         }
         let disk_capacity = config.cache_size / cache_dirs.len() as u64;
-        let pending_cache_capacity = (config.buffer_size as f32 * 0.2
+        let mut pending_cache_capacity = (config.buffer_size as f32 * 0.2
             / config.max_block_size as f32
             / cache_dirs.len() as f32) as usize;
         if pending_cache_capacity == 0 {
+            pending_cache_capacity = 1;
             warn!(
                 "no pending cache capacity, use sync to flush cache, please notice the performance"
             );
