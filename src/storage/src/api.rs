@@ -78,7 +78,7 @@ pub trait ChunkStore: Send + Sync {
     fn set_update_limit(&self, upload: i64, download: i64);
 }
 
-pub async fn new_chunkstore(config: Config, operator: Operator) -> Result<impl ChunkStore + 'static> {
+pub async fn new_chunk_store(config: Config, operator: Operator) -> Result<impl ChunkStore + 'static> {
     let operator = Arc::new(operator);
     let uploader = NormalUploader::new(operator.clone(), None);
     let cache_store = CachedStore::new(operator, config, uploader).await?;

@@ -10,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
         Arc, LazyLock,
-    },
+    }, u64,
 };
 
 use async_trait::async_trait;
@@ -30,12 +30,13 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument::WithSubscriber, warn};
 use uuid::Uuid;
 
 use crate::{
     buffer::{checksum, ChecksumLevel, FileBuffer},
-    cache::{CacheKey, TotalAndUsed},
+    cache::{CacheKey, CacheCntAndSize},
     cached_store::Config,
     error::{Result, StorageErrorEnum},
     uploader::{NormalUploader, Uploader},
@@ -180,7 +181,7 @@ impl CacheManager for DiskCacheManager {
         }
     }
 
-    fn stats(&self) -> TotalAndUsed {
+    fn stats(&self) -> CacheCntAndSize {
         let (mut cnt, mut used) = (0_i64, 0_i64);
         let cache_store = self.cache_stores.read();
 
@@ -256,6 +257,8 @@ enum DiskState {
         io_err_cnt: AtomicU32,
         io_cnt: AtomicU32,
         io_limit: Arc<Semaphore>,
+        probe_task: JoinHandle<()>,
+        cancel_token: CancellationToken,
     },
     Down,
     Unchanged,
@@ -303,10 +306,11 @@ struct WriteBacker {
     /// staged pages wait to upload to object storage
     pending_stages: Sender<(String, FileBuffer)>,
     // TODO: 为什么go的代码这里要设置成map,需要判断去重吗，为什么会有重复的stage呢
-    deplayed_pending_stages: Mutex<BinaryHeap<Reverse<PendingStage>>>,
+    delayed_pending_stages: Mutex<BinaryHeap<Reverse<PendingStage>>>,
     /// the time range for staged pages can upload to object storage
     upload_hours: Option<(u32, u32)>,
-    delay_upload: Option<Duration>,
+    upload_delay: Option<Duration>,
+    scan_delayed_interval: Duration,
 }
 
 impl WriteBacker {
@@ -328,14 +332,12 @@ impl WriteBacker {
 pub struct CacheStore {
     /// cache unique id
     id: String,
-    /// cached pages wait to flush to disk
-    pending_cache: Sender<(CacheKey, Buffer)>,
     /// writer back
     write_backer: Option<WriteBacker>,
 
     /// ----------- Mem manage -----------
-    /// used page mem space in bytes
-    used_mem_page: AtomicI64,
+    /// cached pages wait to flush to disk
+    pending_cache: Sender<(CacheKey, Buffer)>,
     /// memory cached biffer
     mem_caches: DashMap<CacheKey, Buffer>,
 
@@ -404,11 +406,19 @@ impl CacheStore {
         let (disk_event_sender, disk_event_receiver) = channel::<DiskEvent>(1024);
         let (writer_backer, pending_stage_receiver) = if config.writeback {
             let (pending_stage_sender, pending_stage_receiver) = channel::<(String, FileBuffer)>(1024);
+            let scan_delayed_interval = if let Some(scan_interval) = config.upload_delay && scan_interval < STATE_CHECK_DURATION {
+                warn!("upload delay {scan_interval} is too small and is not recommended.");
+                scan_interval
+            } else {
+                info!("upload delay {STATE_CHECK_DURATION}.");
+                STATE_CHECK_DURATION
+            };
             (Some(WriteBacker {
                 pending_stages: pending_stage_sender,
-                deplayed_pending_stages: Mutex::new(BinaryHeap::new()),
+                delayed_pending_stages: Mutex::new(BinaryHeap::new()),
                 upload_hours: config.upload_hours,
-                delay_upload: config.upload_delay,
+                upload_delay: config.upload_delay,
+                scan_delayed_interval,
             }), Some(pending_stage_receiver))
         } else {
             (None, None)
@@ -418,7 +428,6 @@ impl CacheStore {
             id: "".to_string(),
             pending_cache: pending_cache_sender,
             write_backer: writer_backer,
-            used_mem_page: AtomicI64::default(),
             mem_caches: DashMap::default(),
             state: RwLock::new(state),
             used_disk_page: AtomicI64::default(),
@@ -467,7 +476,10 @@ impl CacheStore {
         cache_store.clone().spawn_find_unfinished_stage();
         cache_store
             .clone()
-            .spawn_upload_stage(pending_stage_receiver);
+            .spawn_receive_stage(pending_stage_receiver);
+        cache_store
+            .clone()
+            .spawn_upload_stage();
         cache_store.clone().spawn_check_lock_file();
         cache_store.clone().spawn_check_free_space_ratio();
         cache_store.clone().spawn_check_expire();
@@ -487,7 +499,7 @@ impl CacheStore {
         tokio::spawn(async move {
             loop {
                 if let Some((key, buffer)) = pending_cache.recv().await {
-                    let path = self.dir.join(key.to_path(self.hash_prefix));
+                    let path = self.dir.join(CACHE_DIR).join(key.to_path(self.hash_prefix));
                     if self.max_disk_space > 0
                         && let Ok(file) = self
                             .flush(Path::new(&path), buffer.clone())
@@ -498,8 +510,6 @@ impl CacheStore {
                             .await;
                     }
                     let v = self.mem_caches.remove(&key);
-                    self.used_mem_page
-                        .fetch_sub(buffer.len() as i64, Ordering::SeqCst);
                     // there exist mem cache removed, but channel to be persisted cache don't remove,
                     // so we need to double check it
                     if v.is_none() {
@@ -511,10 +521,87 @@ impl CacheStore {
     }
 
     /// Find unfinished stage to continue upload them to object storage
-    fn spawn_find_unfinished_stage(self: Arc<Self>) {}
+    fn spawn_find_unfinished_stage(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if self.write_backer.is_none() {
+                return;
+            }
+    
+            let start = Local::now();
+            let one_min_ago = start.to_utc() - Duration::minutes(1);
+            let cache_prefix = Path::new(&self.dir).join(CACHE_STAGE_DIR);
+            debug!("Scan {cache_prefix:?} to find staging blocks");
+            let (mut count, mut usage) = (0, 0);
+            for entry in walkdir::WalkDir::new(cache_prefix.as_path()) {
+                let (entry, stat) = match entry {
+                    Ok(entry) => match stat(entry.path()) {
+                        Ok(stat) => (entry, stat),
+                        Err(e) => {
+                            warn!("Failed to get path {:?} metadata: {e}", entry.path());
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to scan stage dir: {e}");
+                        continue;
+                    }
+                };
 
-    /// Flush pending stage file into remote storage and cache intevally
-    fn spawn_upload_stage(
+                let path = entry.path();
+                if entry.file_type().is_dir() || path.to_string_lossy().ends_with(".tmp") { 
+                    let mtime =
+                        DateTime::from_timestamp(stat.st_mtime, stat.st_atime_nsec as u32)
+                            .unwrap();
+                    if mtime < one_min_ago {
+                        let del_res = if entry.file_type().is_dir() {
+                            fs::remove_dir(path).await
+                        } else {
+                            fs::remove_file(path).await
+                        };
+                        if let Ok(_) = del_res {
+                            info!("Remove expire empty directory or .tmp file: {path:?}");
+                        }
+                    }
+                } else {
+                    let cache_key_path = match path.strip_prefix(cache_prefix.as_path()) {
+                        Ok(p) => p.to_string_lossy().to_string(),
+                        Err(e) => {
+                            warn!("Failed to strip prefix from {path:?}: {e}");
+                            continue;
+                        }
+                    };
+                    if !BLOCK_FILE_REGEX.is_match(&cache_key_path) {
+                        warn!("Ignoring invalid cache file: {path:?}");
+                        continue;
+                    }
+                    let cache_key = match cache_key_path.parse::<CacheKey>() {
+                        Ok(key) => key,
+                        Err(e) => {
+                            warn!("Failed to parse cache key from {cache_key_path}: {e}");
+                            continue;
+                        }
+                    };
+                    if cache_key.size == 0 {
+                        warn!("Ignore file with zero size: {path:?}");
+                        continue;
+                    }
+                    debug!("Found staging block: {path:?}");
+
+                    // 这里如果报错，只记录日志即可
+                    let mut file_buffer = FileBuffer::new(path, cache_key.size, self.checksum_level.clone(), self.disk_event_sender.clone()).unwrap();
+                    let buffer = file_buffer.read_at(0, file_buffer.len()).await.unwrap();
+                    self.uploader.upload(&cache_key_path, buffer).await.unwrap();
+
+                    count += 1;
+                    usage += cache_key.size;
+                }
+            }
+            info!("Found {count} staging blocks ({usage}) in {:?} with {}", cache_prefix, Local::now() - start);  
+        })
+    }
+
+    /// Flush penging stage
+    fn spawn_receive_stage(
         self: Arc<Self>,
         pending_stages: Option<Receiver<(String, FileBuffer)>>,
     ) -> JoinHandle<()> {
@@ -522,88 +609,91 @@ impl CacheStore {
             if pending_stages.is_none() {
                 return;
             }
-            let store = self.clone();
-            let scaner = tokio::spawn(async move {
-                let mut pending_stages = pending_stages.unwrap();
-                let write_backer = store.write_backer.as_ref().unwrap();
-                while store.available() {
-                    if let Some((key, stage_fb)) = pending_stages.recv().await {
-                        let pending_stage = PendingStage {
-                            key: key.clone(),
-                            file_buffer: stage_fb.clone(),
-                            ts: Utc::now() + write_backer.delay_upload.unwrap_or(Duration::zero()),
-                        };
-                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
-                        deplayed_pending_stages.push(Reverse(pending_stage));
-                    }
-                }
-            });
-
-            let uploader = tokio::spawn(async move {
-                while self.available() {
-                    sleep(std::time::Duration::from_secs(1)).await;
-                    let write_backer = self.write_backer.as_ref().unwrap();
-                    if !write_backer.can_upload() {
-                        continue;
-                    }
-
-                    let pending_stages = {
-                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
-                        let now = Utc::now();
-                        let mut to_be_uploaded_pending_stages = vec![];
-                        while let Some(Reverse(stage)) = deplayed_pending_stages.peek() {
-                            if now < stage.ts {
-                                break;
-                            } else {
-                                to_be_uploaded_pending_stages
-                                    .push(deplayed_pending_stages.pop().unwrap());
-                            }
-                        }
-                        to_be_uploaded_pending_stages
+            
+            let mut pending_stages = pending_stages.unwrap();
+            let write_backer = self.write_backer.as_ref().unwrap();
+            while self.available() {
+                if let Some((key, stage_fb)) = pending_stages.recv().await {
+                    let pending_stage = PendingStage {
+                        key: key.clone(),
+                        file_buffer: stage_fb.clone(),
+                        ts: Utc::now() + write_backer.upload_delay.unwrap_or(Duration::zero()),
                     };
+                    let mut deplayed_pending_stages = write_backer.delayed_pending_stages.lock();
+                    deplayed_pending_stages.push(Reverse(pending_stage));
+                }
+            }
+        })
+    }
 
-                    let mut err_stage = vec![];
-                    for Reverse(mut stage) in pending_stages {
-                        let buffer =
-                            match stage.file_buffer.read_at(0, stage.file_buffer.len()).await {
-                                Ok(buffer) => buffer,
-                                Err(e) => {
-                                    error!(
-                                        "Failed to read staging file {:?}, {e}",
-                                        stage.file_buffer.as_path()
-                                    );
-                                    err_stage.push(stage);
-                                    continue;
-                                }
-                            };
-                        match self.uploader.upload(&stage.key, buffer).await {
-                            Ok(_) => {
-                                debug!(
-                                    "Upload staging file {:?} to object storage",
-                                    stage.file_buffer.as_path()
-                                );
-                            }
+    /// Flush pending stage file into remote storage and cache intevally
+    fn spawn_upload_stage(
+        self: Arc<Self>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if self.write_backer.is_none() {
+                return;
+            }
+
+            let write_backer = self.write_backer.as_ref().unwrap();
+            while self.available() {
+                sleep(write_backer.scan_delayed_interval.to_std().unwrap()).await;
+                if !write_backer.can_upload() {
+                    continue;
+                }
+
+                let pending_stages = {
+                    let mut deplayed_pending_stages = write_backer.delayed_pending_stages.lock();
+                    let now = Utc::now();
+                    let mut to_be_uploaded_pending_stages = vec![];
+                    while let Some(Reverse(stage)) = deplayed_pending_stages.peek() {
+                        if now < stage.ts {
+                            break;
+                        } else {
+                            to_be_uploaded_pending_stages
+                                .push(deplayed_pending_stages.pop().unwrap());
+                        }
+                    }
+                    to_be_uploaded_pending_stages
+                };
+
+                let mut err_stage = vec![];
+                for Reverse(mut stage) in pending_stages {
+                    let buffer =
+                        match stage.file_buffer.read_at(0, stage.file_buffer.len()).await {
+                            Ok(buffer) => buffer,
                             Err(e) => {
                                 error!(
-                                    "Failed to upload staging file {:?}, {e}",
+                                    "Failed to read staging file {:?}, {e}",
                                     stage.file_buffer.as_path()
                                 );
                                 err_stage.push(stage);
+                                continue;
                             }
+                        };
+                    match self.uploader.upload(&stage.key, buffer).await {
+                        Ok(_) => {
+                            debug!(
+                                "Upload staging file {:?} to object storage",
+                                stage.file_buffer.as_path()
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to upload staging file {:?}, {e}",
+                                stage.file_buffer.as_path()
+                            );
+                            err_stage.push(stage);
                         }
                     }
-
-                    {
-                        let mut deplayed_pending_stages = write_backer.deplayed_pending_stages.lock();
-                        deplayed_pending_stages.extend(err_stage.into_iter().map(Reverse));
-                    }
                 }
-            });
 
-            tokio::select! {
-                _ = scaner => info!("scan task is finished"),
-                _ = uploader => info!("uploader task is finished"),
+                {
+                    let mut deplayed_pending_stages = write_backer.delayed_pending_stages.lock();
+                    deplayed_pending_stages.extend(err_stage.into_iter().map(Reverse));
+                }
             }
+            
         })
     }
 
@@ -759,7 +849,6 @@ impl CacheStore {
                         }
                     };
                     let path = entry.path();
-                    let relative_path = path.strip_prefix(cache_prefix.as_path()).unwrap();
                     if entry.file_type().is_dir() || path.to_string_lossy().ends_with(".tmp") {
                         let mtime =
                             DateTime::from_timestamp(stat.st_mtime, stat.st_atime_nsec as u32)
@@ -782,7 +871,7 @@ impl CacheStore {
                                 continue;
                             }
                         };
-                        if !BLOCK_FILE_REGEX.is_match(&relative_path.to_string_lossy()) {
+                        if !BLOCK_FILE_REGEX.is_match(&cache_key_path) {
                             warn!("Ignoring invalid cache file: {path:?}");
                             continue;
                         }
@@ -813,7 +902,7 @@ impl CacheStore {
                         "Found {} cached blocks ({}) in {} with {start}",
                         disk_caches.len(),
                         self.used_disk_page.load(Ordering::SeqCst),
-                        self.dir.display(),
+                        cache_prefix.display(),
                     );
                 }
                 sleep(scan_interval).await;
@@ -839,7 +928,7 @@ impl CacheStore {
         tokio::spawn(async move {
             loop {
                 sleep(STATE_CHECK_DURATION.to_std().unwrap()).await;
-                self.correct_state();
+                self.clone().correct_state();
             }
         })
     }
@@ -847,30 +936,43 @@ impl CacheStore {
     /// Request a cache disk probe to test disk is ok or not
     fn spawn_probe_cache_capability(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut cnt = 0_u64;
-            while self.available() {
-                let key = CacheKey::new(cnt, 0, PROBE_DATA.len());
-                let _ = self
-                    .put(&key, Either::Left(Buffer::from(PROBE_DATA.to_vec())), true)
-                    .await;
-                sleep(PROBE_DURATION.to_std().unwrap()).await;
-                self.remove(&key).await;
-                sleep(PROBE_DURATION.to_std().unwrap()).await;
-                cnt += 1;
+            if self.write_backer.is_some() {
+                return;
             }
         })
     }
 
-    fn correct_state(&self) {
+    fn correct_state(self: Arc<Self>) {
         let mut state = self.state.write();
         let next_state = match *state {
             DiskState::Normal { ref io_err_cnt } => {
                 if io_err_cnt.load(Ordering::SeqCst) > MAX_NUM_IO_ERR_TO_UNSTABLE {
+                    let cache_store = self.clone();
+                    let token = CancellationToken::new();
+                    let token_cloned = token.clone();
+                    let probe_task = tokio::spawn(async move {
+                        let mut cnt = 0_u64;
+                        loop {
+                            if token_cloned.is_cancelled() {
+                                break;
+                            }
+                            let key = CacheKey::new(cnt, 0, PROBE_DATA.len());
+                            let _ = cache_store
+                                .put(&key, Either::Left(Buffer::from(PROBE_DATA.to_vec())), true)
+                                .await;
+                            sleep(PROBE_DURATION.to_std().unwrap()).await;
+                            cache_store.remove(&key).await;
+                            sleep(PROBE_DURATION.to_std().unwrap()).await;
+                            cnt += 1;
+                        }
+                    });
                     Some(DiskState::Unstable {
                         start_time: Utc::now(),
                         io_err_cnt: AtomicU32::new(0),
                         io_cnt: AtomicU32::new(0),
                         io_limit: Arc::new(Semaphore::new(MAX_CONCURRENCY_FOR_UNSTABLE as usize)),
+                        probe_task,
+                        cancel_token: token,
                     })
                 } else {
                     None
@@ -880,6 +982,7 @@ impl CacheStore {
                 ref start_time,
                 ref io_err_cnt,
                 ref io_cnt,
+                ref cancel_token,
                 ..
             } => {
                 if io_cnt.load(Ordering::SeqCst) > *MIN_NUM_IO_SUCC_TO_NORMAL
@@ -887,10 +990,12 @@ impl CacheStore {
                         / io_cnt.load(Ordering::SeqCst) as f64
                         <= MAX_IO_ERR_PERCENTAGE_TO_NORMAL
                 {
+                    cancel_token.cancel();
                     Some(DiskState::Normal {
                         io_err_cnt: AtomicU32::new(0),
                     })
                 } else if Utc::now() - *start_time >= MAX_DURATION_TO_DOWN {
+                    cancel_token.cancel();
                     Some(DiskState::Down)
                 } else {
                     io_cnt.store(0, Ordering::SeqCst);
@@ -986,7 +1091,7 @@ impl CacheStore {
     }
 
     // Flush memory buffer into disk
-    async fn flush(&self, path: &Path, mut page: Buffer) -> Result<FileBuffer> {
+    async fn flush(&self, path: &Path, page: Buffer) -> Result<FileBuffer> {
         if !self.available() {
             whatever!("err cache down");
         }
@@ -995,6 +1100,7 @@ impl CacheStore {
             self.ensure_cache_dir_created(path).await
         }).await?;
         let tmp_path = path.with_extension("tmp");
+        let mut read_buf = page.clone();
         match self
             .check_fs_op(async || {
                 let mut f = fs::OpenOptions::new()
@@ -1003,7 +1109,7 @@ impl CacheStore {
                     .mode(self.mode.mode())
                     .open(tmp_path.as_path())
                     .await?;
-                f.write_buf(&mut page).await?;
+                f.write_buf(&mut read_buf).await?;
                 if self.checksum_level != ChecksumLevel::None {
                     let mut checksum = checksum(&page);
                     f.write_buf(&mut checksum).await?;
@@ -1189,7 +1295,7 @@ impl CacheStore {
             }
         }
         for path in missing_paths.iter().rev() {
-            fs::create_dir(path).await?;
+            fs::create_dir_all(path).await?;
             // umask may remove some permisssions
             fs::set_permissions(path, mode.clone()).await?;
         }
@@ -1216,31 +1322,35 @@ impl Uploader for CacheStore {
     async fn upload(&self, key: &str, buffer: Buffer) -> Result<Either<Buffer, FileBuffer>> {
         match self.write_backer {
             Some(ref write_backer) => {
+                // Save time loading from disk into memory
+                if write_backer.upload_delay.is_none() && write_backer.can_upload() {
+                    if let Ok(res_buffer) = self.uploader.upload(key, buffer.clone()).await {
+                        return Ok(res_buffer);
+                    }
+                }
                 let staging_path = self.stage_path(key);
                 if self.stage_space_full.load(Ordering::SeqCst) {
                     whatever!("space not enough on device");
                 }
                 let _ = self.state_check()?;
                 let res_buffer = self.flush(staging_path.as_path(), buffer.clone()).await?;
-                // Save time loading from disk into memory
-                if write_backer.delay_upload.is_none() && write_backer.can_upload() {
-                    if let Ok(res_buffer) = self.uploader.upload(key, buffer).await {
-                        return Ok(res_buffer);
-                    }
-                }
-
                 write_backer.pending_stages
                     .send((key.to_string(), res_buffer.clone()))
                     .await
                     .map_err(|_| StorageErrorEnum::SenderError)?;
+                // notice: so we could cache it immediately almost no cost, because it used as cache and staged, 
+                // but maybe cache twice
+                if let Ok(cache_key) = CacheKey::from_str(key) {
+                    let _ = self.put(&cache_key, Either::Right(res_buffer.clone()), false).await.inspect_err(|e| {
+                        error!("Failed to cache staging file {:?}, {e}", staging_path);
+                    });
+                }
                 Ok(Either::Right(res_buffer))
             }
             None => {
                 self.uploader.upload(key, buffer).await
             }
         }
-
-        
     }
 }
 
@@ -1272,7 +1382,6 @@ impl CacheManager for CacheStore {
                     return Ok(());
                 }
                 self.mem_caches.insert(key.clone(), buffer.clone());
-                self.used_mem_page.fetch_add(buffer.len() as i64, Ordering::SeqCst);
                 match self.pending_cache.try_send((key.clone(), buffer)) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full((key, buffer))) => {
@@ -1299,6 +1408,7 @@ impl CacheManager for CacheStore {
             }
             Either::Right(buffer) => {
                 let cache_path = self.cache_path(key);
+                self.ensure_cache_dir_created(cache_path.as_path()).await?;
                 match self
                     .check_fs_op(async || {
                         fs::hard_link(buffer.as_path(), cache_path.as_path()).await
@@ -1328,8 +1438,8 @@ impl CacheManager for CacheStore {
             self.mem_caches.remove(key);
             let mut cache_stats = self.disk_caches.lock();
             if let Some(item) = cache_stats.remove(&key) {
-                self.used_mem_page
-                    .fetch_sub(item.size as i64, std::sync::atomic::Ordering::SeqCst);
+                self.used_disk_page
+                    .fetch_sub(item.size as i64 + 4096, std::sync::atomic::Ordering::SeqCst);
             }
         }
 
@@ -1392,16 +1502,18 @@ impl CacheManager for CacheStore {
         Ok(Some(buffer))
     }
 
-    fn stats(&self) -> TotalAndUsed {
-        let cache_stats = self.disk_caches.lock();
+    fn stats(&self) -> CacheCntAndSize {
+        let disk_caches = self.disk_caches.lock();
         (
-            self.mem_caches.len() as i64 + cache_stats.len() as i64,
+            self.mem_caches.len() as i64 + disk_caches.len() as i64,
             self.used_disk_page.load(Ordering::SeqCst) + self.used_memory(),
         )
     }
 
     fn used_memory(&self) -> i64 {
-        self.used_mem_page.load(Ordering::SeqCst)
+        let mut sum = 0;
+        self.mem_caches.iter().for_each(|kv| sum += kv.value().len());
+        sum as i64
     }
 
     fn is_invalid(&self) -> bool {
@@ -1416,19 +1528,17 @@ mod tests {
     use assert_matches::assert_matches;
     use chrono::{Duration, Utc};
     use either::Either;
-    use opendal::{Buffer, Operator};
+    use opendal::{services::Memory, Buffer, Operator};
     use tempfile::tempdir;
-    use tokio::{sync::Semaphore, time::sleep};
+    use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Semaphore, time::sleep};
+    use tokio_util::sync::CancellationToken;
     use tracing_test::traced_test;
 
     use crate::{
-        buffer::ChecksumLevel,
-        cache::{
-            disk::cache::{CacheStore, DiskState, MAX_CONCURRENCY_FOR_UNSTABLE, MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL},
+        buffer::ChecksumLevel, cache::{
+            disk::cache::{CacheStore, DiskState, CACHE_STAGE_DIR, MAX_CONCURRENCY_FOR_UNSTABLE, MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL},
             CacheKey, CacheManager, DiskEvent,
-        },
-        cached_store::{Config, BLOCK_FILE_REGEX},
-        uploader::NormalUploader,
+        }, cached_store::Config, uploader::NormalUploader
     };
 
     use super::DiskCacheManager;
@@ -1482,7 +1592,7 @@ mod tests {
         for _ in 0..=MAX_NUM_IO_ERR_TO_UNSTABLE {
             cache_store.on_disk_event(DiskEvent::IOError);
         }
-        cache_store.correct_state();
+        cache_store.clone().correct_state();
         sleep(Duration::seconds(1).to_std().unwrap()).await;  // probe every 500 milliseconds
         assert_matches!(*cache_store.state.read(), DiskState::Unstable { 
             ref io_cnt,
@@ -1504,7 +1614,7 @@ mod tests {
         for _ in 0..=*MIN_NUM_IO_SUCC_TO_NORMAL {
             cache_store.on_disk_event(DiskEvent::IOSuccess);
         }
-        cache_store.correct_state();
+        cache_store.clone().correct_state();
         assert_matches!(*cache_store.state.read(), DiskState::Normal{..});
 
         // case: unstable -> down
@@ -1515,11 +1625,13 @@ mod tests {
                 start_time: mock_start_time,
                 io_err_cnt: AtomicU32::default(), 
                 io_cnt: AtomicU32::default(),
-                io_limit: Arc::new(Semaphore::new(MAX_CONCURRENCY_FOR_UNSTABLE as usize)) 
+                io_limit: Arc::new(Semaphore::new(MAX_CONCURRENCY_FOR_UNSTABLE as usize)),
+                probe_task: tokio::spawn(async {}),
+                cancel_token: CancellationToken::new(), 
             }
         }
         sleep(Duration::seconds(1).to_std().unwrap()).await;
-        cache_store.correct_state();
+        cache_store.clone().correct_state();
         assert_matches!(*cache_store.state.read(), DiskState::Down);
     }
 
@@ -1623,5 +1735,42 @@ mod tests {
         }
         sleep(Duration::seconds(1).to_std().unwrap()).await;
         assert!(!manager.is_invalid());
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_scan_stage() {
+        let builder = Memory::default().root("/tmp");
+        let operator = Arc::new(Operator::new(builder).unwrap().finish());
+        let uploader = NormalUploader::new(operator.clone(), None);
+        let dir = tempdir().unwrap();
+        let mut config = default_config();
+        config.writeback = true;
+
+        {
+            let path = dir.path().join(CACHE_STAGE_DIR).join("chunks/0/0");
+            tokio::fs::create_dir_all(path.as_path())
+                .await
+                .expect("create stage dir failed");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(path.join("123_0_4"))
+                .await
+                .expect("create stage file failed");
+            file.write_all(b"good")
+                .await
+                .expect("write stage file failed");
+            file.sync_all().await.expect("sync stage file failed");
+        }
+
+        
+        CacheStore::new(&config, dir.into_path(), 1 << 30, uploader)
+            .await
+            .expect("create new cache store failed");
+        sleep(std::time::Duration::from_millis(50)).await; // wait for scan to finish
+        let reader = operator.reader("chunks/0/0/123_0_4").await.expect("upload stage file failed");
+        let data = reader.read(0..4).await.unwrap().to_vec();
+        assert_eq!(data, b"good");
     }
 }

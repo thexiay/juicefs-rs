@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use opendal::Buffer;
-use snafu::whatever;
+use snafu::{whatever, ResultExt};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
@@ -15,7 +15,10 @@ use tokio::{
 };
 use tracing::error;
 
-use crate::{cache::DiskEvent, error::Result};
+use crate::{
+    cache::DiskEvent,
+    error::{IoDetailSnafu, Result},
+};
 
 const CHECKSUM_BLOCK: u64 = 32 << 10; // 32KB
 
@@ -115,7 +118,9 @@ impl FileBuffer {
             Err(e) if e.is_io_error() => Some(DiskEvent::IOError),
             _ => None,
         };
-        if let Some(event) = event && let Some(notifier) = &self.disk_event_notifier {
+        if let Some(event) = event
+            && let Some(notifier) = &self.disk_event_notifier
+        {
             notifier
                 .send(event)
                 .await
@@ -139,7 +144,8 @@ impl FileBuffer {
             whatever!("read out of range")
         }
 
-        let mut file = File::open(self.as_path()).await?;
+        let mut file = File::open(self.as_path())
+            .await?;
         const CS_BLOCK: usize = CHECKSUM_BLOCK as usize;
         let (read, check, slice) = match self.checksim_level {
             ChecksumLevel::None => (off..off + len, None, 0..len),

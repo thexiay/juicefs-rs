@@ -10,12 +10,15 @@ use std::{future::Future, sync::Arc};
 
 use crate::{buffer::FileBuffer, cached_store::Config, error::Result, uploader::{NormalUploader, Uploader}};
 
-pub type TotalAndUsed = (i64, i64);
+pub type CacheCntAndSize = (i64, i64);
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub struct CacheKey {
+    /// slice id
     id: u64,
+    /// block index
     indx: usize,
+    /// cache block size
     size: usize,
 }
 
@@ -58,6 +61,7 @@ pub trait CacheManager: Send + Sync + 'static {
     // ----------------- Cache API -----------------
     /// Cache a page.
     /// Put a page don't mean to persist it immediately. It may be staged to disk first.
+    /// If `force` is true, it will make sure cache will be ok
     fn put(
         &self,
         key: &CacheKey,
@@ -76,7 +80,7 @@ pub trait CacheManager: Send + Sync + 'static {
 
     /// --------------- Metadata API ---------------
     /// Returns the number of cached items and the total size of the cache
-    fn stats(&self) -> TotalAndUsed;
+    fn stats(&self) -> CacheCntAndSize;
 
     /// Cost memory
     fn used_memory(&self) -> i64;
@@ -153,7 +157,7 @@ impl CacheManager for CacheManagerImpl {
         }
     }
 
-    fn stats(&self) -> TotalAndUsed {
+    fn stats(&self) -> CacheCntAndSize {
         match self {
             CacheManagerImpl::Disk(d) => d.stats(),
         }

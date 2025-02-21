@@ -1,3 +1,5 @@
+use std::backtrace::Backtrace;
+
 use snafu::{FromString, GenerateImplicitData, Snafu};
 use tracing::Span;
 
@@ -24,7 +26,14 @@ pub struct StorageError {
 #[snafu(visibility(pub(crate)))]
 pub enum StorageErrorEnum {
     #[snafu(display("IO error: {}", source), context(false))]
-    IoError { source: std::io::Error },
+    IoError { 
+        source: std::io::Error,
+    },
+    #[snafu(display("IO error: {}", source))]
+    IoDetailError { 
+        source: std::io::Error,
+        path: Option<String>,
+    },
     #[snafu(display("Opendal IO error: {}", source), context(false))]
     ObjectIoError { source: opendal::Error },
     #[snafu(display("Disk is unstable, limit operation during this time"))]

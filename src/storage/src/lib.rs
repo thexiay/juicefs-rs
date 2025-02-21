@@ -2,6 +2,8 @@
 #![feature(async_closure)]
 #![feature(async_fn_traits)]
 #![feature(let_chains)]
+#![feature(never_type)]
+#![feature(test)]
 
 pub mod api;
 pub mod error;

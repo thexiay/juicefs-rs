@@ -37,6 +37,7 @@ pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^chunks/\d+/\d+/(\d+)_(\d+)_(\d+)$").unwrap());
 
 // Config contains options for cachedStore
+#[derive(Clone)]
 pub struct Config {
     pub cache_dirs: Vec<PathBuf>,
     pub cache_file_mode: Permissions,
@@ -260,11 +261,11 @@ impl SliceReader for RSlice {
                 return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
             }
 
-            let indx = self.block_index(off);
-            let boff = off % self.conf.max_block_size;
-            let block_size = self.block_size(indx);
-            assert!(block_size > boff);
-            let block_avail_size = block_size - boff;
+            let idx = self.block_index(off);
+            let b_off = off % self.conf.max_block_size;
+            let block_size = self.block_size(idx);
+            assert!(block_size > b_off);
+            let block_avail_size = block_size - b_off;
             // read beyond current block page
             if len > block_avail_size {
                 let mut got = 0;
@@ -291,14 +292,16 @@ impl SliceReader for RSlice {
 
             // read current block page
             // read data from cache if cache is enable
-            let key = self.key(indx);
+            let key = self.key(idx);
             let key_path = key.to_path(self.conf.is_hash_prefix);
             match self.cache_manager.get(&key).await {
                 Ok(Some(Either::Left(p))) => {
-                    return Ok(p.slice(0..min(len, p.len())).into());
+                    assert!(p.len() > b_off);
+                    return Ok(p.slice(b_off..min(len, p.len() - b_off)).into());
                 }
                 Ok(Some(Either::Right(mut p))) => {
-                    return Ok(p.read_at(0, min(len, p.len())).await?);
+                    assert!(p.len() > b_off);
+                    return Ok(p.read_at(b_off, min(len, p.len() - b_off)).await?);
                 }
                 Err(e) => {
                     self.cache_manager.remove(&key).await;
@@ -310,7 +313,7 @@ impl SliceReader for RSlice {
             // read from object storage
             if self.should_random_partial_read(off, len) {
                 let reader = self.storage.reader(&key_path).await?;
-                let range = boff as u64..(boff + len) as u64;
+                let range = b_off as u64..(b_off + len) as u64;
                 match reader.read(range).await {
                     Ok(buffer) => return Ok(buffer),
                     // fallback to full read
@@ -324,7 +327,7 @@ impl SliceReader for RSlice {
                         .await
                 })
                 .await?;
-            Ok(cache.slice(boff..cache.len()).into())
+            Ok(cache.slice(b_off..cache.len()).into())
         }
     }
 }
@@ -438,16 +441,26 @@ impl SliceWriter for WSlice {
             if start >= self.uploaded_len && end <= offset {
                 if !self.block_pages[i].is_empty() {
                     let block_len = self.block_size(i);
-                    let key_path = self.key(i).to_path(self.conf.is_hash_prefix);
+                    let cache_key = self.key(i);
+                    let cache_key_path = cache_key.to_path(self.conf.is_hash_prefix);
                     let block = std::mem::take(&mut self.block_pages[i])
                         .into_iter()
                         .map(|a| a.freeze())
                         .flatten()
                         .collect::<Buffer>()
                         .slice(0..block_len);
+
                     let uploader = self.uploader.clone();
+                    let cache_manager = self.cache_manager.clone();
+                    let should_cache = block.len() < self.conf.max_block_size;
                     self.pengind_upload_tasks
-                        .spawn(async move { uploader.upload(&key_path, block).await });
+                        .spawn(async move { 
+                            if should_cache {
+                                let _ = cache_manager.put(&cache_key, Either::Left(block.clone()), false).await;
+                            }
+                            
+                            uploader.upload(&cache_key_path, block).await 
+                        });
                 }
                 self.uploaded_len = end;
             }
@@ -629,9 +642,10 @@ impl ChunkStore for CachedStore {
 mod test {
     use std::sync::Arc;
 
+    use chrono::Duration;
     use opendal::{services::Memory, Buffer, Operator};
     use tempfile::tempdir;
-    use tokio::{task::JoinSet, time::sleep};
+    use tokio::{fs::OpenOptions, io::AsyncWriteExt, task::JoinSet, time::sleep};
     use tracing_test::traced_test;
 
     use crate::{
@@ -643,6 +657,11 @@ mod test {
     };
 
     use super::CachedStore;
+
+    fn new_op() -> Operator {
+        let builder = Memory::default().root("/tmp");
+        Operator::new(builder).unwrap().finish()
+    }
 
     async fn new_cached_store(config: Config, op: Operator) -> Result<Arc<CachedStore>> {
         let operator = Arc::new(op);
@@ -730,8 +749,7 @@ mod test {
     #[traced_test]
     #[tokio::test]
     async fn test_store_default() {
-        let builder = Memory::default().root("/tmp");
-        let op = Operator::new(builder).unwrap().finish();
+        let op = new_op();
         let dir = tempdir().unwrap();
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
@@ -748,27 +766,156 @@ mod test {
         assert_eq!(stats.1, 0);
     }
 
-    #[traced_test]
-    #[tokio::test]
+    // todo
     async fn test_store_mem_cache() {}
 
-    #[traced_test]
-    #[tokio::test]
+    // todo
     async fn test_store_compressed() {}
 
-    #[traced_test]
-    #[tokio::test]
+    // todo
     async fn test_store_limited() {}
 
     #[traced_test]
     #[tokio::test]
-    async fn test_store_full() {}
+    async fn test_store_full() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.free_space = 0.9999;
+        
+        let store = new_cached_store(config, op)
+            .await
+            .expect("create chunk store failed");
+        test_store(store.clone()).await;
+    }
 
     #[traced_test]
     #[tokio::test]
-    async fn test_small_buffer() {}
+    async fn test_small_buffer() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.buffer_size = 1 << 20;
+        
+        let store = new_cached_store(config, op)
+            .await
+            .expect("create chunk store failed");
+        test_store(store.clone()).await;
+    }
 
     #[traced_test]
     #[tokio::test]
-    async fn test_store_async() {}
+    async fn test_write_back_no_delay() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.writeback = true;
+        
+        let store = new_cached_store(config, op.clone())
+            .await
+            .expect("create chunk store failed");
+        // because no deplay, so wirte data will be read immediately
+        test_store(store.clone()).await;
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_write_back_delayed() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.writeback = true;
+        config.upload_delay = Some(Duration::milliseconds(200));
+
+        let store = new_cached_store(config, op.clone())
+            .await
+            .expect("create chunk store failed");
+        sleep(std::time::Duration::from_secs(1)).await; // wait scan cache finished
+        // because write data will be cached, so wirte data will be read immediately
+        test_store(store.clone()).await;
+
+        forget_slice(store.clone(), 10, 1024).await.expect("forget slice failed");
+        sleep(std::time::Duration::from_secs(1)).await; // wait upload finished
+        op.stat("chunks/0/0/10_0_1024").await.expect("head object 10_0_1024 failed failed");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_multi_buckets() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.is_hash_prefix = true;
+        
+        let store = new_cached_store(config, op.clone())
+            .await
+            .expect("create chunk store failed");
+        test_store(store.clone()).await;
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_fill_cache() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.cache_size = 10 << 20;
+        config.free_space = 0.01;
+
+        let store = new_cached_store(config.clone(), op.clone())
+            .await
+            .expect("create chunk store failed");
+
+        let block_size = config.max_block_size;
+        forget_slice(store.clone(), 10, 1024).await.expect("forget slice failed");
+        forget_slice(store.clone(), 11, block_size).await.expect("forget slice failed");
+        sleep(std::time::Duration::from_millis(100)).await; // wait for cache flush to disk
+        let stats = store.cache_manager.stats();
+        assert_eq!(stats.0, 1, "10_0_1024 should be cache");
+        assert_eq!(stats.1, 1024 + 4096, "10_0_1024 should be cache(with 4096 padding)");
+
+        store.fill_cache(10, 1024).await.expect("fill cache failed");
+        store.fill_cache(11, block_size as u32).await.expect("fill cache failed");
+        sleep(std::time::Duration::from_secs(1)).await;
+        let stats = store.cache_manager.stats();
+        assert_eq!(stats.0, 2, "10_0_1024 and 11_0_bsize should be cache");
+        assert_eq!(stats.1, 1024 + 4096 + block_size as i64 + 4096, "10_0_1024 and 11_0_bsize should be cache");
+
+        // check
+        let miss_bytes = store.check_cache(10, 1024).await.expect("check cache failed");
+        assert_eq!(miss_bytes, 0);
+
+        let miss_bytes = store.check_cache(11, block_size as u32).await.expect("check cache failed");
+        assert_eq!(miss_bytes, 0);
+
+        store.evict_cache(11, block_size as u32).await.expect("evict cache failed");
+        let stats = store.cache_manager.stats();
+        assert_eq!(stats.0, 1, "10_0_1024 should be cache");
+        assert_eq!(stats.1, 1024 + 4096, "10_0_1024 should be cache(with 4096 padding)");
+
+        // check again
+        let miss_bytes = store.check_cache(11, block_size as u32).await.expect("check cache failed");
+        assert_eq!(miss_bytes, block_size as u64);
+    }
+
+    #[bench]
+    async fn bench_store(b: &mut tokio::test::Bencher) {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        
+        let store = new_cached_store(config, op.clone())
+            .await
+            .expect("create chunk store failed");
+        b.iter(|| {
+            test_store(store.clone());
+        });
+    }
 }
