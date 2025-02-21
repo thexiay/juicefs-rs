@@ -114,9 +114,9 @@ pub enum CacheManagerImpl {
 }
 
 impl CacheManagerImpl {
-    pub async fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
+    pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
         let disk =
-            DiskCacheManager::new(config, uploader).await?;
+            DiskCacheManager::new(config, uploader)?;
         Ok(CacheManagerImpl::Disk(disk))
     }
 }

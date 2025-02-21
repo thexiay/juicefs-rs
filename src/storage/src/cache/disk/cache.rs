@@ -2,9 +2,9 @@ use std::{
     cmp::{min, Reverse},
     collections::{BinaryHeap, HashMap},
     fs::Permissions,
-    io::ErrorKind,
+    io::{ErrorKind, Read, Write},
     ops::AsyncFnOnce,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -19,19 +19,20 @@ use dashmap::DashMap;
 use either::Either;
 use futures::{stream, StreamExt, TryFutureExt};
 use hashring::HashRing;
+use humansize::{format_size, format_size_i};
 use nix::sys::stat::stat;
 use opendal::Buffer;
 use parking_lot::{Mutex, RwLock};
 use snafu::{whatever, OptionExt, ResultExt};
 use tokio::{
     fs::{self},
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncWriteExt},
     sync::{mpsc::{channel, error::TrySendError, Receiver, Sender}, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument::WithSubscriber, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -64,9 +65,7 @@ static MAX_DURATION_TO_DOWN: Duration = Duration::minutes(30);
 
 static STATE_CHECK_DURATION: Duration = Duration::minutes(1);
 static PROBE_DURATION: Duration = Duration::milliseconds(500);
-const PROBE_DIR: &str = "probe";
 const PROBE_DATA: [u8; 3] = [1, 2, 3];
-const PROBE_BUFF: [u8; 3] = [0; 3];
 
 /// A cache manager that manage lots of [ `DiskCache` ] keyed by a object key
 pub struct DiskCacheManager {
@@ -75,7 +74,7 @@ pub struct DiskCacheManager {
 }
 
 impl DiskCacheManager {
-    pub async fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
+    pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
         if let Some(upload_hours) = config.upload_hours {
             if upload_hours.0 != upload_hours.1 {
                 info!("background upload at {}:00 ~ {}:00", upload_hours.0, upload_hours.1)
@@ -84,7 +83,7 @@ impl DiskCacheManager {
         // TODO: use env to replace global default config
         let cache_dirs = if config.auto_create {
             for dir in config.cache_dirs.iter() {
-                fs::create_dir_all(dir).await?;
+                std::fs::create_dir_all(dir)?;
             }
             config.cache_dirs.clone()
         } else {
@@ -98,14 +97,19 @@ impl DiskCacheManager {
         if cache_dirs.is_empty() {
             whatever!("no cache dir existed, use memory cache instead");
         }
-        let dir_cache_size = config.cache_size / cache_dirs.len() as u64;
+        let disk_capacity = config.cache_size / cache_dirs.len() as u64;
+        let pending_cache_capacity = (config.buffer_size as f32 * 0.2 / config.max_block_size as f32 / cache_dirs.len() as f32) as usize;
+        if pending_cache_capacity == 0 {
+            warn!("no pending cache capacity, use sync to flush cache, please notice the performance");
+        }
         let mut cache_stores = ConsistentHashDiskCache {
             hash_ring: HashRing::new(),
             caches: HashMap::new(),
         };
+        
         for dir in cache_dirs {
             let store =
-                CacheStore::new(&config, dir.clone(), dir_cache_size, uploader.clone()).await?;
+                CacheStore::new(&config, dir.clone(), disk_capacity, pending_cache_capacity, uploader.clone())?;
             cache_stores.hash_ring.add(dir.clone());
             cache_stores.caches.insert(dir.clone(), store);
         }
@@ -379,23 +383,24 @@ pub struct CacheStore {
 }
 
 impl CacheStore {
-    pub async fn new(
+    pub fn new(
         config: &Config,
-        dir: PathBuf,
-        max_disk_size: u64,
+        disk_dir: PathBuf,
+        disk_capacity: u64,
+        pending_cache_capacity: usize,
         uploader: NormalUploader,
     ) -> Result<Arc<Self>> {
-        let min_disk_free_ratio = if is_in_root_volumn(dir.as_path()) && config.free_space < 0.2 {
+        let min_disk_free_ratio = if is_in_root_volumn(disk_dir.as_path()) && config.free_space < 0.2 {
             info!(
                 "cache directory {} is in root volume, keep 20% space free",
-                dir.as_path().display()
+                disk_dir.as_path().display()
             );
             0.2
         } else {
             config.free_space
         };
         // TODO: because here cann't determine buffer size, give a fixed channel for pending cache
-        let (pending_cache_sender, pending_cache_reveiver) = channel::<(CacheKey, Buffer)>(1024);
+        let (pending_cache_sender, pending_cache_reveiver) = channel::<(CacheKey, Buffer)>(pending_cache_capacity);
         let state = if config.writeback {
             DiskState::Unchanged
         } else {
@@ -432,11 +437,11 @@ impl CacheStore {
             state: RwLock::new(state),
             used_disk_page: AtomicI64::default(),
             disk_caches: Mutex::new(HashMap::new()),
-            max_disk_space: max_disk_size,
+            max_disk_space: disk_capacity,
             checksum_level: config.cache_checksum.clone(),
             disk_event_sender: disk_event_sender,
             min_disk_free_ratio,
-            dir,
+            dir: disk_dir.clone(),
             cache_expire: config.cache_expire,
             mode: config.cache_file_mode.clone(),
             scanning: AtomicBool::new(false),
@@ -447,27 +452,31 @@ impl CacheStore {
             eviction: config.cache_eviction,
             uploader: uploader,
         };
-        let lock_file = cache_store.lock_path();
-        let raw_id = cache_store
-            .check_fs_op(async move || {
-                let mut file = fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .read(true)
-                    .mode(config.cache_file_mode.mode())
-                    .open(lock_file)
-                    .await?;
-                let mut raw_id = String::new();
-                file.read_to_string(&mut raw_id).await?;
-                if raw_id.is_empty() {
-                    let new_raw_id = Uuid::new_v4().to_string();
-                    file.write_all(new_raw_id.as_bytes()).await?;
-                    Ok(new_raw_id)
-                } else {
-                    Ok(raw_id)
-                }
-            })
-            .await?;
+        let (br, fr) = cache_store.stats_free_ratio();
+        info!("Disk cache ({}): capacity ({}), free ratio {min_disk_free_ratio}%, used ratio - [space {}%, inode {}%, max pending pages space {}",
+            disk_dir.display(),
+            format_size(disk_capacity, humansize::DECIMAL),
+            format!("{:.2}", (1.0 - br) * 100.0),
+            format!("{:.2}", (1.0 - fr) * 100.0),
+            pending_cache_capacity,
+        );
+        let raw_id = {
+            let mut lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .mode(config.cache_file_mode.mode())
+                .open(cache_store.lock_path())?;
+            let mut raw_id = String::new();
+            lock_file.read_to_string(&mut raw_id)?;
+            if raw_id.is_empty() {
+                let new_raw_id = Uuid::new_v4().to_string();
+                lock_file.write_all(new_raw_id.as_bytes())?;
+                new_raw_id
+            } else {
+                raw_id
+            }
+        };
         cache_store.id = raw_id;
         let cache_store = Arc::new(cache_store);
         cache_store
@@ -587,13 +596,14 @@ impl CacheStore {
                     }
                     debug!("Found staging block: {path:?}");
 
-                    // 这里如果报错，只记录日志即可
-                    let mut file_buffer = FileBuffer::new(path, cache_key.size, self.checksum_level.clone(), self.disk_event_sender.clone()).unwrap();
-                    let buffer = file_buffer.read_at(0, file_buffer.len()).await.unwrap();
-                    self.uploader.upload(&cache_key_path, buffer).await.unwrap();
-
-                    count += 1;
-                    usage += cache_key.size;
+                    if let Ok(mut file_buffer) = FileBuffer::new(path, cache_key.size, self.checksum_level.clone(), self.disk_event_sender.clone()) 
+                            && let Ok(buffer) = file_buffer.read_at(0, file_buffer.len()).await
+                            && let Ok(_) = self.uploader.upload(&cache_key_path, buffer).await {
+                        count += 1;
+                        usage += cache_key.size;    
+                    } else {
+                        error!("Failed to upload staging block: {path:?}");
+                    }
                 }
             }
             info!("Found {count} staging blocks ({usage}) in {:?} with {}", cache_prefix, Local::now() - start);  
@@ -1261,12 +1271,7 @@ impl CacheStore {
     }
 
     async fn remove_stage(&self, key: &CacheKey) -> Result<()> {
-        match self
-            .check_fs_op(async || {
-                fs::remove_file(self.stage_path(&key.to_path(self.hash_prefix)).as_path()).await
-            })
-            .await
-        {
+        match fs::remove_file(self.stage_path(&key.to_path(self.hash_prefix)).as_path()).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -1451,7 +1456,7 @@ impl CacheManager for CacheStore {
             {
                 warn!("Remove cache file {:?} failed: {:?}", cache_path, e);
             }
-            if let Err(e) = self.remove_stage(key).await {
+            if let Err(e) = fs::remove_file(self.stage_path(&key.to_path(self.hash_prefix)).as_path()).await && e.kind() != io::ErrorKind::NotFound {
                 warn!(
                     "Remove cache stage file {:?} failed: {:?}",
                     self.stage_path(&key.to_path(self.hash_prefix)),
@@ -1566,7 +1571,7 @@ mod tests {
             .collect::<Vec<_>>();
         let operator = Operator::new(()).unwrap().finish();
         let uploader = NormalUploader::new(Arc::new(operator), None);
-        let cache_manager = DiskCacheManager::new(&config, uploader).await.unwrap();
+        let cache_manager = DiskCacheManager::new(&config, uploader).unwrap();
         {
             let cache_stores = cache_manager.cache_stores.read();
             assert_eq!(cache_stores.caches.len(), dir_num as usize);
@@ -1648,8 +1653,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let operator = Operator::new(()).unwrap().finish();
         let uploader = NormalUploader::new(Arc::new(operator), None);
-        CacheStore::new(&default_config(), dir.into_path(), 1 << 30, uploader)
-            .await
+        CacheStore::new(&default_config(), dir.into_path(), 1 << 30, 1024, uploader)
             .expect("create new cache store failed");
     }
 
@@ -1695,7 +1699,7 @@ mod tests {
         config.cache_dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf(), dir3.path().to_path_buf()];
         let operator = Operator::new(()).unwrap().finish();
         let uploader = NormalUploader::new(Arc::new(operator), None);
-        let manager = DiskCacheManager::new(&config, uploader).await.expect("create disk cache manager failed");
+        let manager = DiskCacheManager::new(&config, uploader).expect("create disk cache manager failed");
         assert!(!manager.is_invalid());
         {
             let cache_stores = manager.cache_stores.read();
@@ -1765,8 +1769,7 @@ mod tests {
         }
 
         
-        CacheStore::new(&config, dir.into_path(), 1 << 30, uploader)
-            .await
+        CacheStore::new(&config, dir.into_path(), 1 << 30, 1024, uploader)
             .expect("create new cache store failed");
         sleep(std::time::Duration::from_millis(50)).await; // wait for scan to finish
         let reader = operator.reader("chunks/0/0/123_0_4").await.expect("upload stage file failed");

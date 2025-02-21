@@ -28,9 +28,15 @@ crc32fast = { workspace = true }
 nix = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }
+humansize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 rand = { workspace = true }
 assert_matches = { workspace = true }
 tracing-test = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "bench_cache_store_read"
+harness = false

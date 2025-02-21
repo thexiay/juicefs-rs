@@ -54,3 +54,5 @@ either = "1.11"
 tempfile = "3"
 assert_matches = "1"
 walkdir = "2"
+criterion = { version = "0.5", features = ["async_futures", "async_tokio"] }
+humansize = "2.1"

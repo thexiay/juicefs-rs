@@ -2,7 +2,8 @@ use std::{future::Future, sync::Arc};
 
 use opendal::{Buffer, Operator};
 
-use crate::{cache::CacheManagerImpl, cached_store::{CachedStore, Config}, error::Result, uploader::NormalUploader};
+use crate::{cached_store::CachedStore, error::Result, uploader::NormalUploader};
+pub use crate::cached_store::Config as Config;
 
 pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
@@ -78,10 +79,10 @@ pub trait ChunkStore: Send + Sync {
     fn set_update_limit(&self, upload: i64, download: i64);
 }
 
-pub async fn new_chunk_store(config: Config, operator: Operator) -> Result<impl ChunkStore + 'static> {
+pub fn new_chunk_store(config: Config, operator: Operator) -> Result<impl ChunkStore + 'static> {
     let operator = Arc::new(operator);
     let uploader = NormalUploader::new(operator.clone(), None);
-    let cache_store = CachedStore::new(operator, config, uploader).await?;
+    let cache_store = CachedStore::new(operator, config, uploader)?;
     Ok(cache_store)
     // todo: add switch disk cache manager to mem cache manager
 }

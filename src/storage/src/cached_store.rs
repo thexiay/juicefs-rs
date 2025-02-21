@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{fs::Permissions, future::Future, sync::Arc};
 
-use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{Duration, Utc};
 use either::Either;
@@ -79,13 +78,13 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             cache_dirs: vec![env::temp_dir().join("cache")],
-            cache_file_mode: Permissions::from_mode(0o666),
+            cache_file_mode: Permissions::from_mode(0o600),
             cache_size: 10 << 20, // 10MB
             cache_checksum: ChecksumLevel::None,
             cache_eviction: false,
             cache_scan_interval: Duration::seconds(300),
             cache_expire: None,
-            free_space: 0.0,
+            free_space: 0.1,
             auto_create: false,
             compress: None,
             max_upload: 1,
@@ -520,12 +519,12 @@ pub struct CachedStore {
 }
 
 impl CachedStore {
-    pub async fn new(
+    pub fn new(
         storage: Arc<Operator>,
         config: Config,
         uploader: NormalUploader,
     ) -> Result<Self> {
-        let cache_manager = Arc::new(CacheManagerImpl::new(&config, uploader).await?);
+        let cache_manager = Arc::new(CacheManagerImpl::new(&config, uploader)?);
         Ok(CachedStore {
             storage,
             cache_manager: cache_manager.clone(),
@@ -663,10 +662,10 @@ mod test {
         Operator::new(builder).unwrap().finish()
     }
 
-    async fn new_cached_store(config: Config, op: Operator) -> Result<Arc<CachedStore>> {
+    fn new_cached_store(config: Config, op: Operator) -> Result<Arc<CachedStore>> {
         let operator = Arc::new(op);
         let uploader = NormalUploader::new(operator.clone(), None);
-        let cache_store = CachedStore::new(operator, config, uploader).await?;
+        let cache_store = CachedStore::new(operator, config, uploader)?;
         Ok(Arc::new(cache_store))
     }
 
@@ -755,7 +754,6 @@ mod test {
         config.cache_dirs = vec![dir.path().to_path_buf()];
 
         let store = new_cached_store(config, op)
-            .await
             .expect("create chunk store failed");
         test_store(store.clone()).await;
 
@@ -785,7 +783,6 @@ mod test {
         config.free_space = 0.9999;
         
         let store = new_cached_store(config, op)
-            .await
             .expect("create chunk store failed");
         test_store(store.clone()).await;
     }
@@ -800,7 +797,6 @@ mod test {
         config.buffer_size = 1 << 20;
         
         let store = new_cached_store(config, op)
-            .await
             .expect("create chunk store failed");
         test_store(store.clone()).await;
     }
@@ -815,7 +811,6 @@ mod test {
         config.writeback = true;
         
         let store = new_cached_store(config, op.clone())
-            .await
             .expect("create chunk store failed");
         // because no deplay, so wirte data will be read immediately
         test_store(store.clone()).await;
@@ -832,7 +827,6 @@ mod test {
         config.upload_delay = Some(Duration::milliseconds(200));
 
         let store = new_cached_store(config, op.clone())
-            .await
             .expect("create chunk store failed");
         sleep(std::time::Duration::from_secs(1)).await; // wait scan cache finished
         // because write data will be cached, so wirte data will be read immediately
@@ -853,7 +847,6 @@ mod test {
         config.is_hash_prefix = true;
         
         let store = new_cached_store(config, op.clone())
-            .await
             .expect("create chunk store failed");
         test_store(store.clone()).await;
     }
@@ -869,7 +862,6 @@ mod test {
         config.free_space = 0.01;
 
         let store = new_cached_store(config.clone(), op.clone())
-            .await
             .expect("create chunk store failed");
 
         let block_size = config.max_block_size;
@@ -902,20 +894,5 @@ mod test {
         // check again
         let miss_bytes = store.check_cache(11, block_size as u32).await.expect("check cache failed");
         assert_eq!(miss_bytes, block_size as u64);
-    }
-
-    #[bench]
-    async fn bench_store(b: &mut tokio::test::Bencher) {
-        let op = new_op();
-        let dir = tempdir().unwrap();
-        let mut config = new_config();
-        config.cache_dirs = vec![dir.path().to_path_buf()];
-        
-        let store = new_cached_store(config, op.clone())
-            .await
-            .expect("create chunk store failed");
-        b.iter(|| {
-            test_store(store.clone());
-        });
     }
 }
