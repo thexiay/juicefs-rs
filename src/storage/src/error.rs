@@ -26,11 +26,9 @@ pub struct StorageError {
 #[snafu(visibility(pub(crate)))]
 pub enum StorageErrorEnum {
     #[snafu(display("IO error: {}", source), context(false))]
-    IoError { 
-        source: std::io::Error,
-    },
+    IoError { source: std::io::Error },
     #[snafu(display("IO error: {}", source))]
-    IoDetailError { 
+    IoDetailError {
         source: std::io::Error,
         path: Option<String>,
     },
@@ -62,9 +60,9 @@ impl StorageError {
 
     pub fn is_eof(&self) -> bool {
         matches!(
-            self.source, 
+            self.source,
             StorageErrorEnum::IoError {
-                ref source 
+                ref source
             } if source.kind() == std::io::ErrorKind::UnexpectedEof
         )
     }

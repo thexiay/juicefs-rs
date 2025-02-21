@@ -5,8 +5,8 @@ use either::Either;
 use opendal::{Buffer, Operator};
 
 use crate::buffer::FileBuffer;
-use crate::error::Result;
 use crate::compress::Compressor;
+use crate::error::Result;
 
 #[async_trait]
 pub trait Uploader: Send + Sync + 'static {
@@ -20,10 +20,7 @@ pub struct NormalUploader {
 }
 
 impl NormalUploader {
-    pub fn new (
-        storage: Arc<Operator>,
-        compressor: Option<Arc<Box<dyn Compressor>>>,
-    ) -> Self {
+    pub fn new(storage: Arc<Operator>, compressor: Option<Arc<Box<dyn Compressor>>>) -> Self {
         NormalUploader {
             storage,
             compressor,

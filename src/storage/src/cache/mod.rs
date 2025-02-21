@@ -8,7 +8,12 @@ use either::Either;
 use opendal::Buffer;
 use std::{future::Future, sync::Arc};
 
-use crate::{buffer::FileBuffer, cached_store::Config, error::Result, uploader::{NormalUploader, Uploader}};
+use crate::{
+    buffer::FileBuffer,
+    cached_store::Config,
+    error::Result,
+    uploader::{NormalUploader, Uploader},
+};
 
 pub type CacheCntAndSize = (i64, i64);
 
@@ -115,8 +120,7 @@ pub enum CacheManagerImpl {
 
 impl CacheManagerImpl {
     pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
-        let disk =
-            DiskCacheManager::new(config, uploader)?;
+        let disk = DiskCacheManager::new(config, uploader)?;
         Ok(CacheManagerImpl::Disk(disk))
     }
 }

@@ -8,11 +8,11 @@
 pub mod api;
 pub mod error;
 
+mod buffer;
 mod cache;
 mod cached_store;
+mod compress;
 mod pre_fetcher;
 mod single_flight;
-mod compress;
-mod buffer;
 mod uploader;
 mod utils;

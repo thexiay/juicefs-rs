@@ -144,8 +144,7 @@ impl FileBuffer {
             whatever!("read out of range")
         }
 
-        let mut file = File::open(self.as_path())
-            .await?;
+        let mut file = File::open(self.as_path()).await?;
         const CS_BLOCK: usize = CHECKSUM_BLOCK as usize;
         let (read, check, slice) = match self.checksim_level {
             ChecksumLevel::None => (off..off + len, None, 0..len),

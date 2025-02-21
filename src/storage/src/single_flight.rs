@@ -1,11 +1,11 @@
 use std::{collections::HashMap, ops::AsyncFnOnce, sync::Arc};
 
+use crate::{cache::CacheKey, error::Result};
 use bytes::Bytes;
 use opendal::Buffer;
 use parking_lot::{Mutex, RwLock};
 use snafu::whatever;
 use tokio::sync::Notify;
-use crate::{cache::CacheKey, error::Result};
 
 struct Request {
     /// This lock to modify the val when necessary
@@ -13,7 +13,7 @@ struct Request {
     wait_group: Notify,
 }
 
-/// SingleFilght ensure that only one request is doing the real work event if 
+/// SingleFilght ensure that only one request is doing the real work event if
 /// there are many requests at the same time, those work all return same result.
 pub struct SingleFlight {
     /// this lock to make sure the request is unique
@@ -38,7 +38,10 @@ impl SingleFlight {
             let mut lock = self.requests.lock();
             if let Some(request) = lock.get(key) {
                 _waiter_holder = Some(request.clone());
-                (request.clone(), _waiter_holder.as_ref().map(|r| r.wait_group.notified()))
+                (
+                    request.clone(),
+                    _waiter_holder.as_ref().map(|r| r.wait_group.notified()),
+                )
             } else {
                 let request = Arc::new(Request {
                     val: RwLock::new(Ok(Buffer::new())),
@@ -48,7 +51,7 @@ impl SingleFlight {
                 (request, None)
             }
         };
-        
+
         if let Some(waiter) = waiter {
             waiter.await;
         } else {
@@ -57,21 +60,27 @@ impl SingleFlight {
                 let mut val = request.val.write();
                 *val = result;
                 request.wait_group.notify_waiters();
-            } 
+            }
             self.requests.lock().remove(key);
         }
 
         let result = request.val.read();
         match &*result {
             Ok(bytes) => Ok(bytes.clone()),
-            Err(e) => whatever!("single flight error: {}", e),  // TODO: clone storage Error
+            Err(e) => whatever!("single flight error: {}", e), // TODO: clone storage Error
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, sync::{atomic::{AtomicU32, Ordering}, Arc}};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
+    };
 
     use opendal::Buffer;
     use rand::Rng;
@@ -79,7 +88,6 @@ mod test {
     use tracing_test::traced_test;
 
     use crate::{cache::CacheKey, single_flight::SingleFlight};
-
 
     #[traced_test]
     #[tokio::test]
@@ -97,23 +105,28 @@ mod test {
             let n = n.clone();
             let barrier = barrier.clone();
             tasks.spawn(async move {
-                let buffer = controller.execute(&key, async || {
-                    // sleep 500 milliseconds to ensure other requests come in and there exist a pending
-                    // request already
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    n.fetch_add(1, Ordering::SeqCst);
-                    // ensure every routine has different buffer
-                    let mut rng = rand::thread_rng();
-                    let bytes: [u8; 10] = rng.gen();
-                    Ok(Buffer::from(bytes.to_vec()))
-                }).await;
+                let buffer = controller
+                    .execute(&key, async || {
+                        // sleep 500 milliseconds to ensure other requests come in and there exist a pending
+                        // request already
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        n.fetch_add(1, Ordering::SeqCst);
+                        // ensure every routine has different buffer
+                        let mut rng = rand::thread_rng();
+                        let bytes: [u8; 10] = rng.gen();
+                        Ok(Buffer::from(bytes.to_vec()))
+                    })
+                    .await;
                 barrier.wait().await;
                 (i, buffer)
             });
         }
         // wait 100000 goroutines finished
         barrier.wait().await;
-        assert!(n.load(Ordering::SeqCst) == 1000, "singleflight doesn't take effect");
+        assert!(
+            n.load(Ordering::SeqCst) == 1000,
+            "singleflight doesn't take effect"
+        );
 
         while let Some(res) = tasks.join_next().await {
             assert!(res.is_ok());

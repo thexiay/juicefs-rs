@@ -2,15 +2,19 @@ use std::{future::Future, sync::Arc};
 
 use opendal::{Buffer, Operator};
 
+pub use crate::cached_store::Config;
 use crate::{cached_store::CachedStore, error::Result, uploader::NormalUploader};
-pub use crate::cached_store::Config as Config;
 
 pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
 
     /// Read data from [`buffer`], and write data into slice at offset.
     /// This is a overwrite write.
-    fn write_all_at(&mut self, buffer: Buffer, off: usize) -> impl Future<Output = Result<()>> + Send;
+    fn write_all_at(
+        &mut self,
+        buffer: Buffer,
+        off: usize,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Flush data from `0..offset` into storage
     fn spawn_flush_until(&mut self, offset: usize) -> Result<()>;

@@ -10,7 +10,8 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
         Arc, LazyLock,
-    }, u64,
+    },
+    u64,
 };
 
 use async_trait::async_trait;
@@ -27,7 +28,10 @@ use snafu::{whatever, OptionExt, ResultExt};
 use tokio::{
     fs::{self},
     io::{self, AsyncWriteExt},
-    sync::{mpsc::{channel, error::TrySendError, Receiver, Sender}, OwnedSemaphorePermit, Semaphore},
+    sync::{
+        mpsc::{channel, error::TrySendError, Receiver, Sender},
+        OwnedSemaphorePermit, Semaphore,
+    },
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -37,7 +41,7 @@ use uuid::Uuid;
 
 use crate::{
     buffer::{checksum, ChecksumLevel, FileBuffer},
-    cache::{CacheKey, CacheCntAndSize},
+    cache::{CacheCntAndSize, CacheKey},
     cached_store::Config,
     error::{Result, StorageErrorEnum},
     uploader::{NormalUploader, Uploader},
@@ -52,7 +56,8 @@ const CACHE_STAGE_DIR: &str = "rawstaging";
 // disk state const
 static MAX_NUM_IO_ERR_TO_UNSTABLE: u32 = 3;
 static MIN_NUM_IO_SUCC_TO_NORMAL: LazyLock<u32> = LazyLock::new(|| {
-    std::env::var("MIN_NUM_IO_SUCC_TO_NORMAL").unwrap_or("60".to_string())
+    std::env::var("MIN_NUM_IO_SUCC_TO_NORMAL")
+        .unwrap_or("60".to_string())
         .parse()
         .unwrap_or(60)
 });
@@ -77,7 +82,10 @@ impl DiskCacheManager {
     pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
         if let Some(upload_hours) = config.upload_hours {
             if upload_hours.0 != upload_hours.1 {
-                info!("background upload at {}:00 ~ {}:00", upload_hours.0, upload_hours.1)
+                info!(
+                    "background upload at {}:00 ~ {}:00",
+                    upload_hours.0, upload_hours.1
+                )
             }
         }
         // TODO: use env to replace global default config
@@ -98,18 +106,27 @@ impl DiskCacheManager {
             whatever!("no cache dir existed, use memory cache instead");
         }
         let disk_capacity = config.cache_size / cache_dirs.len() as u64;
-        let pending_cache_capacity = (config.buffer_size as f32 * 0.2 / config.max_block_size as f32 / cache_dirs.len() as f32) as usize;
+        let pending_cache_capacity = (config.buffer_size as f32 * 0.2
+            / config.max_block_size as f32
+            / cache_dirs.len() as f32) as usize;
         if pending_cache_capacity == 0 {
-            warn!("no pending cache capacity, use sync to flush cache, please notice the performance");
+            warn!(
+                "no pending cache capacity, use sync to flush cache, please notice the performance"
+            );
         }
         let mut cache_stores = ConsistentHashDiskCache {
             hash_ring: HashRing::new(),
             caches: HashMap::new(),
         };
-        
+
         for dir in cache_dirs {
-            let store =
-                CacheStore::new(&config, dir.clone(), disk_capacity, pending_cache_capacity, uploader.clone())?;
+            let store = CacheStore::new(
+                &config,
+                dir.clone(),
+                disk_capacity,
+                pending_cache_capacity,
+                uploader.clone(),
+            )?;
             cache_stores.hash_ring.add(dir.clone());
             cache_stores.caches.insert(dir.clone(), store);
         }
@@ -390,17 +407,19 @@ impl CacheStore {
         pending_cache_capacity: usize,
         uploader: NormalUploader,
     ) -> Result<Arc<Self>> {
-        let min_disk_free_ratio = if is_in_root_volumn(disk_dir.as_path()) && config.free_space < 0.2 {
-            info!(
-                "cache directory {} is in root volume, keep 20% space free",
-                disk_dir.as_path().display()
-            );
-            0.2
-        } else {
-            config.free_space
-        };
+        let min_disk_free_ratio =
+            if is_in_root_volumn(disk_dir.as_path()) && config.free_space < 0.2 {
+                info!(
+                    "cache directory {} is in root volume, keep 20% space free",
+                    disk_dir.as_path().display()
+                );
+                0.2
+            } else {
+                config.free_space
+            };
         // TODO: because here cann't determine buffer size, give a fixed channel for pending cache
-        let (pending_cache_sender, pending_cache_reveiver) = channel::<(CacheKey, Buffer)>(pending_cache_capacity);
+        let (pending_cache_sender, pending_cache_reveiver) =
+            channel::<(CacheKey, Buffer)>(pending_cache_capacity);
         let state = if config.writeback {
             DiskState::Unchanged
         } else {
@@ -410,21 +429,27 @@ impl CacheStore {
         };
         let (disk_event_sender, disk_event_receiver) = channel::<DiskEvent>(1024);
         let (writer_backer, pending_stage_receiver) = if config.writeback {
-            let (pending_stage_sender, pending_stage_receiver) = channel::<(String, FileBuffer)>(1024);
-            let scan_delayed_interval = if let Some(scan_interval) = config.upload_delay && scan_interval < STATE_CHECK_DURATION {
+            let (pending_stage_sender, pending_stage_receiver) =
+                channel::<(String, FileBuffer)>(1024);
+            let scan_delayed_interval = if let Some(scan_interval) = config.upload_delay
+                && scan_interval < STATE_CHECK_DURATION
+            {
                 warn!("upload delay {scan_interval} is too small and is not recommended.");
                 scan_interval
             } else {
                 info!("upload delay {STATE_CHECK_DURATION}.");
                 STATE_CHECK_DURATION
             };
-            (Some(WriteBacker {
-                pending_stages: pending_stage_sender,
-                delayed_pending_stages: Mutex::new(BinaryHeap::new()),
-                upload_hours: config.upload_hours,
-                upload_delay: config.upload_delay,
-                scan_delayed_interval,
-            }), Some(pending_stage_receiver))
+            (
+                Some(WriteBacker {
+                    pending_stages: pending_stage_sender,
+                    delayed_pending_stages: Mutex::new(BinaryHeap::new()),
+                    upload_hours: config.upload_hours,
+                    upload_delay: config.upload_delay,
+                    scan_delayed_interval,
+                }),
+                Some(pending_stage_receiver),
+            )
         } else {
             (None, None)
         };
@@ -486,15 +511,15 @@ impl CacheStore {
         cache_store
             .clone()
             .spawn_receive_stage(pending_stage_receiver);
-        cache_store
-            .clone()
-            .spawn_upload_stage();
+        cache_store.clone().spawn_upload_stage();
         cache_store.clone().spawn_check_lock_file();
         cache_store.clone().spawn_check_free_space_ratio();
         cache_store.clone().spawn_check_expire();
         cache_store.clone().spawn_repair_cache_item();
         cache_store.clone().spawn_io_err_cnt_check();
-        cache_store.clone().spawn_io_err_receive(disk_event_receiver);
+        cache_store
+            .clone()
+            .spawn_io_err_receive(disk_event_receiver);
         cache_store.clone().spawn_probe_cache_capability();
 
         Ok(cache_store)
@@ -512,7 +537,9 @@ impl CacheStore {
                     if self.max_disk_space > 0
                         && let Ok(file) = self
                             .flush(Path::new(&path), buffer.clone())
-                            .inspect_err(|e| error!("Failed to flush {path:?} into cache disk, {e}"))
+                            .inspect_err(|e| {
+                                error!("Failed to flush {path:?} into cache disk, {e}")
+                            })
                             .await
                     {
                         self.cache(&key, file.len() as i32, Some(Utc::now().timestamp()))
@@ -535,7 +562,7 @@ impl CacheStore {
             if self.write_backer.is_none() {
                 return;
             }
-    
+
             let start = Local::now();
             let one_min_ago = start.to_utc() - Duration::minutes(1);
             let cache_prefix = Path::new(&self.dir).join(CACHE_STAGE_DIR);
@@ -557,10 +584,9 @@ impl CacheStore {
                 };
 
                 let path = entry.path();
-                if entry.file_type().is_dir() || path.to_string_lossy().ends_with(".tmp") { 
+                if entry.file_type().is_dir() || path.to_string_lossy().ends_with(".tmp") {
                     let mtime =
-                        DateTime::from_timestamp(stat.st_mtime, stat.st_atime_nsec as u32)
-                            .unwrap();
+                        DateTime::from_timestamp(stat.st_mtime, stat.st_atime_nsec as u32).unwrap();
                     if mtime < one_min_ago {
                         let del_res = if entry.file_type().is_dir() {
                             fs::remove_dir(path).await
@@ -596,17 +622,26 @@ impl CacheStore {
                     }
                     debug!("Found staging block: {path:?}");
 
-                    if let Ok(mut file_buffer) = FileBuffer::new(path, cache_key.size, self.checksum_level.clone(), self.disk_event_sender.clone()) 
-                            && let Ok(buffer) = file_buffer.read_at(0, file_buffer.len()).await
-                            && let Ok(_) = self.uploader.upload(&cache_key_path, buffer).await {
+                    if let Ok(mut file_buffer) = FileBuffer::new(
+                        path,
+                        cache_key.size,
+                        self.checksum_level.clone(),
+                        self.disk_event_sender.clone(),
+                    ) && let Ok(buffer) = file_buffer.read_at(0, file_buffer.len()).await
+                        && let Ok(_) = self.uploader.upload(&cache_key_path, buffer).await
+                    {
                         count += 1;
-                        usage += cache_key.size;    
+                        usage += cache_key.size;
                     } else {
                         error!("Failed to upload staging block: {path:?}");
                     }
                 }
             }
-            info!("Found {count} staging blocks ({usage}) in {:?} with {}", cache_prefix, Local::now() - start);  
+            info!(
+                "Found {count} staging blocks ({usage}) in {:?} with {}",
+                cache_prefix,
+                Local::now() - start
+            );
         })
     }
 
@@ -619,7 +654,7 @@ impl CacheStore {
             if pending_stages.is_none() {
                 return;
             }
-            
+
             let mut pending_stages = pending_stages.unwrap();
             let write_backer = self.write_backer.as_ref().unwrap();
             while self.available() {
@@ -637,9 +672,7 @@ impl CacheStore {
     }
 
     /// Flush pending stage file into remote storage and cache intevally
-    fn spawn_upload_stage(
-        self: Arc<Self>,
-    ) -> JoinHandle<()> {
+    fn spawn_upload_stage(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
             if self.write_backer.is_none() {
                 return;
@@ -669,18 +702,17 @@ impl CacheStore {
 
                 let mut err_stage = vec![];
                 for Reverse(mut stage) in pending_stages {
-                    let buffer =
-                        match stage.file_buffer.read_at(0, stage.file_buffer.len()).await {
-                            Ok(buffer) => buffer,
-                            Err(e) => {
-                                error!(
-                                    "Failed to read staging file {:?}, {e}",
-                                    stage.file_buffer.as_path()
-                                );
-                                err_stage.push(stage);
-                                continue;
-                            }
-                        };
+                    let buffer = match stage.file_buffer.read_at(0, stage.file_buffer.len()).await {
+                        Ok(buffer) => buffer,
+                        Err(e) => {
+                            error!(
+                                "Failed to read staging file {:?}, {e}",
+                                stage.file_buffer.as_path()
+                            );
+                            err_stage.push(stage);
+                            continue;
+                        }
+                    };
                     match self.uploader.upload(&stage.key, buffer).await {
                         Ok(_) => {
                             debug!(
@@ -703,7 +735,6 @@ impl CacheStore {
                     deplayed_pending_stages.extend(err_stage.into_iter().map(Reverse));
                 }
             }
-            
         })
     }
 
@@ -830,8 +861,8 @@ impl CacheStore {
                 Ok(time) => time,
                 Err(e) => {
                     error!("Failed to convert scan interval to std time: {e}");
-                    return
-                },
+                    return;
+                }
             };
             loop {
                 {
@@ -1106,9 +1137,8 @@ impl CacheStore {
             whatever!("err cache down");
         }
 
-        self.check_fs_op(async || {
-            self.ensure_cache_dir_created(path).await
-        }).await?;
+        self.check_fs_op(async || self.ensure_cache_dir_created(path).await)
+            .await?;
         let tmp_path = path.with_extension("tmp");
         let mut read_buf = page.clone();
         match self
@@ -1310,11 +1340,11 @@ impl CacheStore {
     /// state check, for unstable state, limit request concurrency
     fn state_check(&self) -> Result<Option<OwnedSemaphorePermit>> {
         let state = self.state.read();
-        if let DiskState::Unstable {
-            ref io_limit,
-            ..
-        } = *state {
-            let io_limit = io_limit.clone().try_acquire_owned().map_err(|_| StorageErrorEnum::DiskUnstableError)?;
+        if let DiskState::Unstable { ref io_limit, .. } = *state {
+            let io_limit = io_limit
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| StorageErrorEnum::DiskUnstableError)?;
             Ok(Some(io_limit))
         } else {
             Ok(None)
@@ -1339,22 +1369,24 @@ impl Uploader for CacheStore {
                 }
                 let _ = self.state_check()?;
                 let res_buffer = self.flush(staging_path.as_path(), buffer.clone()).await?;
-                write_backer.pending_stages
+                write_backer
+                    .pending_stages
                     .send((key.to_string(), res_buffer.clone()))
                     .await
                     .map_err(|_| StorageErrorEnum::SenderError)?;
-                // notice: so we could cache it immediately almost no cost, because it used as cache and staged, 
+                // notice: so we could cache it immediately almost no cost, because it used as cache and staged,
                 // but maybe cache twice
                 if let Ok(cache_key) = CacheKey::from_str(key) {
-                    let _ = self.put(&cache_key, Either::Right(res_buffer.clone()), false).await.inspect_err(|e| {
-                        error!("Failed to cache staging file {:?}, {e}", staging_path);
-                    });
+                    let _ = self
+                        .put(&cache_key, Either::Right(res_buffer.clone()), false)
+                        .await
+                        .inspect_err(|e| {
+                            error!("Failed to cache staging file {:?}, {e}", staging_path);
+                        });
                 }
                 Ok(Either::Right(res_buffer))
             }
-            None => {
-                self.uploader.upload(key, buffer).await
-            }
+            None => self.uploader.upload(key, buffer).await,
         }
     }
 }
@@ -1456,7 +1488,10 @@ impl CacheManager for CacheStore {
             {
                 warn!("Remove cache file {:?} failed: {:?}", cache_path, e);
             }
-            if let Err(e) = fs::remove_file(self.stage_path(&key.to_path(self.hash_prefix)).as_path()).await && e.kind() != io::ErrorKind::NotFound {
+            if let Err(e) =
+                fs::remove_file(self.stage_path(&key.to_path(self.hash_prefix)).as_path()).await
+                && e.kind() != io::ErrorKind::NotFound
+            {
                 warn!(
                     "Remove cache stage file {:?} failed: {:?}",
                     self.stage_path(&key.to_path(self.hash_prefix)),
@@ -1517,7 +1552,9 @@ impl CacheManager for CacheStore {
 
     fn used_memory(&self) -> i64 {
         let mut sum = 0;
-        self.mem_caches.iter().for_each(|kv| sum += kv.value().len());
+        self.mem_caches
+            .iter()
+            .for_each(|kv| sum += kv.value().len());
         sum as i64
     }
 
@@ -1528,7 +1565,15 @@ impl CacheManager for CacheStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs::Permissions, os::unix::fs::PermissionsExt, sync::{atomic::{AtomicU32, Ordering}, Arc}};
+    use std::{
+        env,
+        fs::Permissions,
+        os::unix::fs::PermissionsExt,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
+    };
 
     use assert_matches::assert_matches;
     use chrono::{Duration, Utc};
@@ -1540,10 +1585,16 @@ mod tests {
     use tracing_test::traced_test;
 
     use crate::{
-        buffer::ChecksumLevel, cache::{
-            disk::cache::{CacheStore, DiskState, CACHE_STAGE_DIR, MAX_CONCURRENCY_FOR_UNSTABLE, MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL},
+        buffer::ChecksumLevel,
+        cache::{
+            disk::cache::{
+                CacheStore, DiskState, CACHE_STAGE_DIR, MAX_CONCURRENCY_FOR_UNSTABLE,
+                MAX_DURATION_TO_DOWN, MAX_NUM_IO_ERR_TO_UNSTABLE, MIN_NUM_IO_SUCC_TO_NORMAL,
+            },
             CacheKey, CacheManager, DiskEvent,
-        }, cached_store::Config, uploader::NormalUploader
+        },
+        cached_store::Config,
+        uploader::NormalUploader,
     };
 
     use super::DiskCacheManager;
@@ -1598,7 +1649,7 @@ mod tests {
             cache_store.on_disk_event(DiskEvent::IOError);
         }
         cache_store.clone().correct_state();
-        sleep(Duration::seconds(1).to_std().unwrap()).await;  // probe every 500 milliseconds
+        sleep(Duration::seconds(1).to_std().unwrap()).await; // probe every 500 milliseconds
         assert_matches!(*cache_store.state.read(), DiskState::Unstable { 
             ref io_cnt,
             .. 
@@ -1608,11 +1659,13 @@ mod tests {
         {
             let state = cache_store.state.read();
             if let DiskState::Unstable { ref io_limit, .. } = *state {
-                let _premit = io_limit.try_acquire_many(MAX_CONCURRENCY_FOR_UNSTABLE).unwrap();
+                let _premit = io_limit
+                    .try_acquire_many(MAX_CONCURRENCY_FOR_UNSTABLE)
+                    .unwrap();
                 let value = cache_store.get(&key).await;
                 assert!(value.is_err());
                 assert!(value.err().unwrap().is_disk_unstable_error());
-            }        
+            }
         }
 
         // case: unstable -> normal
@@ -1620,19 +1673,19 @@ mod tests {
             cache_store.on_disk_event(DiskEvent::IOSuccess);
         }
         cache_store.clone().correct_state();
-        assert_matches!(*cache_store.state.read(), DiskState::Normal{..});
+        assert_matches!(*cache_store.state.read(), DiskState::Normal { .. });
 
         // case: unstable -> down
         {
             let mut state = cache_store.state.write();
             let mock_start_time = Utc::now() - MAX_DURATION_TO_DOWN + Duration::seconds(1);
-            *state = DiskState::Unstable { 
+            *state = DiskState::Unstable {
                 start_time: mock_start_time,
-                io_err_cnt: AtomicU32::default(), 
+                io_err_cnt: AtomicU32::default(),
                 io_cnt: AtomicU32::default(),
                 io_limit: Arc::new(Semaphore::new(MAX_CONCURRENCY_FOR_UNSTABLE as usize)),
                 probe_task: tokio::spawn(async {}),
-                cancel_token: CancellationToken::new(), 
+                cancel_token: CancellationToken::new(),
             }
         }
         sleep(Duration::seconds(1).to_std().unwrap()).await;
@@ -1661,11 +1714,46 @@ mod tests {
     #[tokio::test]
     async fn test_check_path() {
         let cases = vec![
-            ("chunks/0/0/1_0_1048576", Some(CacheKey { id: 1, indx: 0, size: 1048576 })),
-            ("chunks/111/222/3333_3333_3333", Some(CacheKey { id: 3333, indx: 3333, size: 3333 })),
-            ("chunks/111/222/3333_3333_0", Some(CacheKey { id: 3333, indx: 3333, size: 0 })),
-            ("chunks/0/0/0_0_0", Some(CacheKey { id: 0, indx: 0, size: 0 })),
-            ("chunks/01/10/0_01_0", Some(CacheKey { id: 0, indx: 1, size: 0 })),
+            (
+                "chunks/0/0/1_0_1048576",
+                Some(CacheKey {
+                    id: 1,
+                    indx: 0,
+                    size: 1048576,
+                }),
+            ),
+            (
+                "chunks/111/222/3333_3333_3333",
+                Some(CacheKey {
+                    id: 3333,
+                    indx: 3333,
+                    size: 3333,
+                }),
+            ),
+            (
+                "chunks/111/222/3333_3333_0",
+                Some(CacheKey {
+                    id: 3333,
+                    indx: 3333,
+                    size: 0,
+                }),
+            ),
+            (
+                "chunks/0/0/0_0_0",
+                Some(CacheKey {
+                    id: 0,
+                    indx: 0,
+                    size: 0,
+                }),
+            ),
+            (
+                "chunks/01/10/0_01_0",
+                Some(CacheKey {
+                    id: 0,
+                    indx: 1,
+                    size: 0,
+                }),
+            ),
             ("achunks/111/222/3333_3333_3333", None),
             ("chunksa/111/222/3333_3333_3333", None),
             ("chunksa", None),
@@ -1695,11 +1783,16 @@ mod tests {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         let dir3 = tempdir().unwrap();
-        
-        config.cache_dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf(), dir3.path().to_path_buf()];
+
+        config.cache_dirs = vec![
+            dir1.path().to_path_buf(),
+            dir2.path().to_path_buf(),
+            dir3.path().to_path_buf(),
+        ];
         let operator = Operator::new(()).unwrap().finish();
         let uploader = NormalUploader::new(Arc::new(operator), None);
-        let manager = DiskCacheManager::new(&config, uploader).expect("create disk cache manager failed");
+        let manager =
+            DiskCacheManager::new(&config, uploader).expect("create disk cache manager failed");
         assert!(!manager.is_invalid());
         {
             let cache_stores = manager.cache_stores.read();
@@ -1711,7 +1804,6 @@ mod tests {
             *lock = DiskState::Down;
         }
 
-
         // case: key rehash after store removal
         let k1 = CacheKey {
             id: 0,
@@ -1719,7 +1811,10 @@ mod tests {
             size: 3,
         };
         let p1 = Buffer::from(vec![1, 2, 3]);
-        manager.put(&k1, Either::Left(p1), true).await.expect("put cache failed");
+        manager
+            .put(&k1, Either::Left(p1), true)
+            .await
+            .expect("put cache failed");
         let p1_1 = manager.get(&k1).await.expect("get cache failed");
         assert!(p1_1.is_some());
 
@@ -1728,7 +1823,6 @@ mod tests {
         assert!(p1_2.is_none());
         let s1_1 = manager.get_store(&k1);
         assert!(s1_1.is_none());
-
 
         // case: remove all store
         {
@@ -1768,11 +1862,13 @@ mod tests {
             file.sync_all().await.expect("sync stage file failed");
         }
 
-        
         CacheStore::new(&config, dir.into_path(), 1 << 30, 1024, uploader)
             .expect("create new cache store failed");
         sleep(std::time::Duration::from_millis(50)).await; // wait for scan to finish
-        let reader = operator.reader("chunks/0/0/123_0_4").await.expect("upload stage file failed");
+        let reader = operator
+            .reader("chunks/0/0/123_0_4")
+            .await
+            .expect("upload stage file failed");
         let data = reader.read(0..4).await.unwrap().to_vec();
         assert_eq!(data, b"good");
     }

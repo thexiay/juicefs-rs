@@ -452,14 +452,15 @@ impl SliceWriter for WSlice {
                     let uploader = self.uploader.clone();
                     let cache_manager = self.cache_manager.clone();
                     let should_cache = block.len() < self.conf.max_block_size;
-                    self.pengind_upload_tasks
-                        .spawn(async move { 
-                            if should_cache {
-                                let _ = cache_manager.put(&cache_key, Either::Left(block.clone()), false).await;
-                            }
-                            
-                            uploader.upload(&cache_key_path, block).await 
-                        });
+                    self.pengind_upload_tasks.spawn(async move {
+                        if should_cache {
+                            let _ = cache_manager
+                                .put(&cache_key, Either::Left(block.clone()), false)
+                                .await;
+                        }
+
+                        uploader.upload(&cache_key_path, block).await
+                    });
                 }
                 self.uploaded_len = end;
             }
@@ -519,11 +520,7 @@ pub struct CachedStore {
 }
 
 impl CachedStore {
-    pub fn new(
-        storage: Arc<Operator>,
-        config: Config,
-        uploader: NormalUploader,
-    ) -> Result<Self> {
+    pub fn new(storage: Arc<Operator>, config: Config, uploader: NormalUploader) -> Result<Self> {
         let cache_manager = Arc::new(CacheManagerImpl::new(&config, uploader)?);
         Ok(CachedStore {
             storage,
@@ -753,8 +750,7 @@ mod test {
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
 
-        let store = new_cached_store(config, op)
-            .expect("create chunk store failed");
+        let store = new_cached_store(config, op).expect("create chunk store failed");
         test_store(store.clone()).await;
 
         let used = store.used_memory();
@@ -781,9 +777,8 @@ mod test {
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
         config.free_space = 0.9999;
-        
-        let store = new_cached_store(config, op)
-            .expect("create chunk store failed");
+
+        let store = new_cached_store(config, op).expect("create chunk store failed");
         test_store(store.clone()).await;
     }
 
@@ -795,9 +790,8 @@ mod test {
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
         config.buffer_size = 1 << 20;
-        
-        let store = new_cached_store(config, op)
-            .expect("create chunk store failed");
+
+        let store = new_cached_store(config, op).expect("create chunk store failed");
         test_store(store.clone()).await;
     }
 
@@ -809,9 +803,8 @@ mod test {
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
         config.writeback = true;
-        
-        let store = new_cached_store(config, op.clone())
-            .expect("create chunk store failed");
+
+        let store = new_cached_store(config, op.clone()).expect("create chunk store failed");
         // because no deplay, so wirte data will be read immediately
         test_store(store.clone()).await;
     }
@@ -826,15 +819,18 @@ mod test {
         config.writeback = true;
         config.upload_delay = Some(Duration::milliseconds(200));
 
-        let store = new_cached_store(config, op.clone())
-            .expect("create chunk store failed");
+        let store = new_cached_store(config, op.clone()).expect("create chunk store failed");
         sleep(std::time::Duration::from_secs(1)).await; // wait scan cache finished
-        // because write data will be cached, so wirte data will be read immediately
+                                                        // because write data will be cached, so wirte data will be read immediately
         test_store(store.clone()).await;
 
-        forget_slice(store.clone(), 10, 1024).await.expect("forget slice failed");
+        forget_slice(store.clone(), 10, 1024)
+            .await
+            .expect("forget slice failed");
         sleep(std::time::Duration::from_secs(1)).await; // wait upload finished
-        op.stat("chunks/0/0/10_0_1024").await.expect("head object 10_0_1024 failed failed");
+        op.stat("chunks/0/0/10_0_1024")
+            .await
+            .expect("head object 10_0_1024 failed failed");
     }
 
     #[traced_test]
@@ -845,9 +841,8 @@ mod test {
         let mut config = new_config();
         config.cache_dirs = vec![dir.path().to_path_buf()];
         config.is_hash_prefix = true;
-        
-        let store = new_cached_store(config, op.clone())
-            .expect("create chunk store failed");
+
+        let store = new_cached_store(config, op.clone()).expect("create chunk store failed");
         test_store(store.clone()).await;
     }
 
@@ -861,38 +856,69 @@ mod test {
         config.cache_size = 10 << 20;
         config.free_space = 0.01;
 
-        let store = new_cached_store(config.clone(), op.clone())
-            .expect("create chunk store failed");
+        let store =
+            new_cached_store(config.clone(), op.clone()).expect("create chunk store failed");
 
         let block_size = config.max_block_size;
-        forget_slice(store.clone(), 10, 1024).await.expect("forget slice failed");
-        forget_slice(store.clone(), 11, block_size).await.expect("forget slice failed");
+        forget_slice(store.clone(), 10, 1024)
+            .await
+            .expect("forget slice failed");
+        forget_slice(store.clone(), 11, block_size)
+            .await
+            .expect("forget slice failed");
         sleep(std::time::Duration::from_millis(100)).await; // wait for cache flush to disk
         let stats = store.cache_manager.stats();
         assert_eq!(stats.0, 1, "10_0_1024 should be cache");
-        assert_eq!(stats.1, 1024 + 4096, "10_0_1024 should be cache(with 4096 padding)");
+        assert_eq!(
+            stats.1,
+            1024 + 4096,
+            "10_0_1024 should be cache(with 4096 padding)"
+        );
 
         store.fill_cache(10, 1024).await.expect("fill cache failed");
-        store.fill_cache(11, block_size as u32).await.expect("fill cache failed");
+        store
+            .fill_cache(11, block_size as u32)
+            .await
+            .expect("fill cache failed");
         sleep(std::time::Duration::from_secs(1)).await;
         let stats = store.cache_manager.stats();
         assert_eq!(stats.0, 2, "10_0_1024 and 11_0_bsize should be cache");
-        assert_eq!(stats.1, 1024 + 4096 + block_size as i64 + 4096, "10_0_1024 and 11_0_bsize should be cache");
+        assert_eq!(
+            stats.1,
+            1024 + 4096 + block_size as i64 + 4096,
+            "10_0_1024 and 11_0_bsize should be cache"
+        );
 
         // check
-        let miss_bytes = store.check_cache(10, 1024).await.expect("check cache failed");
+        let miss_bytes = store
+            .check_cache(10, 1024)
+            .await
+            .expect("check cache failed");
         assert_eq!(miss_bytes, 0);
 
-        let miss_bytes = store.check_cache(11, block_size as u32).await.expect("check cache failed");
+        let miss_bytes = store
+            .check_cache(11, block_size as u32)
+            .await
+            .expect("check cache failed");
         assert_eq!(miss_bytes, 0);
 
-        store.evict_cache(11, block_size as u32).await.expect("evict cache failed");
+        store
+            .evict_cache(11, block_size as u32)
+            .await
+            .expect("evict cache failed");
         let stats = store.cache_manager.stats();
         assert_eq!(stats.0, 1, "10_0_1024 should be cache");
-        assert_eq!(stats.1, 1024 + 4096, "10_0_1024 should be cache(with 4096 padding)");
+        assert_eq!(
+            stats.1,
+            1024 + 4096,
+            "10_0_1024 should be cache(with 4096 padding)"
+        );
 
         // check again
-        let miss_bytes = store.check_cache(11, block_size as u32).await.expect("check cache failed");
+        let miss_bytes = store
+            .check_cache(11, block_size as u32)
+            .await
+            .expect("check cache failed");
         assert_eq!(miss_bytes, block_size as u64);
     }
 }
