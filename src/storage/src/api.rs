@@ -3,20 +3,24 @@ use std::{future::Future, sync::Arc};
 use opendal::{Buffer, Operator};
 
 pub use crate::cached_store::Config;
-use crate::{cached_store::CachedStore, error::Result, uploader::NormalUploader};
+pub use crate::cached_store::CachedStore;
+use crate::{error::Result, uploader::NormalUploader};
 
 pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
 
     /// Read data from [`buffer`], and write data into slice at offset.
     /// This is a overwrite write.
+    /// 
+    /// [`buffer`]: written data
+    /// [`off`]: offset in chunk
     fn write_all_at(
         &mut self,
         buffer: Buffer,
         off: usize,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Flush data from `0..offset` into storage
+    /// Flush data from `0..offset`(Relative to slice writen before) in slice into storage
     fn spawn_flush_until(&mut self, offset: usize) -> Result<()>;
 
     /// Abort the write and flush progress.
@@ -31,6 +35,9 @@ pub trait SliceReader: Send + Sync {
 
     /// Read data from slice at offset, and write it into buffer.
     /// Returns the bytes readed.
+    /// 
+    /// [`off`]: offset in chunk
+    /// [`len`]: length to read
     fn read_at(&self, off: usize, len: usize) -> impl Future<Output = Result<Buffer>> + Send;
 
     fn read_all_at(&self, off: usize, len: usize) -> impl Future<Output = Result<Buffer>> + Send {
@@ -83,7 +90,7 @@ pub trait ChunkStore: Send + Sync {
     fn set_update_limit(&self, upload: i64, download: i64);
 }
 
-pub fn new_chunk_store(config: Config, operator: Operator) -> Result<impl ChunkStore + 'static> {
+pub fn new_chunk_store(config: Config, operator: Operator) -> Result<CachedStore> {
     let operator = Arc::new(operator);
     let uploader = NormalUploader::new(operator.clone(), None);
     let cache_store = CachedStore::new(operator, config, uploader)?;

@@ -31,7 +31,7 @@ use crate::{
 const CHUNK_SIZE: usize = 64 << 20; // 64MB
 const PAGE_SIZE: usize = 64 << 10; // 64KB
 
-// object stroage file name format
+// object stroage file name format, "chunks/${d}/${d}/${slice_id}_${block_idx}_${data_size}"
 pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^chunks/\d+/\d+/(\d+)_(\d+)_(\d+)$").unwrap());
 
@@ -191,12 +191,6 @@ impl RSlice {
         self.compressor.is_none()
             && off % self.conf.max_block_size > 0
             && len <= self.conf.max_block_size / 4
-    }
-
-    fn parse_block_size(key: &str) -> usize {
-        key.rfind('_')
-            .map(usize::from)
-            .expect("failed to parse block size")
     }
 
     /// read data from storage and cache it
@@ -391,6 +385,8 @@ impl SliceWriter for WSlice {
                 );
             }
 
+            // TODO: Is there any write amplification here? 
+            //       When the offset of the write slice is relatively large, will it fill a lot of useless 0 bytes?
             // Fill pages with zeros until the offset
             if self.length < off {
                 let zeros = Buffer::from(vec![0; off - self.length]);

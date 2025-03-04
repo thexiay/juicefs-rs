@@ -1,10 +1,12 @@
+cargo-features = ["edition2024"]
+
 [workspace]
 members = ["src/test", "src/vfs", "src/meta", "src/storage", "src/utils"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/thexiay/juicefs-rs"
 keywords = ["filesystem", "cloud-storage", "object-storage"]
 license = "Apache-2.0"

@@ -1030,6 +1030,20 @@ dependencies = [
 [[package]]
 name = "juice-vfs"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "either",
+ "juice-meta",
+ "juice-storage",
+ "opendal",
+ "parking_lot",
+ "snafu",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lazy_static"

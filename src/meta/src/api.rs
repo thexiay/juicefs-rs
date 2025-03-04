@@ -94,12 +94,12 @@ pub struct Entry {
 pub struct Slice {
     // slice id
     pub id: u64,
-    // slice total length
+    // slice total length, do not know the start position in chunk
     pub size: u32,
-    // valid data offsite
+    // valid data offset in slice(not in chunk)
     pub off: u32,
     // valid data length
-    // actually not all data in slice is valid, not [off, off+len] is valid data
+    // actually not all data in slice is valid, only `slice_array[off:off+len]` is valid data
     pub len: u32,
 }
 
