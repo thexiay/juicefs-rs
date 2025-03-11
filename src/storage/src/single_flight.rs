@@ -113,7 +113,7 @@ mod test {
                         n.fetch_add(1, Ordering::SeqCst);
                         // ensure every routine has different buffer
                         let mut rng = rand::thread_rng();
-                        let bytes: [u8; 10] = rng.gen();
+                        let bytes: [u8; 10] = rng.r#gen();
                         Ok(Buffer::from(bytes.to_vec()))
                     })
                     .await;

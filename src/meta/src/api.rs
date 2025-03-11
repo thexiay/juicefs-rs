@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bitflags::bitflags;
+use chrono::{DateTime, Utc};
 use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,17 @@ pub struct Entry {
     pub attr: Attr,
 }
 
+/*
+   |-----------------------chunk---------------------|
+   |------|---------|--------------|------|----------|
+   |	  ↑                               ↑          |
+   |     coff(in `PSlice`)               cend        |
+   |                ↑              ↑                 |
+   |	           off            end                |
+   |                |<----len----->|                 |
+   |      |<---------------size---------->|          |
+   |-------------------------------------------------|
+*/
 /// Slice is a continuous write in a chunk
 /// Multiple slices could be combined together as a chunk.
 /// One slice can only in one chunk.
@@ -564,6 +576,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn close(&self, inode: Ino) -> Result<()>;
 
     // Read returns the list of slices on the given chunk.
+    // All returned slices valid range continuously fills the entire chunk range
     async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
 
     // NewSlice returns an id for new slice.
@@ -584,7 +597,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         indx: u32,
         off: u32,
         slice: Slice,
-        mtime: Duration,
+        mtime: DateTime<Utc>,
     ) -> Result<()>;
 
     // InvalidateChunkCache invalidate chunk cache

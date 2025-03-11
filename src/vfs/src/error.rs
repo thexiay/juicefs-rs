@@ -43,6 +43,8 @@ pub enum VfsErrorEnum {
         source: StorageError,
         path: Option<String>,
     },
+    #[snafu(display("EIO error happend under stroage"))]
+    EIO,
     #[snafu(display("Eio failed too many times"))]
     EIOFailedTooManyTimes,
     #[snafu(display("Should try again"))]

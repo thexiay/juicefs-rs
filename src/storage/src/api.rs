@@ -2,8 +2,10 @@ use std::{future::Future, sync::Arc};
 
 use opendal::{Buffer, Operator};
 
-pub use crate::cached_store::Config;
 pub use crate::cached_store::CachedStore;
+pub use crate::cached_store::Config;
+pub use crate::cached_store::RSlice;
+pub use crate::cached_store::WSlice;
 use crate::{error::Result, uploader::NormalUploader};
 
 pub trait SliceWriter: Send + Sync {
@@ -11,16 +13,14 @@ pub trait SliceWriter: Send + Sync {
 
     /// Read data from [`buffer`], and write data into slice at offset.
     /// This is a overwrite write.
-    /// 
+    ///
     /// [`buffer`]: written data
-    /// [`off`]: offset in chunk
-    fn write_all_at(
-        &mut self,
-        buffer: Buffer,
-        off: usize,
-    ) -> impl Future<Output = Result<()>> + Send;
+    /// [`off`]: offset in slice
+    fn write_all_at(&mut self, buffer: Buffer, off: usize) -> Result<()>;
 
     /// Flush data from `0..offset`(Relative to slice writen before) in slice into storage
+    /// 
+    /// [`offset`]: offset in slice
     fn spawn_flush_until(&mut self, offset: usize) -> Result<()>;
 
     /// Abort the write and flush progress.
@@ -35,8 +35,8 @@ pub trait SliceReader: Send + Sync {
 
     /// Read data from slice at offset, and write it into buffer.
     /// Returns the bytes readed.
-    /// 
-    /// [`off`]: offset in chunk
+    ///
+    /// [`off`]: offset in slice
     /// [`len`]: length to read
     fn read_at(&self, off: usize, len: usize) -> impl Future<Output = Result<Buffer>> + Send;
 

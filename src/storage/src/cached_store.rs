@@ -364,65 +364,56 @@ impl SliceWriter for WSlice {
         self.id
     }
 
-    fn write_all_at(
-        &mut self,
-        buffer: Buffer,
-        off: usize,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async move {
-            if off + buffer.len() > CHUNK_SIZE {
-                whatever!(
-                    "write out of chunk boudary: {} > {}",
-                    off + buffer.len(),
-                    CHUNK_SIZE
-                );
-            }
-            if off < self.uploaded_len {
-                whatever!(
-                    "cannot overwrite uploadded block: {} < {}",
-                    off,
-                    self.uploaded_len
-                );
-            }
-
-            // TODO: Is there any write amplification here? 
-            //       When the offset of the write slice is relatively large, will it fill a lot of useless 0 bytes?
-            // Fill pages with zeros until the offset
-            if self.length < off {
-                let zeros = Buffer::from(vec![0; off - self.length]);
-                self.write_all_at(zeros, self.length).boxed().await?;
-            }
-
-            let mut n = 0;
-            while n < buffer.len() {
-                let b_idx = self.block_index(off + n);
-                let b_off = (off + n) % self.conf.max_block_size;
-                let p_size = self.page_size(b_idx);
-                let p_idx = b_off / p_size;
-                let p_off = b_off % p_size;
-                let page_cnt = self.block_pages[b_idx].len();
-                let page = if p_idx < page_cnt {
-                    &mut self.block_pages[b_idx][p_idx]
-                } else {
-                    let mut page = BytesMut::new();
-                    page.resize(p_size, 0); // only resize will fill zeros
-                    self.block_pages[b_idx].push(page);
-                    &mut self.block_pages[b_idx][page_cnt]
-                };
-                let left = buffer.len() - n;
-                // every time copy until page finish
-                let copied = min(page.len() - p_off, left);
-                page[p_off..p_off + copied]
-                    .copy_from_slice(&buffer.slice(n..n + copied).to_bytes());
-                n += copied;
-            }
-            // if write beyond current length, update length
-            if off + n > self.length {
-                self.length = off + n;
-            }
-
-            Ok(())
+    fn write_all_at(&mut self, buffer: Buffer, off: usize) -> Result<()> {
+        if off + buffer.len() > CHUNK_SIZE {
+            whatever!(
+                "write out of chunk boudary: {} > {}",
+                off + buffer.len(),
+                CHUNK_SIZE
+            );
         }
+        if off < self.uploaded_len {
+            whatever!(
+                "cannot overwrite uploadded block: {} < {}",
+                off,
+                self.uploaded_len
+            );
+        }
+
+        // Fill pages with zeros until the offset
+        if self.length < off {
+            let zeros = Buffer::from(vec![0; off - self.length]);
+            self.write_all_at(zeros, self.length)?;
+        }
+
+        let mut n = 0;
+        while n < buffer.len() {
+            let b_idx = self.block_index(off + n);
+            let b_off = (off + n) % self.conf.max_block_size;
+            let p_size = self.page_size(b_idx);
+            let p_idx = b_off / p_size;
+            let p_off = b_off % p_size;
+            let page_cnt = self.block_pages[b_idx].len();
+            let page = if p_idx < page_cnt {
+                &mut self.block_pages[b_idx][p_idx]
+            } else {
+                let mut page = BytesMut::new();
+                page.resize(p_size, 0); // only resize will fill zeros
+                self.block_pages[b_idx].push(page);
+                &mut self.block_pages[b_idx][page_cnt]
+            };
+            let left = buffer.len() - n;
+            // every time copy until page finish
+            let copied = min(page.len() - p_off, left);
+            page[p_off..p_off + copied].copy_from_slice(&buffer.slice(n..n + copied).to_bytes());
+            n += copied;
+        }
+        // if write beyond current length, update length
+        if off + n > self.length {
+            self.length = off + n;
+        }
+
+        Ok(())
     }
 
     fn spawn_flush_until(&mut self, offset: usize) -> Result<()> {
@@ -674,7 +665,7 @@ mod test {
     ) -> Result<()> {
         let mut writer = store.new_writer(slice_id);
         let buf = Buffer::from(vec![0x41_u8; size]);
-        writer.write_all_at(buf, 0).await?;
+        writer.write_all_at(buf, 0)?;
         let s = writer.finish().await?;
         assert_eq!(s, size);
         Ok(())
@@ -684,15 +675,11 @@ mod test {
         // write
         let mut writer = store.new_writer(1);
         let data = Buffer::from("hello world");
-        writer
-            .write_all_at(data.clone(), 0)
-            .await
-            .expect("write failed");
+        writer.write_all_at(data.clone(), 0).expect("write failed");
         let conf = Config::default();
         let offset = conf.max_block_size - 3;
         writer
             .write_all_at(data.clone(), offset)
-            .await
             .expect("write failed");
         writer
             .spawn_flush_until(conf.max_block_size + 3)

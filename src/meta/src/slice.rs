@@ -3,7 +3,6 @@ use std::ops::Deref;
 use async_trait::async_trait;
 use redis::{ErrorKind, FromRedisValue, RedisError, ToRedisArgs, Value};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 
 use crate::{
     api::{Ino, Slice},
@@ -17,7 +16,7 @@ pub struct PSlice {
     size: u32,
     off: u32,
     len: u32,
-    pos: u32,
+    coff: u32,
     #[serde(skip)]
     left: Option<Box<PSlice>>,
     #[serde(skip)]
@@ -25,30 +24,30 @@ pub struct PSlice {
 }
 
 impl PSlice {
-    pub fn new(slice: &Slice, pos: u32) -> Self {
+    pub fn new(slice: &Slice, coff: u32) -> Self {
         PSlice {
             id: slice.id,
             size: slice.size,
             off: slice.off,
             len: slice.len,
-            pos,
+            coff,
             left: None,
             right: None,
         }
     }
 
-    fn cut(mut self, pos: u32) -> (Option<PSlice>, Option<PSlice>) {
-        if pos <= self.pos {
+    fn cut(mut self, coff: u32) -> (Option<PSlice>, Option<PSlice>) {
+        if coff <= self.coff {
             let left = self.left.take().or_else(|| {
-                if self.pos - pos == 0 {
+                if self.coff - coff == 0 {
                     None
                 } else {
                     Some(Box::new(PSlice {
                         id: 0,
                         size: 0,
                         off: 0,
-                        len: self.pos - pos,
-                        pos: pos,
+                        len: self.coff - coff,
+                        coff,
                         left: None,
                         right: None,
                     }))
@@ -56,20 +55,20 @@ impl PSlice {
             });
             match left {
                 Some(left) => {
-                    let (left, right) = left.cut(pos);
+                    let (left, right) = left.cut(coff);
                     self.left = right.map(Box::new);
                     (left, Some(self))
                 }
                 None => (None, Some(self)),
             }
-        } else if pos < self.pos + self.len {
-            let l = pos - self.pos;
+        } else if coff < self.coff + self.len {
+            let l = coff - self.coff;
             let mut right = PSlice {
                 id: self.id,
                 size: self.size,
                 off: self.off + l,
                 len: self.len - l,
-                pos: pos,
+                coff,
                 left: None,
                 right: None,
             };
@@ -78,15 +77,15 @@ impl PSlice {
             (Some(self), Some(right))
         } else {
             let right = self.right.take().or_else(|| {
-                if pos - self.pos - self.len == 0 {
+                if coff - self.coff - self.len == 0 {
                     None
                 } else {
                     Some(Box::new(PSlice {
                         id: 0,
                         size: 0,
                         off: 0,
-                        len: pos - self.pos - self.len,
-                        pos: self.pos + self.len,
+                        len: coff - self.coff - self.len,
+                        coff: self.coff + self.len,
                         left: None,
                         right: None,
                     }))
@@ -94,7 +93,7 @@ impl PSlice {
             });
             match right {
                 Some(right) => {
-                    let (left, right) = right.cut(pos);
+                    let (left, right) = right.cut(coff);
                     self.right = left.map(Box::new);
                     (Some(self), right)
                 }
@@ -161,10 +160,10 @@ impl PSlices {
         let mut root: Option<PSlice> = None;
         for mut pslice in self.pslices {
             if let Some(prev) = root {
-                let (left, right) = prev.cut(pslice.pos);
+                let (left, right) = prev.cut(pslice.coff);
                 pslice.left = left.map(Box::new);
                 if let Some(right) = right {
-                    let (_left, right) = right.cut(pslice.pos + pslice.len);
+                    let (_left, right) = right.cut(pslice.coff + pslice.len);
                     pslice.right = right.map(Box::new);
                 }
             }
@@ -174,14 +173,14 @@ impl PSlices {
         let mut pos = 0;
         if let Some(root) = root {
             root.visit(&mut |s| {
-                if s.pos > pos {
+                if s.coff > pos {
                     // blank interva, fill it with default slice id 0
                     chunk.push(Slice {
-                        size: s.pos - pos,
-                        len: s.pos - pos,
+                        size: s.coff - pos,
+                        len: s.coff - pos,
                         ..Default::default()
                     });
-                    pos = s.pos;
+                    pos = s.coff;
                 }
                 chunk.push(Slice {
                     id: s.id,
@@ -248,7 +247,7 @@ mod tests {
                 size: range.end - range.start,
                 off: 0,
                 len: range.end - range.start,
-                pos: range.start,
+                coff: range.start,
                 left: None,
                 right: None,
             }

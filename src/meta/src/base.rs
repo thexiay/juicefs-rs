@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
@@ -228,7 +228,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         indx: u32,
         off: u32,
         slice: Slice,
-        mtime: Duration,
+        mtime: DateTime<Utc>,
     ) -> Result<(u32, DirStat, Attr)>;
 
     async fn do_truncate(
@@ -2731,7 +2731,7 @@ where
         indx: u32,
         off: u32,
         slice: Slice,
-        mtime: Duration,
+        mtime: DateTime<Utc>,
     ) -> Result<()> {
         let file = self.as_ref().open_files.lock(inode);
         // TODO: lock with whole function?

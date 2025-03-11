@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use chrono::{DateTime, Utc};
 use deadpool::managed::{Object, Pool};
 use futures::StreamExt;
 use juice_utils::process::Bar;
@@ -3021,7 +3022,7 @@ impl Engine for RedisEngine {
         indx: u32,
         off: u32,
         slice: Slice,
-        mtime: Duration,
+        mtime: DateTime<Utc>,
     ) -> Result<(u32, DirStat, Attr)> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
@@ -3062,7 +3063,7 @@ impl Engine for RedisEngine {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_nanos();
-            attr.mtime = now;
+            attr.mtime = mtime.timestamp_nanos_opt().expect("Time overflow") as u128;
             attr.ctime = now;
 
             let mut pipe = pipe();
@@ -3232,15 +3233,17 @@ impl Engine for RedisEngine {
             p.hexists(self.dir_used_space_key(), ino);
         });
         let exists = p.query_async::<Vec<bool>>(&mut conn).await?;
-        ensure_whatever!(batch.keys().len() == exists.len(), "Invalid len for flush redis return list");
+        ensure_whatever!(
+            batch.keys().len() == exists.len(),
+            "Invalid len for flush redis return list"
+        );
         let used_space_exists = batch
             .keys()
             .zip(exists.iter())
             .map(|(ino, exist)| (*ino, *exist))
             .collect::<HashMap<_, _>>();
-        
+
         // TODO: force sync dir stat, it's more precise
-        
 
         // flush dir stat cache, it's not so precise
         let mut inos = batch.keys().collect::<Vec<_>>();

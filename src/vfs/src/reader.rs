@@ -9,7 +9,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Local, Utc};
-use juice_meta::api::{Ino, Meta, Slice, CHUNK_SIZE};
+use juice_meta::api::{Ino, Meta, CHUNK_SIZE};
 use juice_storage::api::{CachedStore, ChunkStore, SliceReader};
 use parking_lot::{Mutex, RwLock};
 use snafu::FromString;
@@ -20,18 +20,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::{
-    arena::ArenaList,
-    error::{EIOFailedTooManyTimesSnafu, Result, VfsError},
-};
+use crate::{error::{EIOFailedTooManyTimesSnafu, Result, VfsError}, frange::Frange};
 
-struct DataReader {
-    ctx: Arc<DataReaderCtx>,
-    // ino到FileReader的映射，这个FileReader是能复用的
-    file_readers: Mutex<HashMap<Ino, Vec<Arc<FileReader>>>>,
-}
-
-struct DataReaderCtx {
+pub struct DataReaderCtx {
     meta: Arc<dyn Meta>,
     store: Arc<CachedStore>,
     max_block_size: u64,
@@ -45,6 +36,20 @@ struct DataReaderCtx {
     max_request: u64,
     // 一次FileReader中的最大失败读取次数
     max_retries: u32,
+}
+
+pub struct DataReaderInvalidator(Arc<DataReader>);
+
+impl DataReaderInvalidator {
+    pub fn invalid(&self, inode: Ino, frange: Frange) {
+        self.0.invalidate(inode, frange);
+    }
+}
+
+pub struct DataReader {
+    ctx: Arc<DataReaderCtx>,
+    // ino到FileReader的映射，这个FileReader是能复用的
+    file_readers: Mutex<HashMap<Ino, Vec<Arc<FileReader>>>>,
 }
 
 impl DataReader {
@@ -96,6 +101,13 @@ impl DataReader {
         fr
     }
 
+    pub fn close(&self, inode: Ino, fr: Arc<FileReader>) {
+        let mut file_readers = self.file_readers.lock();
+        if let Some(frs) = file_readers.get_mut(&inode) {
+            frs.retain(|f| !Arc::ptr_eq(f, &fr))
+        }
+    }
+
     /// Truncate file length
     pub fn truncate(&self, inode: Ino, length: u64) {
         self.visit(inode, |fr| {
@@ -129,6 +141,10 @@ impl DataReader {
         self.ctx.used_read_buffer.load(Ordering::SeqCst)
     }
 
+    pub fn invalid_notifier(self: Arc<Self>) -> DataReaderInvalidator {
+        DataReaderInvalidator(self)
+    }
+
     fn visit(&self, inode: Ino, visitor: impl Fn(&FileReader)) {
         let file_readers = self.file_readers.lock();
         if let Some(frs) = file_readers.get(&inode) {
@@ -136,41 +152,6 @@ impl DataReader {
                 visitor(fr);
             }
         }
-    }
-}
-
-#[derive(Clone)]
-pub struct Frange {
-    off: u64,
-    len: u64,
-}
-
-impl Frange {
-    fn end(&self) -> u64 {
-        self.off + self.len
-    }
-
-    fn is_overlap(&self, other: &Frange) -> bool {
-        self.off < other.off + other.len && other.off < self.off + self.len
-    }
-
-    fn overlap(&self, other: &Frange) -> Option<Frange> {
-        if self.is_overlap(other) {
-            Some(Frange {
-                off: max(self.off, other.off),
-                len: min(self.off + self.len, other.off + other.len) - max(self.off, other.off),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn is_include(&self, other: &Frange) -> bool {
-        self.off <= other.off && self.end() >= other.end()
-    }
-
-    fn is_contain(&self, p: u64) -> bool {
-        self.off < p && p < self.end()
     }
 }
 
@@ -555,7 +536,7 @@ impl FileReader {
 struct SliceReadReq {
     slice_id: u64,
     slice_len: u64,
-    chunk_off: u64,
+    off: u32,
     buf: BytesMut,
 }
 
@@ -577,6 +558,7 @@ impl Drop for ChunkReadReq {
 struct ChunkReader {
     dr_ctx: Arc<DataReaderCtx>,
     fr_ctx: Arc<FileReaderCtx>,
+    // This frange is only in ONE chunk(event one block)
     frange: Frange,
     // reused refs, `ChunkReader` could be reused in other `ChunkReadReq`
     refs: AtomicU32,
@@ -653,8 +635,8 @@ impl ChunkReader {
     async fn run(self: Arc<Self>, task_time: DateTime<Local>) {
         let chunk_idx = (self.frange.off / CHUNK_SIZE) as u32;
         match self.dr_ctx.meta.read(self.fr_ctx.inode, chunk_idx).await {
-            Ok(slices) => {
-                let mut off = self.frange.off / CHUNK_SIZE * CHUNK_SIZE;
+            Ok(slices) => {    
+                let mut foff = self.frange.off / CHUNK_SIZE * CHUNK_SIZE;
                 let mut buf = BytesMut::with_capacity(self.frange.len as usize);
                 let mut slice_reqs = Vec::new();
                 for slice in slices {
@@ -662,7 +644,7 @@ impl ChunkReader {
                         break;
                     }
                     let slice_frange = Frange {
-                        off,
+                        off: foff,
                         len: slice.len as u64,
                     };
                     if let Some(overlap) = self.frange.overlap(&slice_frange) {
@@ -673,11 +655,11 @@ impl ChunkReader {
                         slice_reqs.push(SliceReadReq {
                             slice_id: slice.id,
                             slice_len: slice.len as u64,
-                            chunk_off: overlap.off,
+                            off: slice.off + (overlap.off - foff) as u32,
                             buf: buf.split_to(overlap.len as usize),
                         });
                     }
-                    off += slice.len as u64;
+                    foff += slice.len as u64;
                 }
                 let buf = self.clone().read(slice_reqs).await;
                 if buf.len() == self.frange.len as usize {
@@ -790,7 +772,7 @@ impl ChunkReader {
                     .expect("acquire semaphore failed");
                 let inode = sr.fr_ctx.inode;
                 let id = req.slice_id;
-                let off = req.chunk_off;
+                let off = req.off;
                 let len = req.buf.len();
                 sr.read_slice(req).await.inspect_err(|e| {
                     warn!(inode = %inode, id = %id, off = %off, len = %len, "read slice failed: {:?}", e);
@@ -827,7 +809,7 @@ impl ChunkReader {
             .store
             .new_reader(req.slice_id, req.slice_len as usize);
         reader
-            .read_all_at(req.chunk_off as usize, req.buf.len())
+            .read_all_at(req.off as usize, req.buf.len())
             .await?;
         Ok(req.buf)
     }
