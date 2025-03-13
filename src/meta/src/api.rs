@@ -244,6 +244,8 @@ bitflags! {
     }
 }
 
+pub const O_ACCMODE: OFlag = OFlag::O_WRONLY.union(OFlag::O_RDWR);
+
 // Attr represents attributes of a node.
 #[derive(Default, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Attr {

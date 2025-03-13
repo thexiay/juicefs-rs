@@ -12,3 +12,5 @@ mod error;
 mod arena;
 mod config;
 mod frange;
+mod vfs;
+mod fhandle;

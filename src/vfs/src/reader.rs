@@ -80,8 +80,8 @@ impl DataReader {
         let _ = tokio::spawn(async move {
             loop {
                 {
-                    let file_readers = dr_clone.file_readers.lock();
-                    for (_, frs) in file_readers.iter() {
+                    let mut file_readers = dr_clone.file_readers.lock();
+                    for (_, frs) in file_readers.iter_mut() {
                         for fr in frs.iter() {
                             fr.core.lock().release_idle_buffer();
                         }
@@ -104,6 +104,7 @@ impl DataReader {
     pub fn close(&self, inode: Ino, fr: Arc<FileReader>) {
         let mut file_readers = self.file_readers.lock();
         if let Some(frs) = file_readers.get_mut(&inode) {
+            // 如果没有这个close，那么可能这个fr无法清理掉
             frs.retain(|f| !Arc::ptr_eq(f, &fr))
         }
     }

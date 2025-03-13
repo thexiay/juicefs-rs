@@ -1,11 +1,8 @@
 use std::{
-    cmp::{max, min},
-    collections::{HashMap, LinkedList},
-    mem::take,
-    sync::{
+    cmp::{max, min}, collections::{HashMap, LinkedList}, mem::take, ops::Deref, sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, OnceLock,
-    },
+    }
 };
 
 use bytes::Bytes;
@@ -31,7 +28,7 @@ use tracing::{error, warn};
 
 use crate::{
     config::Config,
-    error::{Result, SharedResult, StorageSnafu, VfsError, VfsErrorEnum},
+    error::{Result, VfsError, VfsErrorEnum},
     frange::Frange,
     reader::DataReaderInvalidator,
 };
@@ -59,6 +56,97 @@ pub struct DataWriter {
     files: Mutex<HashMap<Ino, Arc<FileWriter>>>,
 }
 
+impl DataWriter {
+    pub fn open(&self, ino: Ino, length: u64) -> Arc<FileWriter> {
+        let mut files = self.files.lock();
+        files
+            .entry(ino)
+            .or_insert_with(|| Arc::new(FileWriter::new(self.dw_ctx.clone(), ino, length)))
+            .clone()
+    }
+
+    pub fn truncate(&self, ino: Ino, length: u64) {
+        let writer = self.find(ino);
+        if let Some(writer) = writer {
+            writer.truncate(length);
+        }
+    }
+
+    pub fn len(&self, ino: Ino) -> u64 {
+        let writer = self.find(ino);
+        if let Some(writer) = writer {
+            writer.len()
+        } else {
+            0
+        }
+    }
+
+    pub async fn flush(&self, ino: Ino) -> Result<()> {
+        let writer = self.find(ino);
+        if let Some(writer) = writer {
+            writer.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn flush_all(&self) -> Result<()> {
+        let snapshot = {
+            let files = self.files.lock();
+            files.clone()
+        };
+        
+        for (_, writer) in snapshot.iter() {
+            writer.flush().await.inspect_err(|e| {
+                error!("flush all error: {:?}", e);
+            })?;
+        }
+        Ok(())
+    }
+
+    fn find(&self, ino: Ino) -> Option<Arc<FileWriter>> {
+        let files = self.files.lock();
+        files.get(&ino).map(|f| f.clone())
+    }
+
+}
+
+/*
+pub struct FileWriterRef {
+    writer: Arc<FileWriter>,
+    refs: AtomicU32,
+    dw: Arc<DataWriter>,
+}
+
+impl FileWriterRef {
+    fn new(writer: Arc<FileWriter>, dw: Arc<DataWriter>) -> Self {
+        Self {
+            writer,
+            refs: AtomicU32::new(1),
+            dw,
+        }
+    }
+}
+
+impl Deref for FileWriterRef {
+    type Target = FileWriter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl Drop for FileWriterRef {
+    fn drop(&mut self) {
+        let refs = self.refs.fetch_sub(1, Ordering::Relaxed);
+        if refs == 1 {
+            let mut files = self.dw.files.lock();
+            files.remove(&self.writer.ino);
+        }
+    }
+}
+ */
+
 struct FileWriterCtx {
     ino: Ino,
     ferr: OnceLock<Arc<VfsError>>,
@@ -80,8 +168,6 @@ impl FileWriterCtx {
 
 struct FileWriterCore {
     len: u64,
-    flush_waiting: u16,
-    write_waiting: u16,
     chunks: HashMap<u32, ChunkWriter>,
 }
 
@@ -90,11 +176,27 @@ pub struct FileWriter {
     fw_ctx: Arc<FileWriterCtx>,
     ino: Ino,
     writer: Mutex<FileWriterCore>,
-    flush_notify: Arc<Notify>,
-    write_notify: Arc<Notify>,
 }
 
 impl FileWriter {
+    fn new(dw_ctx: Arc<DataWriterCtx>, ino: Ino, length: u64) -> Self {
+        let fw_ctx = Arc::new(FileWriterCtx {
+            ino,
+            ferr: OnceLock::new(),
+            slices_cnt: AtomicU32::new(0),
+        });
+        let writer = Mutex::new(FileWriterCore {
+            len: length,
+            chunks: HashMap::new(),
+        });
+        Self {
+            dw_ctx,
+            fw_ctx,
+            ino,
+            writer,
+        }
+    }
+
     async fn write(&self, off: u64, mut data: Bytes) -> Result<()> {
         loop {
             if self.fw_ctx.slices_cnt.load(Ordering::Relaxed) < MAX_WRITING_SLICES_IN_FILE {
@@ -175,6 +277,21 @@ impl FileWriter {
                 }
             },
         }
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.flush().await
+    }
+
+    pub fn truncate(&self, length: u64) {
+        let mut writer = self.writer.lock();
+        // TODO: truncate write buffer if length < f.length
+        writer.len = length;
+    }
+
+    pub fn len(&self) -> u64 {
+        let core = self.writer.lock();
+        core.len
     }
 }
 

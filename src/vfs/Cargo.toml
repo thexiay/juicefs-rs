@@ -22,3 +22,4 @@ tracing-subscriber = { workspace = true }
 opendal = { workspace = true }
 parking_lot = { workspace = true }
 either = { workspace = true }
+dashmap = { workspace = true }

@@ -11,6 +11,7 @@ use crate::{
     quota::{MetaQuota, QuotaView},
 };
 use std::time::UNIX_EPOCH;
+use chrono::Utc;
 use tokio::time::{self, sleep};
 use tracing::info;
 
@@ -405,9 +406,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             off: 0,
             len: 100,
         },
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards"),
+        Utc::now()
     )
     .await
     .expect("write f: ");
@@ -716,9 +715,7 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
             off: 0,
             len: 100,
         },
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards"),
+        Utc::now()
     )
     .await
     .expect("write file: ");

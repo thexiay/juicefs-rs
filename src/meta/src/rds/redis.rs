@@ -29,7 +29,7 @@ use crate::base::{
     SetQuota, TrashSliceScan, NEXT_CHUNK, NEXT_INODE, USED_INODES, USED_SPACE,
 };
 use crate::config::{Config, Format};
-use crate::context::{Uid, UserExt, WithContext};
+use crate::context::{FsContext, Uid, UserExt, WithContext};
 use crate::error::{
     BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExists2Snafu, EntryExistsSnafu,
     InvalidArgSnafu, MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu,
@@ -514,10 +514,7 @@ impl RedisHandle {
 /// Context is independent execution context
 pub struct RedisEngine {
     engine: Arc<RedisHandle>,
-    uid: u32,
-    gid: u32,
-    gids: Vec<u32>,
-    token: CancellationToken,
+    context: FsContext,
 }
 
 impl Deref for RedisEngine {
@@ -530,6 +527,18 @@ impl Deref for RedisEngine {
 impl AsRef<CommonMeta> for RedisEngine {
     fn as_ref(&self) -> &CommonMeta {
         &self.engine.meta
+    }
+}
+
+impl AsRef<FsContext> for RedisEngine {
+    fn as_ref(&self) -> &FsContext {
+        &self.context
+    }
+}
+
+impl AsMut<FsContext> for RedisEngine {
+    fn as_mut(&mut self) -> &mut FsContext {
+        &mut self.context
     }
 }
 
@@ -572,10 +581,7 @@ impl RedisEngine {
         engine.check_server_config().await?;
         Ok(RedisEngine {
             engine: Arc::new(engine),
-            uid: 0,
-            gid: 0,
-            gids: Vec::new(),
-            token: CancellationToken::new(),
+            context: FsContext::default(),
         })
     }
 
@@ -944,39 +950,8 @@ impl Clone for RedisEngine {
     fn clone(&self) -> Self {
         RedisEngine {
             engine: self.engine.clone(),
-            uid: self.uid,
-            gid: self.gid,
-            gids: self.gids.clone(),
-            token: self.token.clone(),
+            context: self.context.clone(),
         }
-    }
-}
-
-impl WithContext for RedisEngine {
-    fn with_login(&mut self, uid: u32, gids: Vec<u32>) {
-        assert!(gids.len() > 0);
-        self.uid = uid;
-        self.gid = gids[0];
-        self.gids = gids;
-    }
-
-    fn with_cancel(&mut self, token: CancellationToken) {
-        self.token = token;
-    }
-    fn uid(&self) -> &u32 {
-        &self.uid
-    }
-    fn gid(&self) -> &u32 {
-        &self.gid
-    }
-    fn gids(&self) -> &Vec<u32> {
-        &self.gids
-    }
-    fn token(&self) -> &CancellationToken {
-        &self.token
-    }
-    fn check_permission(&self) -> bool {
-        true
     }
 }
 
@@ -2026,7 +2001,7 @@ impl Engine for RedisEngine {
         trash
             .as_ref()
             .inspect(|trash_ino| info!("do unlink produce new trash: {}", trash_ino));
-        let base = self.as_ref();
+        let base = AsRef::<CommonMeta>::as_ref(self);
         if let Some(trash_ino) = trash {
             let file = base.open_files.lock(trash_ino);
             let mut of = file.lock().await;

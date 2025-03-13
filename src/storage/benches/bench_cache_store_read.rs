@@ -19,7 +19,6 @@ fn bench_cache_read(c: &mut Criterion) {
         let mut writer = store.new_writer(1);
         writer
             .write_all_at(Buffer::from(vec![0; 1024]), 0)
-            .await
             .expect("write fail");
         writer.finish().await.expect("write fail");
         store
