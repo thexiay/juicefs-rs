@@ -1,10 +1,8 @@
 use std::{
-    cmp::{max, min},
-    collections::{HashMap, LinkedList},
-    sync::{
+    cmp::{max, min}, collections::{HashMap, LinkedList}, ops::Deref, sync::{
         atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc,
-    },
+    }
 };
 
 use bytes::{Bytes, BytesMut};
@@ -49,7 +47,7 @@ impl DataReaderInvalidator {
 pub struct DataReader {
     ctx: Arc<DataReaderCtx>,
     // ino到FileReader的映射，这个FileReader是能复用的
-    file_readers: Mutex<HashMap<Ino, Vec<Arc<FileReader>>>>,
+    file_readers: Mutex<HashMap<Ino, Vec<FileReader>>>,
 }
 
 impl DataReader {
@@ -93,20 +91,12 @@ impl DataReader {
         dr
     }
 
-    pub fn open(&self, inode: Ino, length: u64) -> Arc<FileReader> {
+    pub fn open(self: Arc<Self>, inode: Ino, length: u64) -> FileReaderRef {
         let mut file_readers = self.file_readers.lock();
         let frs = file_readers.entry(inode).or_insert_with(Vec::new);
-        let fr = Arc::new(FileReader::new(inode, length, self.ctx.clone()));
+        let fr = FileReader::new(inode, length, self.ctx.clone());
         frs.insert(0, fr.clone());
-        fr
-    }
-
-    pub fn close(&self, inode: Ino, fr: Arc<FileReader>) {
-        let mut file_readers = self.file_readers.lock();
-        if let Some(frs) = file_readers.get_mut(&inode) {
-            // 如果没有这个close，那么可能这个fr无法清理掉
-            frs.retain(|f| !Arc::ptr_eq(f, &fr))
-        }
+        FileReaderRef::new(fr, self.clone())
     }
 
     /// Truncate file length
@@ -444,13 +434,60 @@ impl FileReaderCore {
     }
 }
 
+pub struct FileReaderRef {
+    reader: FileReader,
+    dr: Arc<DataReader>,
+}
+
+impl FileReaderRef {
+    fn new(reader: FileReader, dr: Arc<DataReader>) -> Self {
+        Self { reader, dr }
+    }
+}
+
+impl Deref for FileReaderRef {
+    type Target = FileReader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+impl Drop for FileReaderRef {
+    fn drop(&mut self) {
+        if self.refs.load(Ordering::Relaxed) == 0 {
+            let mut files = self.dr.file_readers.lock();
+            files.remove(&self.reader.f_ctx.inode);
+        }
+    }
+}
+
 /// A File Reader represent a reader of `File Handle`.
 /// It can shared in different thread.
 pub struct FileReader {
     // data reader的上下文信息
     dr_ctx: Arc<DataReaderCtx>,
     f_ctx: Arc<FileReaderCtx>,
-    core: Mutex<FileReaderCore>,
+    core: Arc<Mutex<FileReaderCore>>,
+    refs: Arc<AtomicU32>,
+}
+
+impl Clone for FileReader {
+    fn clone(&self) -> Self {
+        self.refs.fetch_add(1, Ordering::Relaxed);
+        Self {
+            dr_ctx: self.dr_ctx.clone(),
+            f_ctx: self.f_ctx.clone(),
+            core: self.core.clone(),
+            refs: self.refs.clone(),
+        }
+    }
+}
+
+impl Drop for FileReader {
+    fn drop(&mut self) {
+        self.refs.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl FileReader {
@@ -462,7 +499,7 @@ impl FileReader {
         FileReader {
             dr_ctx: ctx.clone(),
             f_ctx: f_ctx.clone(),
-            core: Mutex::new(FileReaderCore {
+            core: Arc::new(Mutex::new(FileReaderCore {
                 dr_ctx: ctx,
                 f_ctx,
                 length,
@@ -473,7 +510,8 @@ impl FileReader {
                     last_atime: Utc::now(),
                 }),
                 chunk_readers: LinkedList::new(),
-            }),
+            })),
+            refs: Arc::new(AtomicU32::new(0)),
         }
     }
 

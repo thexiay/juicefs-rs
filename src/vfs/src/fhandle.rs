@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use juice_meta::api::{Entry, Ino, OFlag};
 use tokio_util::sync::CancellationToken;
 
-use crate::{reader::{DataReader, FileReader}, writer::{DataWriter, FileWriter, FileWriterRef}};
+use crate::{error::Result, reader::{DataReader, FileReader, FileReaderRef}, writer::{DataWriter, FileWriter, FileWriterRef}};
 
 pub type Fh = u64;
 /// Proxy of [`FileReader`] and [`FileWriter`]
@@ -13,8 +13,6 @@ pub type Fh = u64;
 pub struct FileHandle {
     inode: Ino,
     fh: u64,
-    data_writer: Arc<DataWriter>,
-    data_reader: Arc<DataReader>,
     
     // for dir
     pub(crate) children: Vec<Entry>,
@@ -28,7 +26,7 @@ pub struct FileHandle {
     locks: u8,
     flock_owner: u64,
     ofd_owner: u64,
-    pub(crate) reader: Option<Arc<FileReader>>,
+    pub(crate) reader: Option<FileReaderRef>,
     pub(crate) writer: Option<FileWriterRef>,
 
     // internal files 
@@ -45,20 +43,12 @@ impl FileHandle {
     pub fn fh(&self) -> Fh {
         self.fh
     }
-}
 
-impl Drop for FileHandle {
-    fn drop(&mut self) {
-        if let Some(reader) = &self.reader {
-            self.data_reader.close(self.inode, reader.clone());
-        }
+    pub async fn close(&mut self) {
         if let Some(writer) = &self.writer {
-            self.data_writer.close();
+            let _ = writer.flush().await;
         }
+        self.reader = None;
+        self.reader = None;
     }
 }
-
-
-
-
-

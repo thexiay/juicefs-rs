@@ -1,8 +1,12 @@
 use std::{
-    cmp::{max, min}, collections::{HashMap, LinkedList}, mem::take, ops::Deref, sync::{
+    cmp::{max, min},
+    collections::{HashMap, LinkedList},
+    mem::take,
+    ops::Deref,
+    sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, OnceLock,
-    }
+    },
 };
 
 use bytes::Bytes;
@@ -53,16 +57,49 @@ struct DataWriterCtx {
 
 pub struct DataWriter {
     dw_ctx: Arc<DataWriterCtx>,
-    files: Mutex<HashMap<Ino, Arc<FileWriter>>>,
+    files: Mutex<HashMap<Ino, FileWriter>>,
 }
 
 impl DataWriter {
-    pub fn open(&self, ino: Ino, length: u64) -> Arc<FileWriter> {
+    pub fn new(
+        config: Arc<Config>,
+        meta: Arc<dyn Meta>,
+        store: Arc<CachedStore>,
+        invalidator: DataReaderInvalidator,
+    ) -> Arc<Self> {
+        let dw = Arc::new(Self {
+            dw_ctx: Arc::new(DataWriterCtx {
+                meta: meta.clone(),
+                store,
+                config: config.clone(),
+                id_pool: SliceIDPool::new(meta.clone()),
+                dr_invalidator: invalidator,
+                block_size: config.chunk.max_block_size as u64,
+                used_read_buffer: AtomicU64::new(0),
+                max_read_buffer: config.chunk.buffer_size,
+                max_retries: config.meta.retries as u32,
+            }),
+            files: Mutex::new(HashMap::new()),
+        });
+        let dw_clone = dw.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut files = dw_clone.files.lock();
+                    files.retain(|_, v| v.refs.load(Ordering::Relaxed) > 0);
+                }
+                sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        dw
+    }
+
+    pub fn open(self: Arc<Self>, ino: Ino, length: u64) -> FileWriterRef {
         let mut files = self.files.lock();
-        files
+        let writer = files
             .entry(ino)
-            .or_insert_with(|| Arc::new(FileWriter::new(self.dw_ctx.clone(), ino, length)))
-            .clone()
+            .or_insert_with(|| FileWriter::new(self.dw_ctx.clone(), ino, length));
+        FileWriterRef::new(writer.clone(), self.clone())
     }
 
     pub fn truncate(&self, ino: Ino, length: u64) {
@@ -95,7 +132,7 @@ impl DataWriter {
             let files = self.files.lock();
             files.clone()
         };
-        
+
         for (_, writer) in snapshot.iter() {
             writer.flush().await.inspect_err(|e| {
                 error!("flush all error: {:?}", e);
@@ -104,27 +141,20 @@ impl DataWriter {
         Ok(())
     }
 
-    fn find(&self, ino: Ino) -> Option<Arc<FileWriter>> {
+    fn find(&self, ino: Ino) -> Option<FileWriter> {
         let files = self.files.lock();
         files.get(&ino).map(|f| f.clone())
     }
-
 }
 
-/*
 pub struct FileWriterRef {
-    writer: Arc<FileWriter>,
-    refs: AtomicU32,
+    writer: FileWriter,
     dw: Arc<DataWriter>,
 }
 
 impl FileWriterRef {
-    fn new(writer: Arc<FileWriter>, dw: Arc<DataWriter>) -> Self {
-        Self {
-            writer,
-            refs: AtomicU32::new(1),
-            dw,
-        }
+    fn new(writer: FileWriter, dw: Arc<DataWriter>) -> Self {
+        Self { writer, dw }
     }
 }
 
@@ -138,14 +168,12 @@ impl Deref for FileWriterRef {
 
 impl Drop for FileWriterRef {
     fn drop(&mut self) {
-        let refs = self.refs.fetch_sub(1, Ordering::Relaxed);
-        if refs == 1 {
+        if self.refs.load(Ordering::Relaxed) == 0 {
             let mut files = self.dw.files.lock();
             files.remove(&self.writer.ino);
         }
     }
 }
- */
 
 struct FileWriterCtx {
     ino: Ino,
@@ -175,7 +203,27 @@ pub struct FileWriter {
     dw_ctx: Arc<DataWriterCtx>,
     fw_ctx: Arc<FileWriterCtx>,
     ino: Ino,
-    writer: Mutex<FileWriterCore>,
+    writer: Arc<Mutex<FileWriterCore>>,
+    refs: Arc<AtomicU32>,
+}
+
+impl Clone for FileWriter {
+    fn clone(&self) -> Self {
+        self.refs.fetch_add(1, Ordering::Relaxed);
+        Self {
+            dw_ctx: self.dw_ctx.clone(),
+            fw_ctx: self.fw_ctx.clone(),
+            ino: self.ino.clone(),
+            writer: self.writer.clone(),
+            refs: self.refs.clone(),
+        }
+    }
+}
+
+impl Drop for FileWriter {
+    fn drop(&mut self) {
+        self.refs.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl FileWriter {
@@ -185,19 +233,20 @@ impl FileWriter {
             ferr: OnceLock::new(),
             slices_cnt: AtomicU32::new(0),
         });
-        let writer = Mutex::new(FileWriterCore {
+        let writer = Arc::new(Mutex::new(FileWriterCore {
             len: length,
             chunks: HashMap::new(),
-        });
+        }));
         Self {
             dw_ctx,
             fw_ctx,
             ino,
             writer,
+            refs: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    async fn write(&self, off: u64, mut data: Bytes) -> Result<()> {
+    pub async fn write(&self, off: u64, mut data: Bytes) -> Result<()> {
         loop {
             if self.fw_ctx.slices_cnt.load(Ordering::Relaxed) < MAX_WRITING_SLICES_IN_FILE {
                 break;
@@ -236,7 +285,7 @@ impl FileWriter {
         self.fw_ctx.get_result()
     }
 
-    async fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<()> {
         let mut core = self.writer.lock();
         let max_flush_time = max(
             std::time::Duration::from_secs(
@@ -279,10 +328,6 @@ impl FileWriter {
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
-        self.flush().await
-    }
-
     pub fn truncate(&self, length: u64) {
         let mut writer = self.writer.lock();
         // TODO: truncate write buffer if length < f.length
@@ -295,7 +340,7 @@ impl FileWriter {
     }
 }
 
-// TODO: 如果这个协程是全局的，则需要保护它的稳定性
+// TODO: Make it more reliable
 struct SliceIDPool {
     meta: Arc<dyn Meta>,
     id_rx: Mutex<Receiver<MetaResult<u64>>>,

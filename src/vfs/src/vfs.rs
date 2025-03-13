@@ -39,8 +39,8 @@ pub struct Vfs {
     conf: Arc<Config>,
     meta: Arc<dyn Meta>,
     store: Arc<CachedStore>,
-    reader: DataReader,
-    writer: DataWriter,
+    reader: Arc<DataReader>,
+    writer: Arc<DataWriter>,
 
     handles: DashMap<Ino, DashMap<Fh, Arc<AsyncRwLock<FileHandle>>>>,
     ino_mapping: DashMap<Fh, Ino>,
@@ -117,11 +117,11 @@ impl Vfs {
         let mut h = h.write().await;
         match flags.intersection(O_ACCMODE) {
             OFlag::O_RDONLY => {
-                h.reader = Some(self.reader.open(ino, length));
+                h.reader = Some(self.reader.clone().open(ino, length));
             }
             OFlag::O_WRONLY | OFlag::O_RDWR => {
-                h.reader = Some(self.reader.open(ino, length));
-                h.writer = Some(self.writer.open(ino, length));
+                h.reader = Some(self.reader.clone().open(ino, length));
+                h.writer = Some(self.writer.clone().open(ino, length));
             },
             _ => {}
         }
