@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use snafu::{ensure, ensure_whatever, whatever};
 use std::collections::{HashMap, LinkedList};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,9 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask,
-    Session, SessionInfo, SetAttrMask, Slice, Summary, TreeSummary, XattrF, MAX_VERSION,
-    RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -1491,9 +1490,12 @@ where
             if !meta.as_ref().root().is_root() && ino == ROOT_INODE {
                 return Err(OUTSIDE.to_string());
             }
-            names.push("/".to_string());
             names.reverse();
-            Ok(names.join("/"))
+            if names.is_empty() {
+                Ok("/".to_string())
+            } else {
+                Ok(format!("/{}/", names.join("/")))
+            }
         }
 
         let mut paths = vec![];
@@ -1524,7 +1526,7 @@ where
             for e in entries {
                 if e.inode == inode {
                     c += 1;
-                    paths.push(format!("{}/{}", dir, e.name));
+                    paths.push(format!("{}{}", dir, e.name));
                 }
             }
             if c != count {
@@ -1717,11 +1719,11 @@ where
 
     // ---------------------------------------- sys call -----------------------------------------------------------
     // StatFS returns summary statistics of a volume.
-    async fn stat_fs(&self, ino: Ino) -> Result<(u64, u64, u64, u64)> {
-        let (mut space_total, mut space_avail, mut i_used, mut i_avail) = self.stat_root_fs().await;
+    async fn stat_fs(&self, ino: Ino) -> Result<StatFs> {
+        let mut stat_fs = self.stat_root_fs().await;
         let ino = self.as_ref().check_root(ino);
         if ino.is_root() {
-            return Ok((space_total, space_avail, i_used, i_avail));
+            return Ok(stat_fs.clone());
         }
 
         // Not rootfs, fallback to dir ino
@@ -1748,24 +1750,24 @@ where
                 }
                 if quota.max_space > 0 {
                     let ls = (quota.max_space - quota.used_space) as u64;
-                    if ls < space_avail {
-                        space_avail = ls; // minium avail space of all root chain
+                    if ls < stat_fs.space_avail {
+                        stat_fs.space_avail = ls; // minium avail space of all root chain
                     }
                 }
                 if quota.max_inodes > 0 {
                     let li = (quota.max_inodes - quota.used_inodes) as u64;
-                    if li < i_avail {
-                        i_avail = li; // minium avail inodes of all root chain
+                    if li < stat_fs.i_avail {
+                        stat_fs.i_avail = li; // minium avail inodes of all root chain
                     }
                 }
             }
             inode = attr.parent;
         }
         if let Some(usage) = usage {
-            space_total = usage.used_space + space_avail;
-            i_used = usage.used_inodes;
+            stat_fs.space_total = usage.used_space + stat_fs.space_avail;
+            stat_fs.i_used = usage.used_inodes;
         }
-        Ok((space_total, space_avail, i_used, i_avail))
+        Ok(stat_fs)
     }
 
     // Access checks the access permission on given inode.
@@ -2998,7 +3000,7 @@ where
     // GetParents returns a map of node parents (> 1 parents if hardlinked)
     async fn get_parents(&self, inode: Ino) -> HashMap<Ino, u32> {
         if inode.is_root() || inode.is_trash() {
-            return [(1, 1)].into();
+            return [(ROOT_INODE, 1)].into();
         }
         let attr = match self.get_attr(inode).await {
             Ok(attr) => attr,

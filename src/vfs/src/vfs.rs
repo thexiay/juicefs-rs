@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use juice_meta::{
-    api::{Attr, Entry, Ino, Meta, OFlag, O_ACCMODE},
+    api::{Attr, Entry, Ino, Meta, OFlag, StatFs, O_ACCMODE},
     context::{FsContext, Gid, Uid, WithContext},
 };
 use juice_storage::api::CachedStore;
@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
+    error::Result,
     fhandle::{Fh, FileHandle},
     reader::DataReader,
     writer::DataWriter,
@@ -47,6 +48,30 @@ pub struct Vfs {
     next_fh: AtomicU64,
     last_modified: HashMap<Ino, DateTime<Utc>>,
 }
+
+impl Vfs {
+    pub fn lookup(&self, parent: Ino, name: &str) -> Result<Entry> {
+        todo!()
+    }
+
+    pub fn get_attr(&self, ino: Ino, opened: u8) -> Result<Entry> {
+        todo!()
+    }
+
+    pub fn set_attr(&self, ino: Ino, set: isize, fh: Fh, attr: Attr) -> Result<Entry> {
+        todo!()
+    }
+
+    pub fn stat_fs(&self, ino: Ino) -> Result<StatFs> {
+        todo!()
+    }
+
+    //  parent Ino, name string, mode uint16, cumask uint16, rdev uint32) (entry *meta.Entry, err syscall.Errno) {
+    pub fn mknod(&self, parent: Ino, name: &str, mode: u16, cumask: u16, rdev: u32) -> Result<Entry> {
+        todo!()
+    }
+}
+
 
 impl Vfs {
     fn new_handle(&self, ino: Ino, flags: OFlag) -> Arc<AsyncRwLock<FileHandle>> {
@@ -138,7 +163,6 @@ impl Vfs {
 
     async fn cache_dir_handle(&self, parent: Ino, name: String, entry: Option<(Ino, Attr)>) {
         let handles = self.find_all_handle(parent);
-        // 注意这里只是当前所有parent的快照
         for handle in handles {
             let mut handle = handle.write().await;
             if !handle.children.is_empty() && !handle.indexs.is_empty() {

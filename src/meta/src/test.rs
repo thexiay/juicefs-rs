@@ -10,7 +10,6 @@ use crate::{
     config::Format,
     quota::{MetaQuota, QuotaView},
 };
-use std::time::UNIX_EPOCH;
 use chrono::Utc;
 use tokio::time::{self, sleep};
 use tracing::info;
@@ -283,17 +282,17 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .await;
     assert!(rs.unwrap_err().is_entry_exists(&ROOT_INODE, "f"));
     // test rename with replace
-    let before_stat = m.stat_fs(ROOT_INODE).await.unwrap();
+    let before_stat_fs = m.stat_fs(ROOT_INODE).await.unwrap();
     let renamed_entry = m
         .rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::empty())
         .await
         .expect("rename f2 -> f: ");
     assert!(renamed_entry.is_some());
-    let after_stat = m.stat_fs(ROOT_INODE).await.unwrap();
-    assert_eq!(before_stat.2 - after_stat.2, 1); // used inode decr 1
+    let after_stat_fs = m.stat_fs(ROOT_INODE).await.unwrap();
+    assert_eq!(before_stat_fs.i_used - after_stat_fs.i_used, 1); // used inode decr 1
     assert_eq!(
         // avaiable space incr attr length
-        (after_stat.1 - before_stat.1) as i64,
+        (after_stat_fs.space_avail - before_stat_fs.space_avail) as i64,
         align_4k(renamed_entry.unwrap().1.length)
     );
     // test rename with exchange
@@ -516,21 +515,21 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .expect("setxattr: ");
 
     // ----------------------------------------- test quota -----------------------------------------
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 50);
-    assert_eq!(iavail, 10 << 20);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 50);
+    assert_eq!(stat_fs.i_avail, 10 << 20);
     let mut new_format = format.as_ref().clone();
     new_format.capacity = 1 << 20;
     new_format.inodes = 100;
     m.init(new_format, false).await.expect("set quota failed");
     // test async flush quota task
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    if totalspace != 1 << 20 || iavail != 97 {
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    if stat_fs.space_total != 1 << 20 || stat_fs.i_avail != 97 {
         // only tree inodes are used
         time::sleep(Duration::from_millis(100)).await;
-        let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-        assert_eq!(totalspace, 1 << 20);
-        assert_eq!(iavail, 97);
+        let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+        assert_eq!(stat_fs.space_total, 1 << 20);
+        assert_eq!(stat_fs.i_avail, 97);
     }
     // test StatFS with subdir and quota
     let (sub_ino, sub_attr) = m
@@ -539,16 +538,16 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .expect("mkdir subdir: ");
     info!("sub_no {sub_ino}");
     m.chroot("subdir").await.expect("chroot: ");
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 20);
-    assert_eq!(iavail, 96); // used 4 inodes
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 20);
+    assert_eq!(stat_fs.i_avail, 96); // used 4 inodes
 
     m.handle_quota(QuotaOp::Set(QuotaView::default()), ".", false, false)
         .await
         .expect("set quota: ");
-    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, (1 << 20) - 4 * align_4k(0) as u64);
-    assert_eq!(i_avail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, (1 << 20) - 4 * align_4k(0) as u64);
+    assert_eq!(stat_fs.i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -562,9 +561,9 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(i_avail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -578,9 +577,9 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, (1 << 20) as u64 - 4 * align_4k(0) as u64);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, (1 << 20) as u64 - 4 * align_4k(0) as u64);
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -594,18 +593,18 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.get_base().chroot(ROOT_INODE);
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 20);
-    assert_eq!(iavail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 20);
+    assert_eq!(stat_fs.i_avail, 96);
     // statfs subdir directly
-    let (totalspace, _, _, iavail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 10);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 10);
 
     // mock flush quota cache into persist layer
     m.load_quotas().await;
@@ -616,11 +615,11 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             .and_modify(|quota| quota.update(4 << 10, 15));  // test used space > total space
     }
     m.flush_quotas().await;
-    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(total_space, 4 << 10);
-    assert_eq!(avail_space, 0);
-    assert_eq!(i_used, 15);
-    assert_eq!(i_avail, 0);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 4 << 10);
+    assert_eq!(stat_fs.space_avail, 0);
+    assert_eq!(stat_fs.i_used, 15);
+    assert_eq!(stat_fs.i_avail, 0);
     {
         let mut dir_quotas = m.as_ref().dir_quotas.write();
         dir_quotas
@@ -628,11 +627,11 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             .and_modify(|quota| quota.update(-8 << 10, -20)); // invalid used space
     }
     m.flush_quotas().await;
-    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(avail_space, 1 << 10);
-    assert_eq!(i_used, 0);
-    assert_eq!(i_avail, 10);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.space_avail, 1 << 10);
+    assert_eq!(stat_fs.i_used, 0);
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.rmdir(ROOT_INODE, "subdir", false)
         .await
@@ -699,7 +698,6 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
     format.capacity = 0;
     m.init(format, false).await.unwrap();
 
-    m.unlink(1, "f", false).await.expect("unlink f: ");
     let (inode, attr) = m
         .create(1, "f", 0650, 022, OFlag::empty())
         .await
@@ -772,7 +770,7 @@ pub async fn test_remove(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .mkdir(parent, "d2", 0755, 0, 0)
         .await
         .expect("create d/d2: ");
-    let (inode, attr) = m
+    let (inode, _) = m
         .create(parent, "f", 0644, 0, OFlag::empty())
         .await
         .expect("create d/f: ");

@@ -267,6 +267,14 @@ pub struct Attr {
     pub default_acl: AclId, // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
+#[derive(Default, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatFs {
+    pub space_total: u64,
+    pub space_avail: u64,
+    pub i_used: u64,
+    pub i_avail: u64,
+}
+
 // Meta is a interface for a meta service for file system.
 #[async_trait]
 pub trait Meta: WithContext + Send + Sync + 'static {
@@ -394,7 +402,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ///
     /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
     ///    total space is the total size of the inode.
-    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
+    async fn stat_fs(&self, inode: Ino) -> Result<StatFs>;
 
     // Access checks the current user can access (mode)permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;

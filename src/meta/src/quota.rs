@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
-use crate::api::{INodeType, Ino, Meta, Summary, ROOT_INODE};
+use crate::api::{INodeType, Ino, Meta, StatFs, Summary, ROOT_INODE};
 use crate::base::{CommonMeta, DirStat, Engine, USED_INODES, USED_SPACE};
 use crate::error::{NoSpaceSnafu, QuotaExceededSnafu, Result};
 use crate::utils::align_4k;
@@ -125,7 +125,7 @@ pub(crate) trait MetaQuota {
     async fn get_dir_summary(&self, ino: Ino, recursive: bool, strict: bool) -> Result<Summary>;
 
     /// Get the stat of the rootfs
-    async fn stat_root_fs(&self) -> (u64, u64, u64, u64);
+    async fn stat_root_fs(&self) -> StatFs;
 }
 
 #[async_trait]
@@ -467,7 +467,7 @@ where
         Ok(summary)
     }
 
-    async fn stat_root_fs(&self) -> (u64, u64, u64, u64) {
+    async fn stat_root_fs(&self) -> StatFs {
         let meta = dyn_clone::clone_box(self);
         let err = timeout(Duration::from_millis(150), async {
             meta.get_counter(USED_SPACE).await
@@ -530,6 +530,11 @@ where
             }
             iavail
         };
-        (total_space, availspace, iused, iavail)
+        StatFs {
+            space_total: total_space,
+            space_avail: availspace,
+            i_used: iused,
+            i_avail: iavail,
+        }
     }
 }
