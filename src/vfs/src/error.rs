@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use juice_meta::error::MetaError;
 use juice_storage::error::StorageError;
+use nix::errno::Errno;
 use snafu::{FromString, GenerateImplicitData, Snafu};
-use tracing::Span;
+use tracing::{error, Span};
 
 #[derive(Debug)]
 pub struct SpanGuard(tracing::Span);
@@ -22,6 +23,23 @@ pub struct VfsError {
     loc: snafu::Location,
     #[snafu(implicit)]
     span: SpanGuard,
+}
+
+impl VfsError {
+    pub fn fs_err(&self) -> Errno {
+        match &self.source {
+            VfsErrorEnum::IoError { .. } => Errno::EIO,
+            VfsErrorEnum::IoDetailError { .. } => Errno::EIO,
+            VfsErrorEnum::MetaError { source } => source.fs_err(),
+            VfsErrorEnum::StorageError { .. } => Errno::EIO,
+            VfsErrorEnum::EIO => Errno::EIO,
+            VfsErrorEnum::EIOFailedTooManyTimes => Errno::EIO,
+            VfsErrorEnum::TryAgain => Errno::EAGAIN,
+            VfsErrorEnum::Shared { source } => source.fs_err(),
+            VfsErrorEnum::GenericError { .. } => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]

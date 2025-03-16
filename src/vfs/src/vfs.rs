@@ -1,228 +1,378 @@
 use std::{
-    collections::HashMap, path::Path, sync::{
+    collections::HashMap,
+    ops::Deref,
+    path::Path,
+    sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
-    }
+    },
 };
 
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use juice_meta::{
-    api::{Attr, Entry, Ino, Meta, OFlag, StatFs, O_ACCMODE},
+    api::{
+        Attr, Entry, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, StatFs, MAX_FILE_LEN,
+        MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
+    },
     context::{FsContext, Gid, Uid, WithContext},
 };
 use juice_storage::api::CachedStore;
+use nix::errno::Errno;
+use parking_lot::RwLock;
 use tokio::sync::RwLock as AsyncRwLock;
-use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 use crate::{
     config::Config,
-    error::Result,
-    fhandle::{Fh, FileHandle},
+    frange::Frange,
+    handle::{Fh, FileHandle},
+    internal::{InternalNode, CONTROL_INODE, LOG_INODE},
     reader::DataReader,
     writer::DataWriter,
 };
 
-const MIN_INTERNAL_NODE: Ino = 0x7FFFFFFF00000000;
-const LOG_INODE: Ino = MIN_INTERNAL_NODE + 1;
-const CONTROL_INODE: Ino = MIN_INTERNAL_NODE + 2;
-const STATS_INODE: Ino = MIN_INTERNAL_NODE + 3;
-const CONFIG_INODE: Ino = MIN_INTERNAL_NODE + 4;
-const TRASH_INODE: Ino = juice_meta::api::TRASH_INODE;
-
 #[derive(Clone)]
-pub struct SharedVfs {
-    vfs: Arc<Vfs>,
+pub struct Vfs {
+    vfs: Arc<VfsInner>,
     context: FsContext,
 }
 
-pub struct Vfs {
-    conf: Arc<Config>,
-    meta: Arc<dyn Meta>,
-    store: Arc<CachedStore>,
-    reader: Arc<DataReader>,
-    writer: Arc<DataWriter>,
+impl Deref for Vfs {
+    type Target = VfsInner;
 
-    handles: DashMap<Ino, DashMap<Fh, Arc<AsyncRwLock<FileHandle>>>>,
-    ino_mapping: DashMap<Fh, Ino>,
-    next_fh: AtomicU64,
-    last_modified: HashMap<Ino, DateTime<Utc>>,
-}
-
-impl Vfs {
-    pub fn lookup(&self, parent: Ino, name: &str) -> Result<Entry> {
-        todo!()
-    }
-
-    pub fn get_attr(&self, ino: Ino, opened: u8) -> Result<Entry> {
-        todo!()
-    }
-
-    pub fn set_attr(&self, ino: Ino, set: isize, fh: Fh, attr: Attr) -> Result<Entry> {
-        todo!()
-    }
-
-    pub fn stat_fs(&self, ino: Ino) -> Result<StatFs> {
-        todo!()
-    }
-
-    //  parent Ino, name string, mode uint16, cumask uint16, rdev uint32) (entry *meta.Entry, err syscall.Errno) {
-    pub fn mknod(&self, parent: Ino, name: &str, mode: u16, cumask: u16, rdev: u32) -> Result<Entry> {
+    fn deref(&self) -> &Self::Target {
         todo!()
     }
 }
 
+impl AsRef<FsContext> for Vfs {
+    fn as_ref(&self) -> &FsContext {
+        &self.context
+    }
+}
 
+impl AsMut<FsContext> for Vfs {
+    fn as_mut(&mut self) -> &mut FsContext {
+        &mut self.context
+    }
+}
+
+pub struct VfsInner {
+    pub(crate) conf: Arc<Config>,
+    pub(crate) meta: Arc<dyn Meta>,
+    pub(crate) store: Arc<CachedStore>,
+    pub(crate) reader: Arc<DataReader>,
+    pub(crate) writer: Arc<DataWriter>,
+
+    pub(crate) handles: DashMap<Ino, DashMap<Fh, Arc<AsyncRwLock<FileHandle>>>>,
+    pub(crate) ino_mapping: DashMap<Fh, Ino>,
+    pub(crate) next_fh: AtomicU64,
+    pub(crate) internal_inos: Vec<InternalNode>,
+    pub(crate) last_modified: RwLock<HashMap<Ino, DateTime<Utc>>>,
+}
+
+/// Here's the function of vfs:
+/// 1. Interface calls that wrap metadata and data
+/// 2. Handle different inode:
+///     - special control inode
+///     - file inode
+///     - directory inode
+/// 3. Pre-check such as file length, etc.
 impl Vfs {
-    fn new_handle(&self, ino: Ino, flags: OFlag) -> Arc<AsyncRwLock<FileHandle>> {
-        let low_bits = if OFlag::O_RDONLY.contains(flags) {
-            // read only
-            1
-        } else {
-            0
-        };
-        while self
-            .ino_mapping
-            .get(&self.next_fh.load(Ordering::SeqCst))
-            .is_some()
-            || self.next_fh.load(Ordering::SeqCst) & 1 != low_bits
-        {
-            self.next_fh
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst); // skip recovered fd
-        }
-        let fh = self
-            .next_fh
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let handle = Arc::new(AsyncRwLock::new(FileHandle::new(ino, fh, flags, false)));
-        self.handles
-            .entry(ino)
-            .or_insert_with(DashMap::new)
-            .insert(fh, handle.clone());
-        handle
+    pub async fn get_attr(&self, ino: Ino, opened: u8) -> Result<Entry, Errno> {
+        todo!()
     }
 
-    fn find_handle(&self, ino: Ino, fh: Fh) -> Option<Arc<AsyncRwLock<FileHandle>>> {
-        let handle = self
-            .handles
-            .get(&ino)
-            .and_then(|map| map.get(&fh).map(|entry| entry.value().clone()));
-        match handle {
-            Some(handle) => Some(handle),
-            None => {
-                if fh & 1 == 1 && ino != CONTROL_INODE {
-                    let handle =
-                        Arc::new(AsyncRwLock::new(FileHandle::new(ino, fh, OFlag::O_RDWR, true)));
-                    self.handles
-                        .entry(ino)
-                        .or_insert_with(DashMap::new)
-                        .insert(fh, handle.clone());
-                    self.ino_mapping.insert(fh, ino);
-                    Some(handle)
-                } else {
-                    None
-                }
+    pub async fn set_attr(&self, ino: Ino, set: isize, fh: Fh, attr: Attr) -> Result<Entry, Errno> {
+        todo!()
+    }
+
+    pub async fn stat_fs(&self, ino: Ino) -> Result<StatFs, Errno> {
+        let stat_fs = self.meta.stat_fs(ino).await.map_err(|e| {
+            error!("stat_fs failed: {:?}", e);
+            e.fs_err()
+        })?;
+        Ok(stat_fs)
+    }
+
+    pub async fn mknod(
+        &self,
+        parent: Ino,
+        name: &str,
+        r#type: INodeType,
+        mode: u16,
+        cumask: u16,
+        rdev: u32,
+        path: &str,
+    ) -> Result<Entry, Errno> {
+        if parent == ROOT_INODE && self.is_special_node(name) {
+            return Err(Errno::EEXIST);
+        }
+
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        let (ino, attr) = self
+            .meta
+            .mknod(parent, name, r#type, mode, cumask, rdev, path)
+            .await
+            .map_err(|e| {
+                error!("mknod failed: {:?}", e);
+                e.fs_err()
+            })?;
+        self.cache_dir_entry(parent, name, Some((ino, attr.clone())));
+        Ok(Entry {
+            inode: ino,
+            name: name.to_string(),
+            attr,
+        })
+    }
+
+    pub async fn mkdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u16,
+        cumask: u16,
+    ) -> Result<Entry, Errno> {
+        if parent == ROOT_INODE && self.is_special_node(name) {
+            return Err(Errno::EEXIST);
+        }
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        let (ino, attr) = self
+            .meta
+            .mkdir(parent, name, mode, cumask, 0)
+            .await
+            .map_err(|e| {
+                error!("mkdir failed: {:?}", e);
+                e.fs_err()
+            })?;
+        self.cache_dir_entry(parent, name, Some((ino, attr.clone())));
+        Ok(Entry {
+            inode: ino,
+            name: name.to_string(),
+            attr,
+        })
+    }
+
+    pub async fn rmdir(&self, parent: Ino, name: &str) -> Result<(), Errno> {
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        self.meta.rmdir(parent, name, false).await.map_err(|e| {
+            error!("rmdir failed: {:?}", e);
+            e.fs_err()
+        })?;
+        self.cache_dir_entry(parent, name, None);
+        Ok(())
+    }
+
+    pub async fn open(&self, ino: Ino, flags: OFlag) -> Result<(Fh, Attr), Errno> {
+        if VfsInner::is_special_inode(ino) {
+            if ino != CONTROL_INODE && (flags & O_ACCMODE) != OFlag::O_RDONLY {
+                return Err(Errno::EACCES);
             }
+            todo!()
         }
+
+        let mut attr = self.meta.open(ino, flags).await.map_err(|e| {
+            error!("open failed: {:?}", e);
+            e.fs_err()
+        })?;
+        self.update_len(ino, &mut attr);
+        let fh = self.new_file_handle(ino, attr.length, flags).await;
+        Ok((fh, attr))
     }
 
-    fn find_all_handle(&self, ino: Ino) -> Vec<Arc<AsyncRwLock<FileHandle>>> {
-        self.handles
-            .get(&ino)
-            .map(|map| map.iter().map(|entry| entry.value().clone()).collect())
-            .unwrap_or_default()
+    pub async fn opendir(&self, ino: Ino, flags: OFlag) -> Result<Fh, Errno> {
+        if self.check_permission() {
+            let mmask = match flags & (OFlag::O_RDONLY | OFlag::O_WRONLY | OFlag::O_RDWR) {
+                OFlag::O_RDONLY => ModeMask::READ,
+                OFlag::O_WRONLY => ModeMask::WRITE,
+                OFlag::O_RDWR => ModeMask::READ | ModeMask::WRITE,
+                _ => ModeMask::empty(),
+            };
+            self.meta
+                .access(ino, mmask, &Attr::default())
+                .await
+                .map_err(|_| Errno::EACCES)?;
+        }
+        let fh = self.new_file_handle(ino, 0, flags).await;
+        Ok(fh)
     }
 
-    fn release_handle(&self, ino: Ino, fh: Fh) {
-        self.handles.get(&ino).map(|map| map.remove(&fh));
-        self.handles.retain(|_, v| v.len() > 0);
-    }
-
-    async fn new_file_handle(&self, ino: Ino, length: u64, flags: OFlag) -> Fh {
-        let h = self.new_handle(ino, flags);
-        let mut h = h.write().await;
-        match flags.intersection(O_ACCMODE) {
-            OFlag::O_RDONLY => {
-                h.reader = Some(self.reader.clone().open(ino, length));
+    pub async fn releasedir(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
+        match self.find_handle(ino, fh) {
+            Some(h) => {
+                self.release_handle(ino, fh); // dir has no writer and reader, so delete it directly
+                Ok(())
             }
-            OFlag::O_WRONLY | OFlag::O_RDWR => {
-                h.reader = Some(self.reader.clone().open(ino, length));
-                h.writer = Some(self.writer.clone().open(ino, length));
-            },
-            _ => {}
+            None => Err(Errno::EBADF),
         }
-        h.fh()
     }
 
-    async fn release_file_handle(&self, ino: Ino, fh: Fh) {
-        let h = self.find_handle(ino, fh);
-        if let Some(h) = h {
+    pub async fn release(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
+        if VfsInner::is_special_inode(ino) {
+            if ino == LOG_INODE {
+                // close access log
+            }
             self.release_handle(ino, fh);
-            h.write().await.close();
+            return Ok(());
         }
+
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        let h = h.write().await;
+        if let Some(writer) = &h.writer {
+            writer.flush().await.map_err(|e| {
+                error!("flush writer failed: {:?}", e);
+                e.fs_err()
+            })?;
+            let mut last_modified = self.last_modified.write();
+            last_modified.insert(ino, Utc::now());
+        }
+        if let Some(ofd_lock_owner) = &h.ofd_lock_owner {
+            let _ = self
+                .meta
+                .setlk(ino, *ofd_lock_owner, false, Fcntl::F_RDLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
+                .await;
+        }
+        let _ = self.meta.close(ino).await;
+        self.release_handle(ino, fh); // drop file handle auto kill all reader and writer tasks
+        Ok(())
     }
 
-    async fn cache_dir_handle(&self, parent: Ino, name: String, entry: Option<(Ino, Attr)>) {
-        let handles = self.find_all_handle(parent);
-        for handle in handles {
-            let mut handle = handle.write().await;
-            if !handle.children.is_empty() && !handle.indexs.is_empty() {
-                if let Some((ino, attr)) = &entry {
-                    handle.children.push(Entry {
-                        inode: *ino,
-                        name: name.clone(),
-                        attr: attr.clone(),
-                    });
-                } else {
-                    let index = handle.indexs.remove(&name);
-                    if let Some(index) = index {
-                        handle.children[index].inode = 0;  // invalid
-                        if index >= handle.read_off {
-                            // not read yet, remove it
-                            handle.children.remove(index);
-                        }
-                    }
-                }
+    pub async fn flush(&self, ino: Ino, fh: Fh, lock_owner: u64) -> Result<(), Errno> {
+        if VfsInner::is_special_inode(ino) {
+            if ino == CONTROL_INODE {
+                // cancel all operations
             }
+            return Ok(());
+        }
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+
+        let mut h = h.write().await;
+        if let Some(ref writer) = h.writer {
+            writer.flush().await.map_err(|e| {
+                error!("flush writer failed: {:?}", e);
+                e.fs_err()
+            })?;
+        }
+
+        let already_locked = h.ofd_lock_owner.map_or(false, |owner| owner == lock_owner);
+        if already_locked {
+            h.ofd_lock_owner = None;
+        }
+        if let Some(odf_lock_owner) = h.ofd_lock_owner {
+            let _ = self
+                .meta
+                .setlk(
+                    ino,
+                    odf_lock_owner,
+                    false,
+                    Fcntl::F_UNLCK,
+                    0,
+                    0x7FFFFFFFFFFFFFFF,
+                    0,
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    pub fn fsync(&self, ino: Ino, fh: Fh, datasync: bool) -> Result<(), Errno> {
+        todo!()
+    }
+
+    pub async fn read(&self, ino: Ino, fh: Fh, off: u64, size: u64) -> Result<Bytes, Errno> {
+        if VfsInner::is_special_inode(ino) {
+            todo!()
+        }
+
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        if off >= MAX_FILE_LEN || off + size >= MAX_FILE_LEN {
+            return Err(Errno::EFBIG);
+        }
+        let h = h.read().await;
+        match h.reader {
+            Some(ref reader) => {
+                self.writer.flush(ino).await.map_err(|e| {
+                    error!("flush writer failed: {:?}", e);
+                    e.fs_err()
+                })?;
+                let mut buf = BytesMut::with_capacity(size as usize);
+                let _ = reader.read(off, &mut buf).await.map_err(|e| {
+                    error!("read failed: {:?}", e);
+                    e.fs_err()
+                })?;
+                Ok(buf.freeze())
+            }
+            None => Err(Errno::EBADF),
         }
     }
 
-    
-    async fn dump_all_handles(&self, path: &Path) {
+    pub async fn write(&self, ino: Ino, fh: Fh, off: u64, data: Bytes) -> Result<(), Errno> {
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        if off >= MAX_FILE_LEN || off + data.len() as u64 >= MAX_FILE_LEN {
+            return Err(Errno::EFBIG);
+        }
 
+        if ino == CONTROL_INODE {
+            // 拼装消息并且处理控制节点的消息
+            todo!()
+        }
+
+        // TODO: handle LOCK overtime
+        let mut h = h.write().await;
+        match &h.writer {
+            Some(writer) => {
+                writer.write(off, data.clone()).await.map_err(|e| {
+                    error!("write failed: {:?}", e);
+                    e.fs_err()
+                })?;
+                self.reader.invalidate(
+                    ino,
+                    Frange {
+                        off,
+                        len: data.len() as u64,
+                    },
+                );
+                let mut modified = self.last_modified.write();
+                modified.insert(ino, Utc::now());
+                Ok(())
+            }
+            None => Err(Errno::EBADF),
+        }
     }
-
-    async fn load_all_handles(&self, path: &Path) {
-
-    }
-
 }
 
-impl WithContext for SharedVfs {
-    fn with_login(&mut self, uid: Uid, gids: Vec<Gid>) {
-        todo!()
-    }
-
-    fn with_cancel(&mut self, token: CancellationToken) {
-        todo!()
-    }
-
-    fn uid(&self) -> &Uid {
-        todo!()
-    }
-
-    fn gid(&self) -> &Gid {
-        todo!()
-    }
-
-    fn gids(&self) -> &Vec<juice_meta::context::Gid> {
-        todo!()
-    }
-
-    fn token(&self) -> &tokio_util::sync::CancellationToken {
-        todo!()
-    }
-
-    fn check_permission(&self) -> bool {
-        todo!()
+impl VfsInner {
+    /// When the attr obtained from the metadata, it may not be the latest,
+    /// and there is still unrefreshed data in memory.
+    fn update_len(&self, ino: Ino, attr: &mut Attr) {
+        if attr.full && attr.typ == INodeType::File {
+            let length = self.writer.len(ino);
+            if length > attr.length {
+                attr.length = length;
+            }
+            self.reader.truncate(ino, attr.length);
+        }
     }
 }

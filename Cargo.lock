@@ -1037,6 +1037,7 @@ dependencies = [
  "either",
  "juice-meta",
  "juice-storage",
+ "nix",
  "opendal",
  "parking_lot",
  "snafu",

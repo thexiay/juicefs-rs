@@ -1,9 +1,10 @@
 use std::fmt::{Display, Formatter};
 
 use deadpool::managed::PoolError;
+use nix::errno::Errno;
 use redis::RedisError;
 use snafu::{FromString, GenerateImplicitData, Snafu};
-use tracing::{error, Span};
+use tracing::Span;
 
 use crate::api::{Attr, Ino};
 
@@ -15,6 +16,29 @@ pub struct MetaError {
     loc: snafu::Location,
     #[snafu(implicit)]
     span: SpanGuard,
+}
+
+impl MetaError {
+    pub fn fs_err(&self) -> Errno {
+        match self.source {
+            MetaErrorEnum::EntryExists { .. } => Errno::EEXIST,
+            MetaErrorEnum::NoEntryFound { .. } => Errno::ENOENT,
+            MetaErrorEnum::NoEntryFound2 { .. } => Errno::ENOENT,
+            MetaErrorEnum::BadFD { .. } => Errno::EBADF,
+            MetaErrorEnum::DirNotEmpty { .. } => Errno::ENOTEMPTY,
+            MetaErrorEnum::NotDir1 { .. } => Errno::ENOTDIR,
+            MetaErrorEnum::NotDir2 { .. } => Errno::ENOTDIR,
+            MetaErrorEnum::InvalidArg { .. } => Errno::EINVAL,
+            MetaErrorEnum::Interrupted => Errno::EINTR,
+            MetaErrorEnum::OpNotSupported { .. } => Errno::ENOTSUP,
+            MetaErrorEnum::PermissionDenied { .. } => Errno::EACCES,
+            MetaErrorEnum::OpNotPermitted { .. } => Errno::EPERM,
+            MetaErrorEnum::ReadFS => Errno::EROFS,
+            MetaErrorEnum::QuotaExceeded => Errno::EDQUOT,
+            MetaErrorEnum::NoSpace => Errno::ENOSPC,
+            _ => Errno::EIO,
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -305,33 +329,6 @@ impl PartialEq<Ino> for EntryKey {
         match self {
             EntryKey::Ino(ino) => ino == other,
             EntryKey::Name { .. } => false,
-        }
-    }
-}
-
-// for syscall
-pub type Errno = i32;
-pub type FsResult<T> = std::result::Result<T, Errno>;
-impl From<MetaError> for Errno {
-    fn from(e: MetaError) -> Self {
-        error!("inner error: {}", e);
-        match e.source {
-            MetaErrorEnum::EntryExists { .. } => libc::EEXIST,
-            MetaErrorEnum::NoEntryFound { .. } => libc::ENOENT,
-            MetaErrorEnum::NoEntryFound2 { .. } => libc::ENOENT,
-            MetaErrorEnum::BadFD { .. } => libc::EBADF,
-            MetaErrorEnum::DirNotEmpty { .. } => libc::ENOTEMPTY,
-            MetaErrorEnum::NotDir1 { .. } => libc::ENOTDIR,
-            MetaErrorEnum::NotDir2 { .. } => libc::ENOTDIR,
-            MetaErrorEnum::InvalidArg { .. } => libc::EINVAL,
-            MetaErrorEnum::Interrupted => libc::EINTR,
-            MetaErrorEnum::OpNotSupported { .. } => libc::ENOTSUP,
-            MetaErrorEnum::PermissionDenied { .. } => libc::EACCES,
-            MetaErrorEnum::OpNotPermitted { .. } => libc::EPERM,
-            MetaErrorEnum::ReadFS => libc::EROFS,
-            MetaErrorEnum::QuotaExceeded => libc::EDQUOT,
-            MetaErrorEnum::NoSpace => libc::ENOSPC,
-            _ => libc::EIO,
         }
     }
 }

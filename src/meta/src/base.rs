@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
+    Attr, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -2849,7 +2849,7 @@ where
         inode: Ino,
         owner: u64,
         block: bool,
-        ltype: u32,
+        ltype: Fcntl,
         start: u64,
         end: u64,
         pid: u32,

@@ -1,0 +1,113 @@
+Date : 2025-03-15 16:40:53
+Directory : /data/gitcode/juicefs-rs
+Total : 61 files,  17179 codes, 828 comments, 1710 blanks, all 19717 lines
+
+Languages
++----------+------------+------------+------------+------------+------------+
+| language | files      | code       | comment    | blank      | total      |
++----------+------------+------------+------------+------------+------------+
+| Rust     |         54 |     14,591 |        828 |      1,416 |     16,835 |
+| TOML     |          7 |      2,588 |          0 |        294 |      2,882 |
++----------+------------+------------+------------+------------+------------+
+
+Directories
++------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                   | files      | code       | comment    | blank      | total      |
++------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                      |         61 |     17,179 |        828 |      1,710 |     19,717 |
+| . (Files)                                                              |          2 |      2,458 |          0 |        280 |      2,738 |
+| src                                                                    |         59 |     14,721 |        828 |      1,430 |     16,979 |
+| src (Files)                                                            |          1 |         12 |          0 |          3 |         15 |
+| src/meta                                                               |         20 |      8,942 |        627 |        804 |     10,373 |
+| src/meta (Files)                                                       |          1 |         42 |          0 |          3 |         45 |
+| src/meta/src                                                           |         19 |      8,900 |        627 |        801 |     10,328 |
+| src/meta/src (Files)                                                   |         14 |      5,570 |        507 |        529 |      6,606 |
+| src/meta/src/rds                                                       |          5 |      3,330 |        120 |        272 |      3,722 |
+| src/storage                                                            |         16 |      3,263 |        185 |        345 |      3,793 |
+| src/storage (Files)                                                    |          1 |         40 |          0 |          4 |         44 |
+| src/storage/benches                                                    |          1 |         34 |          0 |          6 |         40 |
+| src/storage/src                                                        |         14 |      3,189 |        185 |        335 |      3,709 |
+| src/storage/src (Files)                                                |         10 |      1,366 |         88 |        190 |      1,644 |
+| src/storage/src/cache                                                  |          4 |      1,823 |         97 |        145 |      2,065 |
+| src/storage/src/cache (Files)                                          |          2 |        137 |         18 |         29 |        184 |
+| src/storage/src/cache/disk                                             |          2 |      1,686 |         79 |        116 |      1,881 |
+| src/test                                                               |          7 |        179 |         16 |         40 |        235 |
+| src/test (Files)                                                       |          1 |         13 |          0 |          2 |         15 |
+| src/test/src                                                           |          6 |        166 |         16 |         38 |        220 |
+| src/test/src (Files)                                                   |          1 |         38 |          8 |          9 |         55 |
+| src/test/src/bin                                                       |          5 |        128 |          8 |         29 |        165 |
+| src/utils                                                              |          4 |         47 |          0 |         12 |         59 |
+| src/utils (Files)                                                      |          1 |         11 |          0 |          3 |         14 |
+| src/utils/src                                                          |          3 |         36 |          0 |          9 |         45 |
+| src/vfs                                                                |         11 |      2,278 |          0 |        226 |      2,504 |
+| src/vfs (Files)                                                        |          1 |         24 |          0 |          2 |         26 |
+| src/vfs/src                                                            |         10 |      2,254 |          0 |        224 |      2,478 |
++------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| filename                                                               | language | code       | comment    | blank      | total      |
++------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| /data/gitcode/juicefs-rs/Cargo.lock                                    | TOML     |      2,401 |          0 |        277 |      2,678 |
+| /data/gitcode/juicefs-rs/Cargo.toml                                    | TOML     |         57 |          0 |          3 |         60 |
+| /data/gitcode/juicefs-rs/src/lib.rs                                    | Rust     |         12 |          0 |          3 |         15 |
+| /data/gitcode/juicefs-rs/src/meta/Cargo.toml                           | TOML     |         42 |          0 |          3 |         45 |
+| /data/gitcode/juicefs-rs/src/meta/src/acl.rs                           | Rust     |        170 |          6 |         29 |        205 |
+| /data/gitcode/juicefs-rs/src/meta/src/api.rs                           | Rust     |        452 |        209 |         97 |        758 |
+| /data/gitcode/juicefs-rs/src/meta/src/base.rs                          | Rust     |      2,670 |        195 |        158 |      3,023 |
+| /data/gitcode/juicefs-rs/src/meta/src/config.rs                        | Rust     |        174 |         12 |         11 |        197 |
+| /data/gitcode/juicefs-rs/src/meta/src/context.rs                       | Rust     |         59 |          7 |         14 |         80 |
+| /data/gitcode/juicefs-rs/src/meta/src/error.rs                         | Rust     |        296 |          7 |         32 |        335 |
+| /data/gitcode/juicefs-rs/src/meta/src/lib.rs                           | Rust     |         23 |          0 |          4 |         27 |
+| /data/gitcode/juicefs-rs/src/meta/src/openfile.rs                      | Rust     |        131 |          6 |         23 |        160 |
+| /data/gitcode/juicefs-rs/src/meta/src/quota.rs                         | Rust     |        472 |         20 |         49 |        541 |
+| /data/gitcode/juicefs-rs/src/meta/src/random_test.rs                   | Rust     |          3 |          0 |          2 |          5 |
+| /data/gitcode/juicefs-rs/src/meta/src/rds/check.rs                     | Rust     |         84 |          0 |         11 |         95 |
+| /data/gitcode/juicefs-rs/src/meta/src/rds/conn.rs                      | Rust     |         63 |          3 |         12 |         78 |
+| /data/gitcode/juicefs-rs/src/meta/src/rds/mod.rs                       | Rust     |          6 |          0 |          1 |          7 |
+| /data/gitcode/juicefs-rs/src/meta/src/rds/redis.rs                     | Rust     |      3,031 |        104 |        210 |      3,345 |
+| /data/gitcode/juicefs-rs/src/meta/src/rds/test.rs                      | Rust     |        146 |         13 |         38 |        197 |
+| /data/gitcode/juicefs-rs/src/meta/src/session.rs                       | Rust     |          2 |          0 |          3 |          5 |
+| /data/gitcode/juicefs-rs/src/meta/src/slice.rs                         | Rust     |        285 |         11 |         30 |        326 |
+| /data/gitcode/juicefs-rs/src/meta/src/test.rs                          | Rust     |        751 |         27 |         61 |        839 |
+| /data/gitcode/juicefs-rs/src/meta/src/utils.rs                         | Rust     |         82 |          7 |         16 |        105 |
+| /data/gitcode/juicefs-rs/src/storage/Cargo.toml                        | TOML     |         40 |          0 |          4 |         44 |
+| /data/gitcode/juicefs-rs/src/storage/benches/bench_cache_store_read.rs | Rust     |         34 |          0 |          6 |         40 |
+| /data/gitcode/juicefs-rs/src/storage/src/api.rs                        | Rust     |         55 |         24 |         21 |        100 |
+| /data/gitcode/juicefs-rs/src/storage/src/buffer.rs                     | Rust     |        215 |          0 |         22 |        237 |
+| /data/gitcode/juicefs-rs/src/storage/src/cache/disk/cache.rs           | Rust     |      1,683 |         79 |        115 |      1,877 |
+| /data/gitcode/juicefs-rs/src/storage/src/cache/disk/mod.rs             | Rust     |          3 |          0 |          1 |          4 |
+| /data/gitcode/juicefs-rs/src/storage/src/cache/mem.rs                  | Rust     |          0 |          0 |          2 |          2 |
+| /data/gitcode/juicefs-rs/src/storage/src/cache/mod.rs                  | Rust     |        137 |         18 |         27 |        182 |
+| /data/gitcode/juicefs-rs/src/storage/src/cached_store.rs               | Rust     |        756 |         59 |         93 |        908 |
+| /data/gitcode/juicefs-rs/src/storage/src/compress.rs                   | Rust     |         26 |          3 |          9 |         38 |
+| /data/gitcode/juicefs-rs/src/storage/src/error.rs                      | Rust     |         92 |          2 |         15 |        109 |
+| /data/gitcode/juicefs-rs/src/storage/src/lib.rs                        | Rust     |         16 |          0 |          3 |         19 |
+| /data/gitcode/juicefs-rs/src/storage/src/pre_fetcher.rs                | Rust     |          6 |          0 |          2 |          8 |
+| /data/gitcode/juicefs-rs/src/storage/src/single_flight.rs              | Rust     |        132 |          0 |         13 |        145 |
+| /data/gitcode/juicefs-rs/src/storage/src/uploader.rs                   | Rust     |         33 |          0 |          7 |         40 |
+| /data/gitcode/juicefs-rs/src/storage/src/utils.rs                      | Rust     |         35 |          0 |          5 |         40 |
+| /data/gitcode/juicefs-rs/src/test/Cargo.toml                           | TOML     |         13 |          0 |          2 |         15 |
+| /data/gitcode/juicefs-rs/src/test/src/bin/test_async.rs                | Rust     |         50 |          7 |          9 |         66 |
+| /data/gitcode/juicefs-rs/src/test/src/bin/test_deref.rs                | Rust     |         24 |          1 |          7 |         32 |
+| /data/gitcode/juicefs-rs/src/test/src/bin/test_drop.rs                 | Rust     |         27 |          0 |          6 |         33 |
+| /data/gitcode/juicefs-rs/src/test/src/bin/test_redis.rs                | Rust     |          8 |          0 |          3 |         11 |
+| /data/gitcode/juicefs-rs/src/test/src/bin/test_time.rs                 | Rust     |         19 |          0 |          4 |         23 |
+| /data/gitcode/juicefs-rs/src/test/src/main.rs                          | Rust     |         38 |          8 |          9 |         55 |
+| /data/gitcode/juicefs-rs/src/utils/Cargo.toml                          | TOML     |         11 |          0 |          3 |         14 |
+| /data/gitcode/juicefs-rs/src/utils/src/lib.rs                          | Rust     |          2 |          0 |          0 |          2 |
+| /data/gitcode/juicefs-rs/src/utils/src/process.rs                      | Rust     |          4 |          0 |          1 |          5 |
+| /data/gitcode/juicefs-rs/src/utils/src/runtime.rs                      | Rust     |         30 |          0 |          8 |         38 |
+| /data/gitcode/juicefs-rs/src/vfs/Cargo.toml                            | TOML     |         24 |          0 |          2 |         26 |
+| /data/gitcode/juicefs-rs/src/vfs/src/arena.rs                          | Rust     |         77 |          0 |         13 |         90 |
+| /data/gitcode/juicefs-rs/src/vfs/src/config.rs                         | Rust     |         63 |          0 |          6 |         69 |
+| /data/gitcode/juicefs-rs/src/vfs/src/error.rs                          | Rust     |        130 |          0 |         14 |        144 |
+| /data/gitcode/juicefs-rs/src/vfs/src/frange.rs                         | Rust     |         30 |          0 |          7 |         37 |
+| /data/gitcode/juicefs-rs/src/vfs/src/handle.rs                         | Rust     |        139 |          0 |         20 |        159 |
+| /data/gitcode/juicefs-rs/src/vfs/src/internal.rs                       | Rust     |         25 |          0 |          5 |         30 |
+| /data/gitcode/juicefs-rs/src/vfs/src/lib.rs                            | Rust     |         16 |          0 |          1 |         17 |
+| /data/gitcode/juicefs-rs/src/vfs/src/reader.rs                         | Rust     |        838 |          0 |         66 |        904 |
+| /data/gitcode/juicefs-rs/src/vfs/src/vfs.rs                            | Rust     |        345 |          0 |         39 |        384 |
+| /data/gitcode/juicefs-rs/src/vfs/src/writer.rs                         | Rust     |        591 |          0 |         53 |        644 |
+| Total                                                                  |          |     17,179 |        828 |      1,710 |     19,717 |
++------------------------------------------------------------------------+----------+------------+------------+------------+------------+

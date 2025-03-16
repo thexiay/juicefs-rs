@@ -29,6 +29,7 @@ pub const TRASH_INODE: Ino = 0x7FFFFFFF10000000; // larger than vfs.minInternalN
 pub const TRASH_NAME: &str = ".Trash";
 // ChunkSize is size of a chunk
 pub const CHUNK_SIZE: u64 = 1 << 26; // ChunkSize is size of a chunk, default 64M
+pub const MAX_FILE_LEN: u64 = CHUNK_SIZE << 31; // MaxFileLength is the max length of a file.
 pub const MAX_VERSION: i32 = 1; // MaxVersion is the max of supported versions.
 pub const MAX_FILE_NAME_LEN: usize = 255; // MaxNameLen is the max length of a name.
 
@@ -241,6 +242,12 @@ bitflags! {
         const CREATE_OR_REPLACE = 0;
         const CREATE = 1 << 0;
         const REPLACE = 1 << 1;
+    }
+
+    pub struct Fcntl: u8 {
+        const F_RDLCK = 0 << 0;
+        const F_WRLCK = 1 << 0;
+        const F_UNLCK = 1 << 1;
     }
 }
 
@@ -661,7 +668,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         inode: Ino,
         owner: u64,
         block: bool,
-        ltype: u32,
+        ltype: Fcntl,
         start: u64,
         end: u64,
         pid: u32,
