@@ -72,6 +72,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -538,6 +560,28 @@ dependencies = [
  "futures-sink",
  "futures-task",
  "futures-util",
+]
+
+[[package]]
+name = "futures-async-stream"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38c4ff593faf24530b9a6eeea6ea4b5e3c20591da3f6348069724cb261d6d643"
+dependencies = [
+ "futures-async-stream-macro",
+ "futures-core",
+ "pin-project",
+]
+
+[[package]]
+name = "futures-async-stream-macro"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f664c1c2186b81f798ac765d661fb8cefd74fdb398fd23c76c3fb3c1aec760e8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1031,10 +1075,13 @@ dependencies = [
 name = "juice-vfs"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "bytes",
  "chrono",
  "dashmap 6.1.0",
  "either",
+ "futures",
+ "futures-async-stream",
  "juice-meta",
  "juice-storage",
  "nix",

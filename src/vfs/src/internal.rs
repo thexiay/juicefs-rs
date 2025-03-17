@@ -9,12 +9,6 @@ pub const STATS_INODE: Ino = MIN_INTERNAL_NODE + 3;
 pub const CONFIG_INODE: Ino = MIN_INTERNAL_NODE + 4;
 pub const TRASH_INODE: Ino = juice_meta::api::TRASH_INODE;
 
-pub struct InternalNode {
-    inode: Ino,
-    name: String,
-    attr: Attr,
-}
-
 impl VfsInner {
     pub fn is_special_node(&self, name: &str) -> bool {
         if let Some(first) = name.chars().next() && first == '.' {

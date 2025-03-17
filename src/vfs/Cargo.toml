@@ -24,3 +24,6 @@ parking_lot = { workspace = true }
 either = { workspace = true }
 dashmap = { workspace = true }
 nix = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+futures-async-stream = { workspace = true }

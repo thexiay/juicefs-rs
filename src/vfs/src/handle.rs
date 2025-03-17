@@ -1,90 +1,171 @@
-use std::{collections::HashMap, path::Path, sync::{atomic::Ordering, Arc}};
+use std::{
+    collections::HashMap,
+    path::Path,
+    pin::Pin,
+    sync::{atomic::Ordering, Arc},
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use juice_meta::{api::{Attr, Entry, Fcntl, Ino, OFlag, O_ACCMODE}, context::Uid};
-use tokio::sync::RwLock as AsyncRwLock;
+use juice_meta::api::{Attr, Entry, Ino, InoExt, Meta, OFlag};
+use tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::{internal::CONTROL_INODE, reader::FileReaderRef, vfs::{Vfs, VfsInner}, writer::FileWriterRef};
+use crate::{
+    error::{InvalidOFlagSnafu, Result},
+    reader::FileReaderRef,
+    vfs::{Vfs, VfsInner},
+    writer::FileWriterRef,
+};
 
 pub type Fh = u64;
 /// Proxy of [`FileReader`] and [`FileWriter`]
 /// Can handle write and read progres bar.
-pub struct FileHandle {
+pub struct Handle {
     inode: Ino,
     fh: u64,
-
-    // for dir
-    pub(crate) children: Vec<Entry>,
-    pub(crate) indexs: HashMap<String, usize>,
-    read_at: DateTime<Utc>,
-    pub(crate) read_off: usize,
-
-    // for file
-    flags: OFlag,
-    is_recovered: bool,
-    pub(crate) bsd_lock_owner: Option<u64>,
-    pub(crate) ofd_lock_owner: Option<u64>,
-    pub(crate) reader: Option<FileReaderRef>,
-    pub(crate) writer: Option<FileWriterRef>,
+    handle: AsyncRwLock<HandleInner>,
 }
 
-impl FileHandle {
-    pub fn new(ino: Ino, fh: Fh, flags: OFlag, is_recovered: bool) -> Self {
-        todo!()
-    }
-
+impl Handle {
     pub fn fh(&self) -> Fh {
         self.fh
     }
+
+    pub async fn write(&self, accept_interrupt: bool) -> Option<RwLockWriteGuard<'_, HandleInner>> {
+        // TODO: add interrupt break for cancel token
+        // 针对不同的类型
+        Some(self.handle.write().await)
+    }
+
+    pub async fn read(&self, accept_interrupt: bool) -> Option<RwLockReadGuard<'_, HandleInner>> {
+        // TODO: add interrupt break for cancel token
+        Some(self.handle.read().await)
+    }
 }
 
+pub enum HandleInner {
+    File(FileHandle),
+    Dir(DirHandle),
+    Control(ControlHandle),
+}
 
-struct InnerFileHandle {
+enum FileHandleType {
+    ReadOnlyFile {
+        reader: FileReaderRef,
+    },
+    WRFile {
+        reader: FileReaderRef,
+        writer: FileWriterRef,
+    },
+}
+
+pub struct FileHandle {
+    flags: OFlag,
+    bsd_lock_owner: Option<u64>,
+    ofd_lock_owner: Option<u64>,
+    handle: FileHandleType,
+}
+
+impl FileHandle {
+    pub fn reader(&self) -> &FileReaderRef {
+        match &self.handle {
+            FileHandleType::ReadOnlyFile { reader } | FileHandleType::WRFile { reader, .. } => {
+                reader
+            }
+        }
+    }
+
+    pub fn writer(&mut self) -> Option<&FileWriterRef> {
+        match &self.handle {
+            FileHandleType::WRFile { writer, .. } => Some(writer),
+            _ => None,
+        }
+    }
+
+    pub fn bsd_lock_owner(&self) -> Option<u64> {
+        self.bsd_lock_owner
+    }
+
+    pub fn posix_lock_owner(&self) -> Option<u64> {
+        self.ofd_lock_owner
+    }
+
+    pub fn free_posix_lock(&mut self) {
+        self.ofd_lock_owner = None;
+    }
+}
+
+pub struct DirHandle {
+    read_dir: Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<Entry>>> + Send>> + Send + Sync>,
+    children: Vec<Entry>,
+    indexs: HashMap<String, usize>,
+    read_at: DateTime<Utc>,
+    read_off_idx: usize, // current readdir offset in children
+}
+
+impl DirHandle {
+    pub fn cache(&mut self, name: &str, entry: Option<(Ino, Attr)>) {
+        if !self.children.is_empty() && !self.indexs.is_empty() {
+            if let Some((inode, attr)) = entry {
+                self.indexs.insert(name.to_string(), self.children.len());
+                self.children.push(Entry {
+                    inode,
+                    name: name.to_string(),
+                    attr,
+                });
+            } else {
+                if let Some(idx) = self.indexs.remove(name) {
+                    // only remove the entry if it's not read yet
+                    if idx >= self.read_off_idx {
+                        let total_len = self.children.len();
+                        self.children.swap(idx, total_len - 1);
+                        self.indexs.insert(self.children[idx].name.clone(), idx);
+                        self.children.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn refresh(&mut self) -> Result<()> {
+        self.read_at = Utc::now();
+        self.read_off_idx = 0;
+        self.children = (&self.read_dir)().await?;
+        Ok(())
+    }
+
+    pub fn need_refresh(&self) -> bool {
+        self.read_off_idx == 0
+    }
+
+    pub fn seek(&mut self, offset: u64) {
+        self.read_off_idx = offset as usize;
+    }
+
+    pub fn read_once(&mut self) -> Option<Entry> {
+        self.children.get(self.read_off_idx).map(|entry| {
+            self.read_off_idx += 1;
+            entry.clone()
+        })
+    }
+}
+
+pub struct ControlHandle {
     // internal files
     off: u64,
     data: Bytes,
     pending: Bytes,
 }
 
-
-impl VfsInner {
-    pub fn new_handle(&self, ino: Ino, flags: OFlag) -> Arc<AsyncRwLock<FileHandle>> {
-        let low_bits = if OFlag::O_RDONLY.contains(flags) {
-            // read only
-            1
-        } else {
-            0
-        };
-        while self
-            .ino_mapping
-            .get(&self.next_fh.load(Ordering::SeqCst))
-            .is_some()
-            || self.next_fh.load(Ordering::SeqCst) & 1 != low_bits
-        {
-            self.next_fh
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst); // skip recovered fd
-        }
-        let fh = self
-            .next_fh
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let handle = Arc::new(AsyncRwLock::new(FileHandle::new(ino, fh, flags, false)));
+impl Vfs {
+    pub fn find_handle(&self, ino: Ino, fh: Fh) -> Option<Arc<Handle>> {
         self.handles
-            .entry(ino)
-            .or_insert_with(DashMap::new)
-            .insert(fh, handle.clone());
-        handle
-    }
-
-    pub fn find_handle(&self, ino: Ino, fh: Fh) -> Option<Arc<AsyncRwLock<FileHandle>>> {
-        self
-            .handles
             .get(&ino)
             .and_then(|map| map.get(&fh).map(|entry| entry.value().clone()))
     }
 
-    pub fn find_all_handle(&self, ino: Ino) -> Vec<Arc<AsyncRwLock<FileHandle>>> {
+    pub fn find_all_handle(&self, ino: Ino) -> Vec<Arc<Handle>> {
         self.handles
             .get(&ino)
             .map(|map| map.iter().map(|entry| entry.value().clone()).collect())
@@ -96,42 +177,90 @@ impl VfsInner {
         self.handles.retain(|_, v| v.len() > 0);
     }
 
-    pub async fn new_file_handle(&self, ino: Ino, length: u64, flags: OFlag) -> Fh {
-        let h = self.new_handle(ino, flags);
-        let mut h = h.write().await;
-        match flags.intersection(O_ACCMODE) {
-            OFlag::O_RDONLY => {
-                h.reader = Some(self.reader.clone().open(ino, length));
-            }
-            OFlag::O_WRONLY | OFlag::O_RDWR => {
-                h.reader = Some(self.reader.clone().open(ino, length));
-                h.writer = Some(self.writer.clone().open(ino, length));
-            }
-            _ => {}
+    pub async fn new_handle(&self, ino: Ino, length: u64, flags: Option<OFlag>) -> Result<Fh> {
+        while self
+            .ino_mapping
+            .get(&self.next_fh.load(Ordering::SeqCst))
+            .is_some()
+        {
+            self.next_fh
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        h.fh()
+        let fh = self
+            .next_fh
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let handle_inner = match flags {
+            Some(flags) => {
+                let file_type = match flags {
+                    OFlag::O_RDONLY => FileHandleType::ReadOnlyFile {
+                        reader: self.reader.clone().open(ino, length),
+                    },
+                    OFlag::O_WRONLY | OFlag::O_RDWR => {
+                        // FUSE writeback_cache mode need reader even for WRONLY
+                        FileHandleType::WRFile {
+                            reader: self.reader.clone().open(ino, length),
+                            writer: self.writer.clone().open(ino, length),
+                        }
+                    }
+                    _ => return Err(InvalidOFlagSnafu.build().into()),
+                };
+                HandleInner::File(FileHandle {
+                    flags,
+                    bsd_lock_owner: None,
+                    ofd_lock_owner: None,
+                    handle: file_type,
+                })
+            }
+            None => {
+                let vfs_cloned = self.clone();
+                let ino_cloned = ino.clone();
+                HandleInner::Dir(DirHandle {
+                    read_dir: Box::new(move || {
+                        let vfs = vfs_cloned.clone();
+                        let ino = ino_cloned.clone();
+                        Box::pin(async move {
+                            let mut entries = match vfs.meta.readdir(ino, true).await {
+                                Ok(entries) => entries,
+                                Err(e) => {
+                                    if e.is_permission_denied() {
+                                        vfs.meta.readdir(ino, false).await?
+                                    } else {
+                                        return Err(e.into());
+                                    }
+                                }
+                            };
+                            if ino.is_root() && !vfs.conf.hide_internal {
+                                entries.extend_from_slice(&vfs.internal_inos);
+                            }
+
+                            Ok(entries)
+                        })
+                    }),
+                    children: Vec::new(),
+                    indexs: HashMap::new(),
+                    read_at: Utc::now(),
+                    read_off_idx: 0,
+                })
+            }
+        };
+        let handle = Handle {
+            inode: ino,
+            fh,
+            handle: AsyncRwLock::new(handle_inner),
+        };
+        self.handles
+            .entry(ino)
+            .or_insert_with(DashMap::new)
+            .insert(fh, Arc::new(handle));
+        Ok(fh)
     }
 
     pub async fn cache_dir_entry(&self, parent: Ino, name: &str, entry: Option<(Ino, Attr)>) {
         let handles = self.find_all_handle(parent);
         for handle in handles {
-            let mut handle = handle.write().await;
-            if !handle.children.is_empty() && !handle.indexs.is_empty() {
-                if let Some((ino, attr)) = &entry {
-                    handle.children.push(Entry {
-                        inode: *ino,
-                        name: name.to_string(),
-                        attr: attr.clone(),
-                    });
-                } else {
-                    let index = handle.indexs.remove(name);
-                    if let Some(index) = index {
-                        handle.children[index].inode = 0; // invalid
-                        if index >= handle.read_off {
-                            // not read yet, remove it
-                            handle.children.remove(index);
-                        }
-                    }
+            if let Some(ref mut handle) = handle.write(false).await {
+                if let HandleInner::Dir(ref mut dir_handle) = **handle {
+                    dir_handle.cache(name, entry.clone());
                 }
             }
         }

@@ -11,6 +11,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures::Stream;
+use futures_async_stream::{stream, try_stream};
+
 use juice_meta::{
     api::{
         Attr, Entry, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, StatFs, MAX_FILE_LEN,
@@ -21,14 +24,13 @@ use juice_meta::{
 use juice_storage::api::CachedStore;
 use nix::errno::Errno;
 use parking_lot::RwLock;
-use tokio::sync::RwLock as AsyncRwLock;
 use tracing::error;
 
 use crate::{
     config::Config,
     frange::Frange,
-    handle::{Fh, FileHandle},
-    internal::{InternalNode, CONTROL_INODE, LOG_INODE},
+    handle::{Fh, Handle, HandleInner},
+    internal::{CONTROL_INODE, LOG_INODE},
     reader::DataReader,
     writer::DataWriter,
 };
@@ -66,10 +68,10 @@ pub struct VfsInner {
     pub(crate) reader: Arc<DataReader>,
     pub(crate) writer: Arc<DataWriter>,
 
-    pub(crate) handles: DashMap<Ino, DashMap<Fh, Arc<AsyncRwLock<FileHandle>>>>,
+    pub(crate) handles: DashMap<Ino, DashMap<Fh, Arc<Handle>>>,
     pub(crate) ino_mapping: DashMap<Fh, Ino>,
     pub(crate) next_fh: AtomicU64,
-    pub(crate) internal_inos: Vec<InternalNode>,
+    pub(crate) internal_inos: Vec<Entry>,
     pub(crate) last_modified: RwLock<HashMap<Ino, DateTime<Utc>>>,
 }
 
@@ -123,7 +125,8 @@ impl Vfs {
                 error!("mknod failed: {:?}", e);
                 e.fs_err()
             })?;
-        self.cache_dir_entry(parent, name, Some((ino, attr.clone())));
+        self.cache_dir_entry(parent, name, Some((ino, attr.clone())))
+            .await;
         Ok(Entry {
             inode: ino,
             name: name.to_string(),
@@ -153,7 +156,8 @@ impl Vfs {
                 error!("mkdir failed: {:?}", e);
                 e.fs_err()
             })?;
-        self.cache_dir_entry(parent, name, Some((ino, attr.clone())));
+        self.cache_dir_entry(parent, name, Some((ino, attr.clone())))
+            .await;
         Ok(Entry {
             inode: ino,
             name: name.to_string(),
@@ -169,7 +173,7 @@ impl Vfs {
             error!("rmdir failed: {:?}", e);
             e.fs_err()
         })?;
-        self.cache_dir_entry(parent, name, None);
+        self.cache_dir_entry(parent, name, None).await;
         Ok(())
     }
 
@@ -186,7 +190,13 @@ impl Vfs {
             e.fs_err()
         })?;
         self.update_len(ino, &mut attr);
-        let fh = self.new_file_handle(ino, attr.length, flags).await;
+        let fh = self
+            .new_handle(ino, attr.length, Some(flags))
+            .await
+            .map_err(|e| {
+                error!("open failed: {:?}", e);
+                e.fs_err()
+            })?;
         Ok((fh, attr))
     }
 
@@ -203,13 +213,16 @@ impl Vfs {
                 .await
                 .map_err(|_| Errno::EACCES)?;
         }
-        let fh = self.new_file_handle(ino, 0, flags).await;
+        let fh = self.new_handle(ino, 0, None).await.map_err(|e| {
+            error!("opendir failed: {:?}", e);
+            e.fs_err()
+        })?;
         Ok(fh)
     }
 
     pub async fn releasedir(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
         match self.find_handle(ino, fh) {
-            Some(h) => {
+            Some(_) => {
                 self.release_handle(ino, fh); // dir has no writer and reader, so delete it directly
                 Ok(())
             }
@@ -217,6 +230,7 @@ impl Vfs {
         }
     }
 
+    // force close handle
     pub async fn release(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
         if VfsInner::is_special_inode(ino) {
             if ino == LOG_INODE {
@@ -230,20 +244,26 @@ impl Vfs {
             Some(h) => h,
             None => return Err(Errno::EBADF),
         };
-        let h = h.write().await;
-        if let Some(writer) = &h.writer {
-            writer.flush().await.map_err(|e| {
-                error!("flush writer failed: {:?}", e);
-                e.fs_err()
-            })?;
-            let mut last_modified = self.last_modified.write();
-            last_modified.insert(ino, Utc::now());
-        }
-        if let Some(ofd_lock_owner) = &h.ofd_lock_owner {
-            let _ = self
-                .meta
-                .setlk(ino, *ofd_lock_owner, false, Fcntl::F_RDLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
-                .await;
+        let mut h = h.write(true).await.ok_or(Errno::EINTR)?;
+        match &mut *h {
+            HandleInner::File(h) => {
+                if let Some(writer) = h.writer() {
+                    writer.flush().await.map_err(|e| {
+                        error!("flush writer failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                }
+                let mut last_modified = self.last_modified.write();
+                last_modified.insert(ino, Utc::now());
+                if let Some(owner) = &h.posix_lock_owner() {
+                    let _ = self
+                        .meta
+                        .setlk(ino, *owner, false, Fcntl::F_RDLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
+                        .await;
+                }
+            }
+            HandleInner::Dir(_) => {}
+            HandleInner::Control(_) => {}
         }
         let _ = self.meta.close(ino).await;
         self.release_handle(ino, fh); // drop file handle auto kill all reader and writer tasks
@@ -262,44 +282,107 @@ impl Vfs {
             None => return Err(Errno::EBADF),
         };
 
-        let mut h = h.write().await;
-        if let Some(ref writer) = h.writer {
-            writer.flush().await.map_err(|e| {
-                error!("flush writer failed: {:?}", e);
-                e.fs_err()
-            })?;
-        }
-
-        let already_locked = h.ofd_lock_owner.map_or(false, |owner| owner == lock_owner);
-        if already_locked {
-            h.ofd_lock_owner = None;
-        }
-        if let Some(odf_lock_owner) = h.ofd_lock_owner {
-            let _ = self
-                .meta
-                .setlk(
-                    ino,
-                    odf_lock_owner,
-                    false,
-                    Fcntl::F_UNLCK,
-                    0,
-                    0x7FFFFFFFFFFFFFFF,
-                    0,
-                )
-                .await;
+        let mut h = loop {
+            match h.write(true).await {
+                Some(h) => break h,
+                None => (), // cancel op
+            }
+        };
+        match &mut *h {
+            HandleInner::File(h) => {
+                if let Some(writer) = h.writer() {
+                    writer.flush().await.map_err(|e| {
+                        error!("flush writer failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                }
+                let already_locked = h
+                    .posix_lock_owner()
+                    .map_or(false, |owner| owner == lock_owner);
+                if already_locked {
+                    h.free_posix_lock();
+                }
+                if let Some(owner) = &h.posix_lock_owner() {
+                    let _ = self
+                        .meta
+                        .setlk(ino, *owner, false, Fcntl::F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
+                        .await;
+                }
+            }
+            HandleInner::Dir(_) => {}
+            HandleInner::Control(_) => {}
         }
         Ok(())
     }
 
-    pub fn fsync(&self, ino: Ino, fh: Fh, datasync: bool) -> Result<(), Errno> {
-        todo!()
+    pub async fn fsync(&self, ino: Ino, fh: Fh, datasync: bool) -> Result<(), Errno> {
+        if VfsInner::is_special_inode(ino) {
+            return Ok(());
+        }
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        let mut h = loop {
+            match h.write(true).await {
+                Some(h) => break h,
+                None => (),
+            }
+        };
+        match &mut *h {
+            HandleInner::File(h) => {
+                if let Some(writer) = h.writer() {
+                    writer.flush().await.map_err(|e| {
+                        error!("flush writer failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                }
+            }
+            HandleInner::Dir(_) => {}
+            HandleInner::Control(_) => {}
+        }
+        Ok(())
+    }
+
+    #[try_stream(boxed, ok = Entry, error = Errno)]
+    pub async fn readdir(&self, ino: Ino, fh: Fh, off: u64) {
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        let mut h = loop {
+            match h.write(true).await {
+                Some(h) => break h,
+                None => (),
+            }
+        };
+
+        match &mut *h {
+            HandleInner::Dir(handle) => {
+                if handle.need_refresh() {
+                    handle.refresh().await.map_err(|e| {
+                        error!("refresh failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                }
+                handle.seek(off);
+                loop {
+                    match handle.read_once() {
+                        Some(entry) => {
+                            yield entry;
+                        },
+                        None => break,
+                    }
+                }
+            }
+            _ => return Err(Errno::ENOTDIR),
+        }
     }
 
     pub async fn read(&self, ino: Ino, fh: Fh, off: u64, size: u64) -> Result<Bytes, Errno> {
         if VfsInner::is_special_inode(ino) {
             todo!()
         }
-
         let h = match self.find_handle(ino, fh) {
             Some(h) => h,
             None => return Err(Errno::EBADF),
@@ -307,13 +390,15 @@ impl Vfs {
         if off >= MAX_FILE_LEN || off + size >= MAX_FILE_LEN {
             return Err(Errno::EFBIG);
         }
-        let h = h.read().await;
-        match h.reader {
-            Some(ref reader) => {
+
+        let h = h.read(true).await.ok_or(Errno::EINTR)?;
+        match &*h {
+            HandleInner::File(h) => {
                 self.writer.flush(ino).await.map_err(|e| {
                     error!("flush writer failed: {:?}", e);
                     e.fs_err()
                 })?;
+                let reader = h.reader();
                 let mut buf = BytesMut::with_capacity(size as usize);
                 let _ = reader.read(off, &mut buf).await.map_err(|e| {
                     error!("read failed: {:?}", e);
@@ -321,7 +406,8 @@ impl Vfs {
                 })?;
                 Ok(buf.freeze())
             }
-            None => Err(Errno::EBADF),
+            HandleInner::Dir(_) => Err(Errno::EISDIR),
+            HandleInner::Control(_) => todo!(),
         }
     }
 
@@ -339,26 +425,29 @@ impl Vfs {
             todo!()
         }
 
-        // TODO: handle LOCK overtime
-        let mut h = h.write().await;
-        match &h.writer {
-            Some(writer) => {
-                writer.write(off, data.clone()).await.map_err(|e| {
-                    error!("write failed: {:?}", e);
-                    e.fs_err()
-                })?;
-                self.reader.invalidate(
-                    ino,
-                    Frange {
-                        off,
-                        len: data.len() as u64,
-                    },
-                );
-                let mut modified = self.last_modified.write();
-                modified.insert(ino, Utc::now());
-                Ok(())
-            }
-            None => Err(Errno::EBADF),
+        let mut h = h.write(true).await.ok_or(Errno::EINTR)?;
+        match &mut *h {
+            HandleInner::File(h) => match h.writer() {
+                Some(writer) => {
+                    writer.write(off, data.clone()).await.map_err(|e| {
+                        error!("write failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                    self.reader.invalidate(
+                        ino,
+                        Frange {
+                            off,
+                            len: data.len() as u64,
+                        },
+                    );
+                    let mut modified = self.last_modified.write();
+                    modified.insert(ino, Utc::now());
+                    Ok(())
+                }
+                None => return Err(Errno::EBADF),
+            },
+            HandleInner::Dir(_) => Err(Errno::EISDIR),
+            HandleInner::Control(_) => todo!(),
         }
     }
 }

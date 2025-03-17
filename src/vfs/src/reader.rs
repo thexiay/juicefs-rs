@@ -46,7 +46,6 @@ impl DataReaderInvalidator {
 
 pub struct DataReader {
     ctx: Arc<DataReaderCtx>,
-    // ino到FileReader的映射，这个FileReader是能复用的
     file_readers: Mutex<HashMap<Ino, Vec<FileReader>>>,
 }
 

@@ -67,6 +67,14 @@ pub enum VfsErrorEnum {
     EIOFailedTooManyTimes,
     #[snafu(display("Should try again"))]
     TryAgain,
+    #[snafu(display("File is not readable"))]
+    NotReadable,
+    #[snafu(display("File is not writable"))]
+    NotWritable,
+    #[snafu(display("File is not dir"))]
+    NotDir,
+    #[snafu(display("Illigal flag for open"))]
+    InvalidOFlag,
     #[snafu(transparent)]
     Shared {
         source: Arc<VfsError>,

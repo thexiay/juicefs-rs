@@ -82,7 +82,7 @@ pub enum QuotaOp {
 }
 
 // Entry is an entry inside a directory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub inode: Ino,
     pub name: String,
