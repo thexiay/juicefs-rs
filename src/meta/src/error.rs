@@ -36,6 +36,7 @@ impl MetaError {
             MetaErrorEnum::ReadFS => Errno::EROFS,
             MetaErrorEnum::QuotaExceeded => Errno::EDQUOT,
             MetaErrorEnum::NoSpace => Errno::ENOSPC,
+            MetaErrorEnum::BrokenPipe { .. } => Errno::EPIPE,
             _ => Errno::EIO,
         }
     }
@@ -263,6 +264,8 @@ impl MetaError {
         matches!(self.inner(), MetaErrorEnum::NoSuchAttr)
     }
 }
+
+
 
 impl<E> From<E> for MetaError
 where

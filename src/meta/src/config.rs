@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use snafu::whatever;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::{
     api::MAX_VERSION,
@@ -13,7 +14,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Config {
     pub strict: bool,   // update ctime
-    pub retries: isize, // number of retries
+    pub retries: u32, // number of retries
     // max delete gc threads
     pub max_deletes_threads: isize,
     // max delete task in queue
@@ -82,14 +83,15 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Format {
     pub name: String,
-    pub uuid: String,
+    pub uuid: Uuid,
     pub storage: String,
     pub storage_class: Option<String>,
     pub bucket: String,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub session_token: Option<String>,
-    pub block_size: i32,
+    /// Minimum size of the data blocks aligned for the platform
+    pub page_size: u32,
     pub compression: Option<String>,
     pub shards: Option<i32>,
     pub hash_prefix: Option<bool>,
@@ -100,7 +102,7 @@ pub struct Format {
     pub key_encrypted: Option<bool>,
     pub upload_limit: Option<i64>,   // Mbps
     pub download_limit: Option<i64>, // Mbps
-    // max days to remain for trash(trash dir and trash slices)
+    /// max days to remain for trash(trash dir and trash slices)
     pub trash_days: u8,
     pub meta_version: i32,
     pub min_client_version: Option<String>,
@@ -113,14 +115,14 @@ impl Default for Format {
     fn default() -> Self {
         Self {
             name: Default::default(),
-            uuid: Default::default(),
+            uuid: Uuid::new_v4(),
             storage: Default::default(),
             storage_class: Default::default(),
             bucket: Default::default(),
             access_key: Default::default(),
             secret_key: Default::default(),
             session_token: Default::default(),
-            block_size: Default::default(),
+            page_size: Default::default(),
             compression: Default::default(),
             shards: Default::default(),
             hash_prefix: Default::default(),
@@ -149,8 +151,8 @@ impl Format {
         } else {
             if self.name != old.name {
                 whatever!("upgrade: name {} -> {}", old.name, self.name);
-            } else if self.block_size != old.block_size {
-                whatever!("upgrade: block size {} -> {}", old.block_size, self.block_size);
+            } else if self.page_size != old.page_size {
+                whatever!("upgrade: block size {} -> {}", old.page_size, self.page_size);
             } else if self.compression != old.compression {
                 return UpgradeFormatSnafu {
                     detail: format!(

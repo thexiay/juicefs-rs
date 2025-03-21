@@ -10,7 +10,9 @@ use redis::{
     IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, Value,
 };
 use regex::Regex;
+use scopeguard::defer;
 use snafu::{ensure, ensure_whatever, whatever, FromString, ResultExt};
+use std::cmp::{max, min};
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicI64;
@@ -31,12 +33,13 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{FsContext, Uid, UserExt, WithContext};
 use crate::error::{
-    BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExists2Snafu, EntryExistsSnafu,
-    InvalidArgSnafu, MetaError, MetaErrorEnum, NoEntryFound2Snafu, NoEntryFoundSnafu,
-    NoSuchAttrSnafu, NotDir1Snafu, NotDir2Snafu, OpNotPermittedSnafu, OpNotSupportedSnafu,
-    PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu, RenameSameInoSnafu, Result,
+    BadFDSnafu, BrokenPipeSnafu, ConnectionSnafu, DirNotEmptySnafu, EntryExists2Snafu,
+    EntryExistsSnafu, InvalidArgSnafu, MetaError, MetaErrorEnum, NoEntryFound2Snafu,
+    NoEntryFoundSnafu, NoSuchAttrSnafu, NotDir1Snafu, NotDir2Snafu, OpNotPermittedSnafu,
+    OpNotSupportedSnafu, PermissionDeniedSnafu, ReadFSSnafu, RedisDetailSnafu, RenameSameInoSnafu,
+    Result,
 };
-use crate::openfile::INVALIDATE_ATTR_ONLY;
+use crate::openfile::{OpenFileChunkGuard, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
 use crate::quota::{MetaQuota, Quota, QuotaView};
 use crate::slice::{PSlice, PSlices, Slices};
 use crate::utils::{self, align_4k, DeleteFileOption};
@@ -228,6 +231,7 @@ pub struct RedisHandle {
     lookup_script_sha: String,  // lookup lua script sha
     resolve_script_sha: String, // reslove lua script sha
     meta: CommonMeta,
+    chunk_re: Regex,
 }
 
 impl RedisHandle {
@@ -325,7 +329,7 @@ impl RedisHandle {
     }
 
     /// Parent:     p$inode -> {parent -> count}
-    /// count for the number of inode hard links in parent directory
+    /// The different parent inode(for soft link inode, it has multiple parent inode) and their hardlink count
     fn parent_key(&self, inode: Ino) -> String {
         format!("{}p{}", self.prefix, inode)
     }
@@ -569,6 +573,10 @@ impl RedisEngine {
             })?;
 
         let meta = CommonMeta::new(addr, conf);
+        let chunk_re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &prefix))
+            .with_whatever_context::<_, String, MetaErrorEnum>(|err| {
+                format!("compile chunk regex: {}", err)
+            })?;
         let engine = RedisHandle {
             pool,
             shared_conn: conn,
@@ -576,6 +584,7 @@ impl RedisEngine {
             lookup_script_sha,
             resolve_script_sha,
             meta,
+            chunk_re,
         };
 
         engine.check_server_config().await?;
@@ -1264,7 +1273,6 @@ impl Engine for RedisEngine {
     async fn scan_all_chunks(&self, ch: Sender<Cchunk>, bar: &Bar) -> Result<()> {
         let mut shared_conn = self.share_conn();
         let mut pipe = redis::pipe();
-        let re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &self.prefix)).expect("error regex");
         let mut iter = shared_conn
             .scan_match::<String, Vec<u8>>(format!("{}{}", self.prefix, "c*_*"))
             .await?
@@ -1291,8 +1299,10 @@ impl Engine for RedisEngine {
                     }
                 };
                 match *cnt {
-                    Some(cnt) if cnt > 1 && matches!(re.captures(&key), Some(caps)) => {
-                        let caps = re.captures(&key).expect("error regex");
+                    Some(cnt)
+                        if cnt > 1
+                            && let Some(caps) = self.chunk_re.captures(&key) =>
+                    {
                         let inode = caps
                             .get(1)
                             .unwrap()
@@ -1626,6 +1636,11 @@ impl Engine for RedisEngine {
                 Ok(Some(None))
             }
         })
+    }
+
+    async fn do_exists(&self, inode: Ino) -> Result<bool> {
+        let mut conn = self.share_conn();
+        Ok(conn.exists(self.inode_key(inode)).await?)
     }
 
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)> {
@@ -2002,12 +2017,6 @@ impl Engine for RedisEngine {
             .as_ref()
             .inspect(|trash_ino| info!("do unlink produce new trash: {}", trash_ino));
         let base = AsRef::<CommonMeta>::as_ref(self);
-        if let Some(trash_ino) = trash {
-            let file = base.open_files.lock(trash_ino);
-            let mut of = file.lock().await;
-            of.invalidate_chunk(INVALIDATE_ATTR_ONLY);
-        }
-
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let (space_guage, ino_cnt_guage, should_del, open_session_id, ino, attr) =
@@ -2019,7 +2028,9 @@ impl Engine for RedisEngine {
                         op: format!("unlink target is an directory."),
                     }
                 );
-
+                defer! {  // always invalid ino attr cache
+                    base.open_files.remove_attr(ino);
+                }
                 // first find ino by parent ino and son name, then watch it
                 cmd("WATCH")
                     .arg(self.inode_key(ino))
@@ -2074,7 +2085,7 @@ impl Engine for RedisEngine {
                                 op: "unlink file is append or immutable.",
                             }
                         );
-                        // check if trash ino and name already exists, don't repeat generate
+                        // check if trash ino and name already exists, don't repeat generate trash entry
                         if let Some(trash_ino) = trash
                             && attr.nlink > 1
                         {
@@ -2086,9 +2097,6 @@ impl Engine for RedisEngine {
                                 .await?
                             {
                                 trash.take();
-                                let file = base.open_files.lock(trash_ino);
-                                let mut of = file.lock().await;
-                                of.invalidate_chunk(INVALIDATE_ATTR_ONLY);
                             }
                         }
                         attr.ctime = now;
@@ -2101,7 +2109,7 @@ impl Engine for RedisEngine {
                                     should_del = true;
                                     let sid = { self.meta.sid.read().clone() };
                                     if let Some(sid) = sid
-                                        && base.open_files.has_any_open(ino).await
+                                        && base.open_files.is_opened(ino)
                                     {
                                         open_session_id.replace(sid);
                                     }
@@ -2418,9 +2426,9 @@ impl Engine for RedisEngine {
                 };
                 let entry = Entry {
                     inode: ino,
-                    name: name,
+                    name,
                     attr: Attr {
-                        typ: typ,
+                        typ,
                         ..Default::default()
                     },
                 };
@@ -2483,6 +2491,7 @@ impl Engine for RedisEngine {
                 if parent_src == parent_dst && name_src == name_dst {
                     return RenameSameInoSnafu.fail()?;
                 }
+                let mut invalid_attr_guard = vec![];
                 let mut watch_keys = vec![self.inode_key(ino_src)];
                 let exists_dst = match self.do_lookup_entry(conn, parent_dst, name_dst).await {
                     Ok((typ, ino, name)) => Some((typ, ino, name)),
@@ -2644,21 +2653,21 @@ impl Engine for RedisEngine {
                             } else {
                                 attr_dst.nlink -= 1;
                                 if *typ_dst == INodeType::File && attr_dst.nlink == 0 {
-                                    delete_option =
-                                        if self.meta.open_files.has_any_open(*ino_dst).await {
-                                            if self.meta.sid.read().is_some() {
-                                                Some(DeleteFileOption::Deferred)
-                                            } else {
-                                                Some(DeleteFileOption::Immediate { force: false })
-                                            }
+                                    delete_option = if self.meta.open_files.is_opened(*ino_dst) {
+                                        if self.meta.sid.read().is_some() {
+                                            Some(DeleteFileOption::Deferred)
                                         } else {
-                                            None
-                                        };
+                                            Some(DeleteFileOption::Immediate { force: false })
+                                        }
+                                    } else {
+                                        None
+                                    };
                                     // TODO: InvalidateChunk
                                 }
-                                let file = self.meta.open_files.lock(*ino_dst);
-                                let mut of = file.lock().await;
-                                of.invalidate_chunk(INVALIDATE_ATTR_ONLY);
+                                let remove_cache_ino = *ino_dst;
+                                invalid_attr_guard.push(scopeguard::guard((), move |_| {
+                                    self.meta.open_files.remove_attr(remove_cache_ino)
+                                }));
                             }
                         }
                     }
@@ -3068,6 +3077,290 @@ impl Engine for RedisEngine {
         length: u64,
         skip_perm_check: bool,
     ) -> Result<(Attr, DirStat)> {
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        async_transaction!(conn, &[self.inode_key(inode)], {
+            let attr_bytes = conn
+                .get::<_, Option<Vec<u8>>>(self.inode_key(inode))
+                .await?;
+            ensure!(attr_bytes.is_some(), NoEntryFound2Snafu { ino: inode });
+            let mut attr: Attr = bincode::deserialize(&attr_bytes.unwrap())?;
+            ensure!(
+                attr.typ == INodeType::File
+                    && !attr.flags.intersects(Flag::IMMUTABLE | Flag::APPEND)
+                    && !attr.parent.is_trash(),
+                OpNotPermittedSnafu {
+                    op: "truncate a non file"
+                }
+            );
+            if !skip_perm_check {
+                self.access(inode, ModeMask::WRITE, &attr).await?;
+            }
+            if length == attr.length {
+                // do nothing
+                return Ok((attr, DirStat::default()));
+            }
+            let delta = DirStat {
+                length: length as i64 - attr.length as i64,
+                space: utils::align_4k(length) as i64 - utils::align_4k(attr.length) as i64,
+                inodes: 0,
+            };
+            let parents = self.get_parents(inode).await.into_keys().collect();
+            self.check_quotas(delta.space, 0, parents).await?;
+
+            // When expanding, fill zero, and when shrinking, fill zero, and do not delete immediately
+            let (left, right) = (min(length, attr.length), max(length, attr.length));
+            let zero_chunks = if (right - left) / CHUNK_SIZE as u64 >= 10000 {
+                // super large
+                let mut iter = conn
+                    .scan_match::<String, Vec<u8>>(format!("{}c{}_*", self.prefix, inode))
+                    .await?
+                    .chunks(10000);
+                let mut zero_chunks = Vec::new();
+                while let Some(keys) = iter.next().await {
+                    for key in keys {
+                        let key = match String::from_utf8(key) {
+                            Ok(key) => key,
+                            Err(e) => {
+                                error!("Invalid key: {:?}", e);
+                                continue;
+                            }
+                        };
+                        if let Some(caps) = self.chunk_re.captures(&key)
+                            && let Ok(idx) = caps.get(1).unwrap().as_str().parse::<u64>()
+                        {
+                            if idx > left / CHUNK_SIZE && idx < right / CHUNK_SIZE {
+                                zero_chunks.push(idx);
+                            }
+                        } else {
+                            error!("parse {} into chunk idx error", key);
+                            continue;
+                        }
+                    }
+                }
+                zero_chunks
+            } else {
+                (left / CHUNK_SIZE + 1..right / CHUNK_SIZE).collect()
+            };
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos();
+            attr.length = length;
+            attr.mtime = now;
+            attr.ctime = now;
+            let mut pipe = pipe();
+            pipe.atomic();
+            pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
+            // zero out from left to right
+            let l = if right > (left / CHUNK_SIZE + 1) * CHUNK_SIZE {
+                CHUNK_SIZE - left % CHUNK_SIZE
+            } else {
+                right - left
+            };
+            pipe.rpush(
+                self.chunk_key(inode, (left / CHUNK_SIZE) as u32),
+                PSlice::new(
+                    &Slice {
+                        id: 0,
+                        size: 0,
+                        off: 0,
+                        len: l as u32,
+                    },
+                    (left % CHUNK_SIZE) as u32,
+                ),
+            );
+            for indx in zero_chunks {
+                pipe.rpush(
+                    self.chunk_key(inode, indx as u32),
+                    PSlice::new(
+                        &Slice {
+                            id: 0,
+                            size: 0,
+                            off: 0,
+                            len: CHUNK_SIZE as u32,
+                        },
+                        0,
+                    ),
+                );
+            }
+            if right > (left / CHUNK_SIZE + 1) * CHUNK_SIZE && right % CHUNK_SIZE > 0 {
+                pipe.rpush(
+                    self.chunk_key(inode, (right / CHUNK_SIZE) as u32),
+                    PSlice::new(
+                        &Slice {
+                            id: 0,
+                            size: 0,
+                            off: 0,
+                            len: (right % CHUNK_SIZE) as u32,
+                        },
+                        0,
+                    ),
+                );
+            }
+            pipe.incr(self.used_space_key(), delta.space);
+            pipe.query_async(conn).await?;
+            Ok(Some((attr, delta)))
+        })
+    }
+
+    async fn do_copy_file_range(
+        &self,
+        src: Ino,
+        src_off: u64,
+        dst: Ino,
+        dst_off: u64,
+        len: u64,
+        flags: u32,
+    ) -> Result<u64> {
+        let base = AsRef::<CommonMeta>::as_ref(self);
+        let chunks = base
+            .open_files
+            .chunks(dst)
+            .ok_or_else(|| BadFDSnafu { fd: dst }.build())?;
+        let mut chunks = chunks.write().await;
+        defer! {
+            chunks.clear();
+        }
+
+        /*
+                defer m.timeit("CopyFileRange", time.Now())
+        f := m.of.find(fout)
+        if f != nil {
+            f.Lock()
+            defer f.Unlock()
+        }
+        var newLength, newSpace int64
+        var sattr, attr Attr
+        defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
+        err := m.txn(ctx, func(tx *redis.Tx) error {
+            newLength, newSpace = 0, 0
+            rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
+            if err != nil {
+                return err
+            }
+            if rs[0] == nil || rs[1] == nil {
+                return redis.Nil
+            }
+            sattr = Attr{}
+            m.parseAttr([]byte(rs[0].(string)), &sattr)
+            if sattr.Typ != TypeFile {
+                return syscall.EINVAL
+            }
+            if offIn >= sattr.Length {
+                if copied != nil {
+                    *copied = 0
+                }
+                return nil
+            }
+            size := size
+            if offIn+size > sattr.Length {
+                size = sattr.Length - offIn
+            }
+            attr = Attr{}
+            m.parseAttr([]byte(rs[1].(string)), &attr)
+            if attr.Typ != TypeFile {
+                return syscall.EINVAL
+            }
+            if (attr.Flags&FlagImmutable) != 0 || (attr.Flags&FlagAppend) != 0 {
+                return syscall.EPERM
+            }
+
+            newleng := offOut + size
+            if newleng > attr.Length {
+                newLength = int64(newleng - attr.Length)
+                newSpace = align4K(newleng) - align4K(attr.Length)
+                attr.Length = newleng
+            }
+            if err := m.checkQuota(ctx, newSpace, 0, m.getParents(ctx, tx, fout, attr.Parent)...); err != 0 {
+                return err
+            }
+            now := time.Now()
+            attr.Mtime = now.Unix()
+            attr.Mtimensec = uint32(now.Nanosecond())
+            attr.Ctime = now.Unix()
+            attr.Ctimensec = uint32(now.Nanosecond())
+            if outLength != nil {
+                *outLength = attr.Length
+            }
+
+            var vals [][]string
+            for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
+                val, err := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
+                if err != nil {
+                    return err
+                }
+                vals = append(vals, val)
+            }
+
+            _, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+                coff := offIn / ChunkSize * ChunkSize
+                for _, sv := range vals {
+                    // Add a zero chunk for hole
+                    ss := readSlices(sv)
+                    if ss == nil {
+                        return syscall.EIO
+                    }
+                    ss = append([]*slice{{len: ChunkSize}}, ss...)
+                    cs := buildSlice(ss)
+                    tpos := coff
+                    for _, s := range cs {
+                        pos := tpos
+                        tpos += uint64(s.Len)
+                        if pos < offIn+size && pos+uint64(s.Len) > offIn {
+                            if pos < offIn {
+                                dec := offIn - pos
+                                s.Off += uint32(dec)
+                                pos += dec
+                                s.Len -= uint32(dec)
+                            }
+                            if pos+uint64(s.Len) > offIn+size {
+                                dec := pos + uint64(s.Len) - (offIn + size)
+                                s.Len -= uint32(dec)
+                            }
+                            doff := pos - offIn + offOut
+                            indx := uint32(doff / ChunkSize)
+                            dpos := uint32(doff % ChunkSize)
+                            if dpos+s.Len > ChunkSize {
+                                pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, ChunkSize-dpos))
+                                if s.Id > 0 {
+                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+                                }
+
+                                skip := ChunkSize - dpos
+                                pipe.RPush(ctx, m.chunkKey(fout, indx+1), marshalSlice(0, s.Id, s.Size, s.Off+skip, s.Len-skip))
+                                if s.Id > 0 {
+                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+                                }
+                            } else {
+                                pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, s.Len))
+                                if s.Id > 0 {
+                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
+                                }
+                            }
+                        }
+                    }
+                    coff += ChunkSize
+                }
+                pipe.Set(ctx, m.inodeKey(fout), m.marshal(&attr), 0)
+                if newSpace > 0 {
+                    pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
+                }
+                return nil
+            })
+            if err == nil {
+                if copied != nil {
+                    *copied = size
+                }
+            }
+            return err
+        }, m.inodeKey(fout), m.inodeKey(fin))
+        if err == nil {
+            m.updateParentStat(ctx, fout, attr.Parent, newLength, newSpace)
+        }
+        return errno(err)
+             */
         unimplemented!()
     }
 

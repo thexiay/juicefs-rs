@@ -1,22 +1,19 @@
 use std::{
+    cmp::min,
     collections::HashMap,
     ops::Deref,
-    path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicU64, Arc},
 };
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures::Stream;
+use futures::TryFutureExt;
 use futures_async_stream::{stream, try_stream};
 
 use juice_meta::{
     api::{
-        Attr, Entry, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, StatFs, MAX_FILE_LEN,
+        Attr, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, StatFs, MAX_FILE_LEN,
         MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
     },
     context::{FsContext, Gid, Uid, WithContext},
@@ -45,7 +42,7 @@ impl Deref for Vfs {
     type Target = VfsInner;
 
     fn deref(&self) -> &Self::Target {
-        todo!()
+        &self.vfs
     }
 }
 
@@ -83,6 +80,33 @@ pub struct VfsInner {
 ///     - directory inode
 /// 3. Pre-check such as file length, etc.
 impl Vfs {
+    pub fn new(config: Config, meta: Arc<dyn Meta>, store: CachedStore) -> Self {
+        let config = Arc::new(config);
+        let store = Arc::new(store);
+        let reader = DataReader::new(meta.clone(), store.clone(), config.clone());
+        let writer = DataWriter::new(
+            config.clone(),
+            meta.clone(),
+            store.clone(),
+            reader.clone().invalid_notifier(),
+        );
+        Vfs {
+            vfs: Arc::new(VfsInner {
+                conf: config,
+                meta,
+                store,
+                reader,
+                writer,
+                handles: DashMap::new(),
+                ino_mapping: DashMap::new(),
+                next_fh: AtomicU64::new(1),
+                internal_inos: Vec::new(),
+                last_modified: RwLock::new(HashMap::new()),
+            }),
+            context: FsContext::default(),
+        }
+    }
+
     pub async fn get_attr(&self, ino: Ino, opened: u8) -> Result<Entry, Errno> {
         todo!()
     }
@@ -134,6 +158,187 @@ impl Vfs {
         })
     }
 
+    pub async fn truncate(&self, ino: Ino, size: u64, fh: Fh) -> Result<Attr, Errno> {
+        if VfsInner::is_special_inode(ino) {
+            return Err(Errno::EPERM);
+        }
+        if size >= MAX_FILE_LEN {
+            return Err(Errno::EFBIG);
+        }
+
+        // Lock all active handles
+        let mut hs = self.find_all_handle(ino);
+        hs.sort_by_key(|h| h.fh());
+        let mut locks = Vec::new();
+        for h in hs.iter() {
+            locks.push(h.write(true).await.ok_or(Errno::EINTR)?);
+        }
+        self.writer.flush(ino).await.map_err(|e| {
+            error!("flush writer failed: {:?}", e);
+            e.fs_err()
+        })?;
+
+        let attr = if fh == 0 {
+            self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
+                error!("truncate failed: {:?}", e);
+                e.fs_err()
+            })?
+        } else {
+            let _ = self.find_handle(ino, fh).ok_or(Errno::EBADF)?;
+            self.meta.truncate(ino, 0, size, true).await.map_err(|e| {
+                error!("truncate failed: {:?}", e);
+                e.fs_err()
+            })?
+        };
+
+        self.writer.truncate(ino, size);
+        self.reader.truncate(ino, size);
+        let mut last_modified = self.last_modified.write();
+        last_modified.insert(ino, Utc::now());
+        Ok(attr)
+    }
+
+    pub async fn fallocate(
+        &self,
+        ino: Ino,
+        mode: Falloc,
+        off: u64,
+        size: u64,
+        fh: Fh,
+    ) -> Result<(), Errno> {
+        if VfsInner::is_special_inode(ino) {
+            return Err(Errno::EPERM);
+        }
+        if off >= MAX_FILE_LEN || off + size >= MAX_FILE_LEN {
+            return Err(Errno::EFBIG);
+        }
+
+        let h = match self.find_handle(ino, fh) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        let mut h = h.write(true).await.ok_or(Errno::EINTR)?;
+        match &mut *h {
+            HandleInner::File(h) => match h.writer() {
+                Some(writer) => {
+                    writer.flush().await.map_err(|e| {
+                        error!("flush writer failed: {:?}", e);
+                        e.fs_err()
+                    })?;
+                    let length = self
+                        .meta
+                        .fallocate(ino, mode, off, size)
+                        .await
+                        .map_err(|e| {
+                            error!("fallocate failed: {:?}", e);
+                            e.fs_err()
+                        })?;
+                    writer.truncate(size);
+                    let s = min(length - off, size);
+                    if s > 0 {
+                        self.reader.invalidate(ino, Frange { off, len: s });
+                    }
+                    let mut last_modified = self.last_modified.write();
+                    last_modified.insert(ino, Utc::now());
+                    Ok(())
+                }
+                None => Err(Errno::EBADF),
+            },
+            HandleInner::Dir(_) => Err(Errno::EINVAL),
+            HandleInner::Control(_) => Err(Errno::EINVAL),
+        }
+    }
+
+    pub async fn copy_filerange(
+        &self,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        size: u64,
+        flags: u32,
+    ) -> Result<u64, Errno> {
+        todo!()
+        /*
+                func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {
+            defer func() {
+                logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
+            }()
+            if IsSpecialNode(nodeIn) {
+                err = syscall.ENOTSUP
+                return
+            }
+            if IsSpecialNode(nodeOut) {
+                err = syscall.EPERM
+                return
+            }
+            hi := v.findHandle(nodeIn, fhIn)
+            if fhIn == 0 || hi == nil || hi.inode != nodeIn {
+                err = syscall.EBADF
+                return
+            }
+            ho := v.findHandle(nodeOut, fhOut)
+            if fhOut == 0 || ho == nil || ho.inode != nodeOut {
+                err = syscall.EBADF
+                return
+            }
+            if hi.reader == nil {
+                err = syscall.EBADF
+                return
+            }
+            if ho.writer == nil {
+                err = syscall.EACCES
+                return
+            }
+            if offIn >= maxFileSize || offIn+size >= maxFileSize || offOut >= maxFileSize || offOut+size >= maxFileSize {
+                err = syscall.EFBIG
+                return
+            }
+            if flags != 0 {
+                err = syscall.EINVAL
+                return
+            }
+            if nodeIn == nodeOut && (offIn <= offOut && offOut < offIn+size || offOut <= offIn && offIn < offOut+size) {
+                err = syscall.EINVAL // overlap
+                return
+            }
+
+            if !ho.Wlock(ctx) {
+                err = syscall.EINTR
+                return
+            }
+            defer ho.Wunlock()
+            defer ho.removeOp(ctx)
+            if nodeIn != nodeOut {
+                if !hi.Rlock(ctx) {
+                    err = syscall.EINTR
+                    return
+                }
+                defer hi.Runlock()
+                defer hi.removeOp(ctx)
+            }
+
+            err = v.writer.Flush(ctx, nodeIn)
+            if err != 0 {
+                return
+            }
+            err = v.writer.Flush(ctx, nodeOut)
+            if err != 0 {
+                return
+            }
+            var length uint64
+            err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, size, flags, &copied, &length)
+            if err == 0 {
+                v.writer.Truncate(nodeOut, length)
+                v.reader.Invalidate(nodeOut, offOut, size)
+                v.invalidateAttr(nodeOut)
+            }
+            return
+        }s
+                 */
+    }
+
     pub async fn mkdir(
         &self,
         parent: Ino,
@@ -175,6 +380,49 @@ impl Vfs {
         })?;
         self.cache_dir_entry(parent, name, None).await;
         Ok(())
+    }
+
+    pub async fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u16,
+        cumask: u16,
+        flags: OFlag,
+    ) -> Result<(Fh, Entry), Errno> {
+        if parent == ROOT_INODE && self.is_special_node(name) {
+            return Err(Errno::EEXIST);
+        }
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        let (ino, mut attr) = self
+            .meta
+            .create(parent, name, mode & 0o7777, cumask, flags)
+            .await
+            .map_err(|e| {
+                error!("create failed: {:?}", e);
+                e.fs_err()
+            })?;
+        self.update_len(ino, &mut attr);
+        let fh = self
+            .new_handle(ino, attr.length, Some(flags))
+            .await
+            .map_err(|e| {
+                error!("create failed: {:?}", e);
+                e.fs_err()
+            })?;
+        self.cache_dir_entry(parent, name, Some((ino, attr.clone())))
+            .await;
+        Ok((
+            fh,
+            Entry {
+                inode: ino,
+                name: name.to_string(),
+                attr,
+            },
+        ))
     }
 
     pub async fn open(&self, ino: Ino, flags: OFlag) -> Result<(Fh, Attr), Errno> {
@@ -315,7 +563,7 @@ impl Vfs {
         Ok(())
     }
 
-    pub async fn fsync(&self, ino: Ino, fh: Fh, datasync: bool) -> Result<(), Errno> {
+    pub async fn fsync(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
         if VfsInner::is_special_inode(ino) {
             return Ok(());
         }
@@ -370,7 +618,7 @@ impl Vfs {
                     match handle.read_once() {
                         Some(entry) => {
                             yield entry;
-                        },
+                        }
                         None => break,
                     }
                 }

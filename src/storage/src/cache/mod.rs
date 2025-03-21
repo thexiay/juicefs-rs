@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use disk::DiskCacheManager;
 pub use disk::DiskEvent;
 use either::Either;
-use opendal::Buffer;
+use mem::MemCacheManager;
+use opendal::{Buffer, Operator};
+use snafu::whatever;
 use std::{future::Future, sync::Arc};
 
 use crate::{
@@ -115,67 +117,82 @@ impl CacheReader for Box<dyn CacheReader> {
 
 pub enum CacheManagerImpl {
     Disk(DiskCacheManager),
-    // todo: mem
+    Mem(MemCacheManager),
 }
 
 impl CacheManagerImpl {
-    pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
-        let disk = DiskCacheManager::new(config, uploader)?;
-        Ok(CacheManagerImpl::Disk(disk))
+    pub fn new(config: &Config, operator: Arc<Operator>) -> Result<Self> {
+        match config.cache_type.to_lowercase().as_str() {
+            "mem" => {
+                let mem = MemCacheManager::new();
+                Ok(CacheManagerImpl::Mem(mem))
+            },
+            "disk" => {
+                if config.cache_size == 0 {
+                    whatever!("cache_size must be set when cache_type is disk");
+                }
+                Ok(CacheManagerImpl::Disk(DiskCacheManager::new(config, operator)?))
+            },
+            _ => whatever!("invalid cache_type"),
+        }
     }
-}
 
-#[async_trait]
-impl Uploader for CacheManagerImpl {
-    async fn upload(&self, key: &str, block: Buffer) -> Result<Either<Buffer, FileBuffer>> {
+    pub fn uploader(&self) -> Option<Arc<dyn Uploader>> {
         match self {
-            CacheManagerImpl::Disk(d) => d.upload(key, block).await,
+            CacheManagerImpl::Disk(d) => Some(Arc::new(d.clone())),
+            CacheManagerImpl::Mem(_) => None,
         }
     }
 }
 
 impl CacheManager for CacheManagerImpl {
-    fn put(
+    async fn put(
         &self,
         key: &CacheKey,
         p: Either<Buffer, FileBuffer>,
         force: bool,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> Result<()> {
         match self {
-            CacheManagerImpl::Disk(d) => d.put(key, p, force),
+            CacheManagerImpl::Disk(d) => d.put(key, p, force).await,
+            CacheManagerImpl::Mem(m) => m.put(key, p, force).await,
         }
     }
 
-    fn remove(&self, key: &CacheKey) -> impl Future<Output = ()> + Send {
+    async fn remove(&self, key: &CacheKey) {
         match self {
-            CacheManagerImpl::Disk(d) => d.remove(key),
+            CacheManagerImpl::Disk(d) => d.remove(key).await,
+            CacheManagerImpl::Mem(m) => m.remove(key).await,
         }
     }
 
-    fn get(
+    async fn get(
         &self,
         key: &CacheKey,
-    ) -> impl Future<Output = Result<Option<Either<Buffer, FileBuffer>>>> + Send {
+    ) -> Result<Option<Either<Buffer, FileBuffer>>> {
         match self {
-            CacheManagerImpl::Disk(d) => d.get(key),
+            CacheManagerImpl::Disk(d) => d.get(key).await,
+            CacheManagerImpl::Mem(m) => m.get(key).await,
         }
     }
 
     fn stats(&self) -> CacheCntAndSize {
         match self {
             CacheManagerImpl::Disk(d) => d.stats(),
+            CacheManagerImpl::Mem(m) => m.stats(),
         }
     }
 
     fn used_memory(&self) -> i64 {
         match self {
             CacheManagerImpl::Disk(d) => d.used_memory(),
+            CacheManagerImpl::Mem(m) => m.used_memory(),
         }
     }
 
     fn is_invalid(&self) -> bool {
         match self {
             CacheManagerImpl::Disk(d) => d.is_invalid(),
+            CacheManagerImpl::Mem(m) => m.is_invalid(),
         }
     }
 }

@@ -39,6 +39,7 @@ uuid = { workspace = true }
 dyn-clone = { workspace = true }
 nix = { workspace = true }
 time = { workspace = true }
+scopeguard = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

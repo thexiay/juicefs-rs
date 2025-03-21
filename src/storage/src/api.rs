@@ -92,8 +92,7 @@ pub trait ChunkStore: Send + Sync {
 
 pub fn new_chunk_store(config: Config, operator: Operator) -> Result<CachedStore> {
     let operator = Arc::new(operator);
-    let uploader = NormalUploader::new(operator.clone(), None);
-    let cache_store = CachedStore::new(operator, config, uploader)?;
+    let cache_store = CachedStore::new(operator, config)?;
     Ok(cache_store)
     // todo: add switch disk cache manager to mem cache manager
 }

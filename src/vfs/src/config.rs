@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::Duration;
 use juice_meta::config::{Config as MetaConfig, Format as MetaFormat};
 use juice_storage::api::Config as ChunkConfig;
+use nix::unistd::{getpid, getppid};
 
 pub struct Port {
     pub prometheus_agent: String,
@@ -43,27 +44,35 @@ pub struct FuseOptions {
     pub no_alloc_for_read: bool,
 }
 
+pub struct BackupMeta {
+    pub interval: Duration,
+    pub skip_trash: bool,
+}
+
 pub struct Config {
     pub meta: Arc<MetaConfig>,
     pub format: MetaFormat,
     pub chunk: Arc<ChunkConfig>,
-    pub port: Port,
-    pub version: String ,
-    pub attr_timeout: Duration,
-    pub dir_entry_timeout: Duration,
-    pub entry_timeout: Duration,
-    pub backup_meta: Duration,
-    pub backup_skip_trash: bool,
-    pub fast_resolve: bool,
-    pub access_log: String,
+    pub port: Option<Arc<Port>>,
+    pub version: String,
+    pub attr_timeout: Option<Duration>,
+    pub dir_entry_timeout: Option<Duration>,
+    pub entry_timeout: Option<Duration>,
+    pub backup_meta: Option<BackupMeta>,
+    pub fast_resolve: Option<bool>,
+    pub access_log: Option<String>,
+    /// Whether to add prefix ".jfs" for internal files
     pub prefix_internal: bool,
+    /// Whether hide internal files
     pub hide_internal: bool,
-    pub root_squash: Arc<RootSquash>,
-    pub non_default_permission: bool,
+    pub root_squash: Option<Arc<RootSquash>>,
+    pub non_default_permission: Option<bool>,
     
     pub pid: i32,
     pub ppid: i32,
-    pub comm_path: String,
-    pub state_path: String,
-    pub fuse_opts: Arc<FuseOptions>,
+    pub comm_path: Option<String>,
+    pub state_path: Option<String>,
+    pub fuse_opts: Option<Arc<FuseOptions>>,
 }
+
+

@@ -27,3 +27,8 @@ nix = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 futures-async-stream = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+assert_matches = { workspace = true }
+tracing-test = { workspace = true }

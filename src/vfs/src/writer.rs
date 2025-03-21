@@ -46,7 +46,6 @@ type CRange = Frange;
 struct DataWriterCtx {
     meta: Arc<dyn Meta>,
     store: Arc<CachedStore>,
-    config: Arc<Config>,
     id_pool: SliceIDPool,
     dr_invalidator: DataReaderInvalidator,
     block_size: u64,
@@ -71,13 +70,12 @@ impl DataWriter {
             dw_ctx: Arc::new(DataWriterCtx {
                 meta: meta.clone(),
                 store,
-                config: config.clone(),
                 id_pool: SliceIDPool::new(meta.clone()),
                 dr_invalidator: invalidator,
                 block_size: config.chunk.max_block_size as u64,
                 used_read_buffer: AtomicU64::new(0),
                 max_read_buffer: config.chunk.buffer_size,
-                max_retries: config.meta.retries as u32,
+                max_retries: config.meta.retries,
             }),
             files: Mutex::new(HashMap::new()),
         });

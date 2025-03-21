@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::{
     align_4k,
@@ -393,7 +393,6 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     assert!(err.is_no_entry_found2(&99999), "got {:?}", err);
 
     let _ = m.open(inode, OFlag::O_RDWR).await.expect("open f: ");
-    m.close(inode).await.expect("close f: ");
     let slice_id = m.new_slice().await.expect("new slice: ");
     m.write(
         inode,
@@ -449,6 +448,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .fallocate(inode, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 0, 0)
         .await;
     assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let _ = m.open(parent, OFlag::O_RDWR).await.expect("open f: ");
     let rs = m
         .fallocate(parent, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 100, 50)
         .await;
@@ -457,6 +457,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         "got {:?}",
         rs
     );
+    m.close(parent).await.expect("close f: ");
 
     let slices = m.read(inode, 0).await.expect("read chunk: ");
     assert_eq!(slices.len(), 3);
@@ -464,6 +465,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     assert_eq!(slices[1].len, 50);
     assert_eq!(slices[2].id, slice_id);
     assert_eq!(slices[2].len, 50);
+    m.close(inode).await.expect("close f: ");
 
     // xattr
     m.set_xattr(
@@ -683,14 +685,13 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .expect("unlink f3: ");
     
     sleep(Duration::from_millis(100)).await;  // wait for delete
-    
+
+    // 这里unlink后ROOT/f理论上不应该存在这个了，但是读取到缓存数据了，从而导致错误的信息
     let rs = m.read(inode, 0).await;
     assert!(rs.as_ref().unwrap_err().is_no_entry_found2(&inode), "got {:?}", rs);
 
-    info!("4444");
     // release resource
     m.rmdir(ROOT_INODE, "d", false).await.expect("rmdir d: ");
-
 }
 
 pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>)) {

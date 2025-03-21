@@ -14,7 +14,7 @@ use tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::{
     error::{InvalidOFlagSnafu, Result},
     reader::FileReaderRef,
-    vfs::{Vfs, VfsInner},
+    vfs::Vfs,
     writer::FileWriterRef,
 };
 

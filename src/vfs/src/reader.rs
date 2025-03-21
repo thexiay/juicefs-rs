@@ -18,21 +18,24 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::{error::{EIOFailedTooManyTimesSnafu, Result, VfsError}, frange::Frange};
+use crate::{config::Config, error::{EIOFailedTooManyTimesSnafu, Result, VfsError}, frange::Frange};
+
+const READ_SESSION: usize = 2;
 
 pub struct DataReaderCtx {
     meta: Arc<dyn Meta>,
     store: Arc<CachedStore>,
     max_block_size: u64,
-    // 一个FileReader中最大的readahead数量
+    /// max readahead bytes in once readahead request
+    max_once_readahead: u64,
+    /// total readahead bytes in all files
     max_readahead: u64,
-    // 所有的FileReader中总共的最大的readahead数量
-    total_readahead: u64,
-    // 所有FileReader中使用的buffer数量
+    /// used read buffer in all file readers
     used_read_buffer: AtomicU64,
-    // 一个FileReader中并发读取的最大请求数，超过这个数量的block读取请求会被丢弃
-    max_request: u64,
-    // 一次FileReader中的最大失败读取次数
+    /// Max read requests in one [`FileReader`]
+    /// After exceeding this value, the fileReader that is completed in the cache will be cleaned.
+    max_request: usize,
+    /// Max read retries count in one [`FileReader`], requests exceeding this value will fail
     max_retries: u32,
 }
 
@@ -53,19 +56,19 @@ impl DataReader {
     pub fn new(
         meta: Arc<dyn Meta>,
         store: Arc<CachedStore>,
-        max_block_size: u64,
-        max_readahead: u64,
-        total_readahead: u64,
-        max_request: u64,
-        max_retries: u32,
+        conf: Arc<Config>,
     ) -> Arc<DataReader> {
+        let total_readahead = max(conf.chunk.buffer_size * 10 / 8, 256 << 20);  // default 256MB
+        let max_readahead = min(max(8 * conf.chunk.max_block_size as u64, conf.chunk.read_ahead), total_readahead);
+        let max_retries = conf.meta.retries;
+        let max_request = max_readahead as usize / conf.chunk.max_block_size * READ_SESSION + 1;
         let dr = Arc::new(DataReader {
             ctx: Arc::new(DataReaderCtx {
                 meta,
                 store,
-                max_block_size,
-                max_readahead,
-                total_readahead,
+                max_block_size: conf.chunk.max_block_size as u64,
+                max_once_readahead: max_readahead,
+                max_readahead: total_readahead,
                 used_read_buffer: AtomicU64::new(0),
                 max_request,
                 max_retries,
@@ -162,8 +165,8 @@ struct FileReaderCore {
     dr_ctx: Arc<DataReaderCtx>,
     f_ctx: Arc<FileReaderCtx>,
     length: u64,
-    sessions: [SessionTrace; 2],
     // The link list of all chunk readers
+    sessions: [SessionTrace; READ_SESSION],
     // Shared between different `FileReader`
     chunk_readers: LinkedList<Arc<ChunkReader>>,
 }
@@ -210,8 +213,8 @@ impl FileReaderCore {
     /// release idle chunk reader
     fn release_idle_buffer(&mut self) {
         let used = self.dr_ctx.used_read_buffer.load(Ordering::SeqCst);
-        let idle = if used > self.dr_ctx.total_readahead {
-            let reduce = (used / self.dr_ctx.total_readahead) as i32;
+        let idle = if used > self.dr_ctx.max_readahead {
+            let reduce = (used / self.dr_ctx.max_readahead) as i32;
             Duration::minutes(1) / reduce
         } else {
             Duration::minutes(1)
@@ -246,7 +249,7 @@ impl FileReaderCore {
         // do readahead
         if frange.len > 0
             && frange.off < self.length
-            && self.dr_ctx.used_read_buffer.load(Ordering::SeqCst) < self.dr_ctx.total_readahead
+            && self.dr_ctx.used_read_buffer.load(Ordering::SeqCst) < self.dr_ctx.max_readahead
         {
             if frange.len < self.dr_ctx.max_block_size {
                 // align to end of a block
@@ -313,11 +316,11 @@ impl FileReaderCore {
         let used = self.dr_ctx.used_read_buffer.load(Ordering::SeqCst);
         let is_first_readahead = session.last_readahead_len == 0
             && (frange.off == 0 || session.seq_readlen > frange.len);
-        let is_readahead_double = session.last_readahead_len < self.dr_ctx.max_readahead
+        let is_readahead_double = session.last_readahead_len < self.dr_ctx.max_once_readahead
             && session.seq_readlen >= session.last_readahead_len
-            && self.dr_ctx.total_readahead - used > session.last_readahead_len * 4;
+            && self.dr_ctx.max_readahead - used > session.last_readahead_len * 4;
         let is_readahead_halve = session.last_readahead_len >= self.dr_ctx.max_block_size
-            && (self.dr_ctx.total_readahead - used < session.last_readahead_len / 2
+            && (self.dr_ctx.max_readahead - used < session.last_readahead_len / 2
                 || session.seq_readlen < session.last_readahead_len * 4);
 
         let readahead_len = if is_first_readahead {

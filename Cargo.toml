@@ -45,9 +45,9 @@ bitflags = "1.3"
 futures = "0.3"
 crc32fast = "1.4"
 rand = "0.8"
-uuid = "1.11"
+uuid = { version = "1.11", features = [ "serde", "v4" ] }
 dyn-clone = "1"
-nix = { version = "0.29", features = ["fs"] }
+nix = { version = "0.29", features = ["fs", "process"] }
 opendal = { version = "0.50", features = ["default", "services-fs"] }
 governor = { version = "0.6.0", features = ["std"] }
 hashring = "0.3"
@@ -60,3 +60,4 @@ criterion = { version = "0.5", features = ["async_futures", "async_tokio"] }
 humansize = "2.1"
 async-stream = "0.3.5"
 futures-async-stream = "0.2.9"
+scopeguard = "1.2"

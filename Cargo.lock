@@ -1011,6 +1011,7 @@ dependencies = [
  "rand",
  "redis",
  "regex",
+ "scopeguard",
  "serde",
  "serde_json",
  "snafu",
@@ -1075,6 +1076,7 @@ dependencies = [
 name = "juice-vfs"
 version = "0.1.0"
 dependencies = [
+ "assert_matches",
  "async-stream",
  "bytes",
  "chrono",
@@ -1088,10 +1090,12 @@ dependencies = [
  "opendal",
  "parking_lot",
  "snafu",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
 ]
 
 [[package]]

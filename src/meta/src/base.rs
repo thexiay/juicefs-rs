@@ -1,13 +1,11 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
+use scopeguard::defer;
 use snafu::{ensure, ensure_whatever, whatever};
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,19 +19,21 @@ use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp, RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME
+    Attr, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp,
+    RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF,
+    MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
 use crate::error::{
     BadFDSnafu, DirNotEmptySnafu, InterruptedSnafu, InvalidArgSnafu, MetaErrorEnum,
-    NoEntryFoundSnafu, NotDir1Snafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu,
+    NoEntryFound2Snafu, NoEntryFoundSnafu, NotDir2Snafu, NotInitializedSnafu, OpNotPermittedSnafu,
     OpNotSupportedSnafu, PermissionDeniedSnafu, QuotaExceededSnafu, ReadFSSnafu, Result,
     SetQuotaSnafu,
 };
-use crate::openfile::{OpenFileChunkGuard, OpenFiles, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
+use crate::openfile::OpenFiles2;
 use crate::quota::{MetaQuota, Quota, QuotaView};
-use crate::slice::{MetaCompact, PSlice, PSlices};
+use crate::slice::{MetaCompact, PSlices};
 use crate::utils::{
     access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem,
     FreeID, PLockItem,
@@ -179,6 +179,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         sugidclearmode: u8,
         attr: &Attr,
     ) -> Result<Option<Attr>>;
+    async fn do_exists(&self, inode: Ino) -> Result<bool>;
     async fn do_lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr)>;
     async fn do_resolve(&self, parent: Ino, path: &str) -> Result<(Ino, Attr)>;
     async fn do_mknod(
@@ -230,6 +231,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         mtime: DateTime<Utc>,
     ) -> Result<(u32, DirStat, Attr)>;
 
+    // Returns (truncated attr, delta dirstat)
     async fn do_truncate(
         &self,
         inode: Ino,
@@ -237,6 +239,16 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         length: u64,
         skip_perm_check: bool,
     ) -> Result<(Attr, DirStat)>;
+
+    async fn do_copy_file_range(
+        &self,
+        src: Ino,
+        src_off: u64,
+        dst: Ino,
+        dst_off: u64,
+        len: u64,
+        flags: u32,
+    ) -> Result<u64>;
 
     async fn do_fallocate(
         &self,
@@ -341,7 +353,7 @@ pub trait MetaOtherFunction {
     /// Alter attr atime, it will use cache attr or persist attr to decide whether to update atime.
     ///
     /// caller makes sure inode is not special inode.
-    async fn update_attr_atime(&self, ino: Ino, open: bool);
+    async fn update_attr_atime(&self, ino: Ino);
 
     fn is_atime_need_update(&self, attr: &Attr, now: Duration) -> bool;
 
@@ -400,7 +412,7 @@ pub struct CommonMeta {
     pub sid: RwLock<Option<u64>>,
     // session umounting, once meta begin, fs mounting; once session is closed, unmounting
     pub ses_umounting: AsyncMutex<bool>,
-    pub open_files: Arc<OpenFiles>,
+    pub open_files: Arc<OpenFiles2>,
     // TODO: encapsulation it into Segmented Lock
     // Pessimistic locks to reduce conflicts
     pub txn_locks: [Mutex<()>; N_LOCK],
@@ -410,7 +422,7 @@ pub struct CommonMeta {
 impl CommonMeta {
     pub fn new(addr: &str, conf: Config) -> Self {
         let max_deleting = Arc::new(Semaphore::new(conf.max_deletes_task as usize));
-        let open_files = OpenFiles::new(conf.open_cache, conf.open_cache_limit);
+        let open_files = OpenFiles2::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
             addr: addr.to_string(),
             root: AtomicU64::new(ROOT_INODE),
@@ -845,13 +857,8 @@ where
         }
     }
 
-    async fn update_attr_atime(&self, ino: Ino, open: bool) {
+    async fn update_attr_atime(&self, ino: Ino) {
         let base = self.as_ref();
-        let file = base.open_files.lock(ino);
-        let mut of = file.lock().await;
-        if open {
-            of.open();
-        }
         if base.conf.atime_mode == "NoAtime" || base.conf.read_only {
             return;
         }
@@ -859,7 +866,7 @@ where
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
-        if let Some(attr) = of.get_attr()
+        if let Some(attr) = base.open_files.attr(ino)
             && attr.full
             && !self.is_atime_need_update(&attr, now)
         {
@@ -868,8 +875,8 @@ where
 
         // update persist layer atime
         match self.do_touch_atime(ino, now).await {
-            Ok(mut attr) => {
-                of.put_attr(&mut attr);
+            Ok(attr) => {
+                base.open_files.cache_attr(ino, &attr);
             }
             Err(e) => {
                 warn!("Update atime of inode {} failed: {}", ino, e);
@@ -1242,13 +1249,12 @@ where
         }
         if persist {
             let session_info = base.new_session_info();
-            self.clone()
-                .do_new_session(
-                    sid,
-                    &bincode::serialize(&session_info).unwrap(),
-                    action == "Update",
-                )
-                .await?;
+            self.do_new_session(
+                sid,
+                &bincode::serialize(&session_info).unwrap(),
+                action == "Update",
+            )
+            .await?;
             info!("{} session {} OK with version:", action, sid);
         }
 
@@ -1901,12 +1907,7 @@ where
     async fn get_attr(&self, inode: Ino) -> Result<Attr> {
         let base = self.as_ref();
         let inode = base.check_root(inode);
-        let attr = {
-            let file = base.open_files.lock(inode);
-            let of = file.lock().await;
-            of.get_attr()
-        };
-        if let Some(attr) = attr {
+        if let Some(attr) = base.open_files.attr(inode) {
             return Ok(attr);
         }
         // for root and trash, maybe the attr is not persist, but we need it always return ok
@@ -1931,10 +1932,13 @@ where
             }
         } else {
             let mut attr = self.do_get_attr(inode).await?;
-            {
-                let file = base.open_files.lock(inode);
-                let mut of = file.lock().await;
-                of.put_attr(&mut attr);
+            if base.open_files.cache_attr(inode, &attr) {
+                attr.keep_cache = true
+            } else {
+                if let Some(chunks) = base.open_files.chunks(inode) {
+                    let mut chunks = chunks.write().await;
+                    chunks.clear();
+                }
             }
             if attr.typ == INodeType::Directory && inode.is_root() && !attr.parent.is_trash() {
                 base.dir_parents.lock().insert(inode, attr.parent);
@@ -1953,18 +1957,15 @@ where
     ) -> Result<()> {
         let base = self.as_ref();
         let inode = base.check_root(inode);
-        let res = self.do_set_attr(inode, set, sggid_clear_mode, attr).await;
-        {
-            let file = base.open_files.lock(inode);
-            let mut of = file.lock().await;
-            of.invalidate_chunk(INVALIDATE_ATTR_ONLY);
-            if let Some(mut attr) = of.get_attr()
-                && set.intersects(SetAttrMask::SET_ATIME.union(SetAttrMask::SET_ATIME_NOW))
+        defer! {
+            base.open_files.remove_attr(inode);
+            if let Some(mut attr) = base.open_files.attr(inode)
+                && set.intersects(SetAttrMask::SET_ATIME | SetAttrMask::SET_ATIME_NOW)
             {
                 attr.full = false;
             }
         }
-        res?;
+        let _ = self.do_set_attr(inode, set, sggid_clear_mode, attr).await?;
         Ok(())
     }
 
@@ -1981,9 +1982,20 @@ where
         attr_length: u64,
         skip_perm_check: bool,
     ) -> Result<Attr> {
-        let file = self.as_ref().open_files.lock(inode);
-        let _ = file.lock().await; // lock file until truncate finished
-
+        let chunks = match self.as_ref().open_files.chunks(inode) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(inode)
+                    .await?
+                    .then(|| BadFDSnafu { fd: inode }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: inode }.fail())?;
+            }
+        };
+        let mut chunks = chunks.write().await; // lock file until truncate finished
+        defer! {
+            chunks.clear();
+        }
         let (attr, dir_stat) = self
             .do_truncate(inode, flags, attr_length, skip_perm_check)
             .await?;
@@ -2031,8 +2043,20 @@ where
             }
         );
 
-        let file = self.as_ref().open_files.lock(inode);
-        let _ = OpenFileChunkGuard::new(file.lock().await, INVALIDATE_ALL_CHUNK);
+        let chunks = match self.as_ref().open_files.chunks(inode) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(inode)
+                    .await?
+                    .then(|| BadFDSnafu { fd: inode }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: inode }.fail())?;
+            }
+        };
+        let mut chunks = chunks.write().await;
+        defer! {
+            chunks.clear();
+        }
         let (delta, attr) = self.do_fallocate(inode, flag, off, size).await?;
         self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
             .await;
@@ -2486,15 +2510,13 @@ where
         if self.check_quota(parent, align_4k(attr.length), 1).await {
             return QuotaExceededSnafu.fail()?;
         }
-        let res = self.do_link(inode, parent, name).await;
-        if let Ok(_) = res {
-            self.update_dir_stats(parent, attr.length as i64, align_4k(attr.length), 1);
-            self.update_quota(parent, align_4k(attr.length), 1).await;
+        defer! {
+            self.as_ref().open_files.remove_attr(inode);
         }
-        let file = self.as_ref().open_files.lock(inode);
-        let mut of = file.lock().await;
-        of.invalidate_chunk(INVALIDATE_ATTR_ONLY);
-        res
+        let attr = self.do_link(inode, parent, name).await?;
+        self.update_dir_stats(parent, attr.length as i64, align_4k(attr.length), 1);
+        self.update_quota(parent, align_4k(attr.length), 1).await;
+        Ok(attr)
     }
 
     // Readdir returns all entries for given directory, which include attributes if plus is true.
@@ -2531,7 +2553,7 @@ where
         ];
         //  TODO: why here ENOENT and trash return ok?
         base_entries.append(&mut self.do_readdir(inode, wantattr, None).await?);
-        self.update_attr_atime(inode, false).await;
+        self.update_attr_atime(inode).await;
         Ok(base_entries)
     }
 
@@ -2544,17 +2566,11 @@ where
         cumask: u16,
         flags: OFlag,
     ) -> Result<(Ino, Attr)> {
-        match self
+        let (ino, mut attr) = match self
             .mknod(parent, name, INodeType::File, mode, cumask, 0, "")
             .await
         {
-            Ok((ino, mut attr)) => {
-                let file = self.as_ref().open_files.lock(ino);
-                let mut of = file.lock().await;
-                of.put_attr(&mut attr);
-                of.open();
-                Ok((ino, attr))
-            }
+            Ok((ino, attr)) => (ino, attr),
             Err(err) => {
                 if let MetaErrorEnum::EntryExists {
                     parent: parent,
@@ -2569,16 +2585,25 @@ where
                         None => self.get_attr(*exist_ino).await?,
                     };
                     if attr.typ == INodeType::File {
-                        let file = self.as_ref().open_files.lock(*exist_ino);
-                        let mut of = file.lock().await;
-                        of.put_attr(&mut attr);
-                        of.open();
-                        return Ok((*exist_ino, attr));
+                        (*exist_ino, attr)
+                    } else {
+                        return Err(err);
                     }
+                } else {
+                    return Err(err);
                 }
-                Err(err)
+            }
+        };
+        self.as_ref().open_files.open(ino);
+        if self.as_ref().open_files.cache_attr(ino, &attr) {
+            attr.keep_cache = true;
+        } else {
+            if let Some(chunks) = self.as_ref().open_files.chunks(ino) {
+                let mut chunks = chunks.write().await;
+                chunks.clear();
             }
         }
+        return Ok((ino, attr));
     }
 
     // Open checks permission on a node and track it as open.
@@ -2593,68 +2618,67 @@ where
         {
             return ReadFSSnafu.fail()?;
         }
-        let open_cache = {
-            // use cache if has cache
-            let file = self.as_ref().open_files.lock(inode);
-            let mut of = file.lock().await;
-            if of.is_open()
-                && let Some(attr) = of.get_attr()
-            {
-                Some(attr)
-            } else {
-                None
+        let base = self.as_ref();
+        let mut attr = match base.open_files.attr(inode) {
+            Some(attr) => attr,
+            None => {
+                let attr = self.get_attr(inode).await?;
+                let mode_mask = match flags
+                    .intersection(OFlag::O_RDONLY.union(OFlag::O_WRONLY).union(OFlag::O_RDWR))
+                {
+                    OFlag::O_RDONLY => ModeMask::READ,
+                    OFlag::O_WRONLY => ModeMask::WRITE,
+                    OFlag::O_RDWR => ModeMask::READ.union(ModeMask::WRITE),
+                    _ => ModeMask::empty(),
+                };
+                self.access(inode, mode_mask, &attr).await?;
+                if attr.flags.intersects(Flag::IMMUTABLE) || attr.parent > TRASH_INODE {
+                    if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) {
+                        return OpNotPermittedSnafu {
+                            op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                        }
+                        .fail()?;
+                    }
+                }
+                if attr.flags.intersects(Flag::APPEND) {
+                    if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR))
+                        && !flags.intersects(OFlag::O_APPEND)
+                    {
+                        return OpNotPermittedSnafu {
+                            op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                        }
+                        .fail()?;
+                    }
+                    if flags.intersects(OFlag::O_TRUNC) {
+                        return OpNotPermittedSnafu {
+                            op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
+                        }
+                        .fail()?;
+                    }
+                }
+                attr
             }
         };
-        if let Some(attr) = open_cache {
-            // todo: encapsulation it into guard scope
-            self.update_attr_atime(inode, true).await;
-            return Ok(attr);
-        }
 
-        let mut attr = self.get_attr(inode).await?;
-        let mode_mask =
-            match flags.intersection(OFlag::O_RDONLY.union(OFlag::O_WRONLY).union(OFlag::O_RDWR)) {
-                OFlag::O_RDONLY => ModeMask::READ,
-                OFlag::O_WRONLY => ModeMask::WRITE,
-                OFlag::O_RDWR => ModeMask::READ.union(ModeMask::WRITE),
-                _ => ModeMask::empty(),
-            };
-        self.access(inode, mode_mask, &attr).await?;
-        if attr.flags.intersects(Flag::IMMUTABLE) || attr.parent > TRASH_INODE {
-            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR)) {
-                return OpNotPermittedSnafu {
-                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
-                }
-                .fail()?;
+        // Only success modify atime?
+        base.open_files.open(inode);
+        if base.open_files.cache_attr(inode, &attr) {
+            attr.keep_cache = true;
+        } else {
+            if let Some(chunks) = base.open_files.chunks(inode) {
+                let mut chunks = chunks.write().await;
+                chunks.clear();
             }
         }
-        if attr.flags.intersects(Flag::APPEND) {
-            if flags.intersects(OFlag::O_WRONLY.union(OFlag::O_RDWR))
-                && !flags.intersects(OFlag::O_APPEND)
-            {
-                return OpNotPermittedSnafu {
-                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
-                }
-                .fail()?;
-            }
-            if flags.intersects(OFlag::O_TRUNC) {
-                return OpNotPermittedSnafu {
-                    op: format!("open({inode},{flags:?}): flags conflict with attr flags."),
-                }
-                .fail()?;
-            }
-        }
-        self.update_attr_atime(inode, true).await;
+        self.update_attr_atime(inode).await;
         Ok(attr)
     }
 
     // Close a file.
     async fn close(&self, inode: Ino) -> Result<()> {
         let base = self.as_ref();
-        let file = base.open_files.lock(inode);
-        let mut of = file.lock().await;
-        of.close();
-        if !of.is_open() {
+        base.open_files.close(inode);
+        if !base.open_files.is_opened(inode) {
             // lock during close file
             let removed = {
                 let mut removed_files = base.removed_files.lock();
@@ -2681,12 +2705,21 @@ where
 
     // Read returns the list of slices on the given chunk.
     async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>> {
-        let base = self.as_ref();
-        let file = base.open_files.lock(inode);  // 这里注意死锁，lock不可重入的
-        let of = file.lock().await;
-        if let Some(ss) = of.read_chunk(indx) {
-            return Ok(ss);
+        let chunks = match self.as_ref().open_files.chunks(inode) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(inode)
+                    .await?
+                    .then(|| BadFDSnafu { fd: inode }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: inode }.fail())?;
+            }
+        };
+        let chunks = chunks.read().await;
+        if let Some(slices) = chunks.get(&indx) {
+            return Ok(slices.clone());
         }
+
         let pslices = self.do_read(inode, indx).await?;
         ensure_whatever!(pslices.is_some(), "read chunk not found");
         let pslices = pslices.unwrap();
@@ -2702,7 +2735,7 @@ where
         } else {
             let pslices_len = pslices.len();
             let slices = pslices.build_slices();
-            if !base.conf.read_only && (pslices_len >= 5 || slices.len() >= 5) {
+            if !self.as_ref().conf.read_only && (pslices_len >= 5 || slices.len() >= 5) {
                 let mut meta = dyn_clone::clone_box(self);
                 meta.with_cancel(self.token().child_token());
                 tokio::spawn(async move {
@@ -2735,9 +2768,20 @@ where
         slice: Slice,
         mtime: DateTime<Utc>,
     ) -> Result<()> {
-        let file = self.as_ref().open_files.lock(inode);
-        // TODO: lock with whole function?
-        let _ = OpenFileChunkGuard::new(file.lock().await, indx);
+        let chunks = match self.as_ref().open_files.chunks(inode) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(inode)
+                    .await?
+                    .then(|| BadFDSnafu { fd: inode }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: inode }.fail())?;
+            }
+        };
+        let mut chunks = chunks.write().await;
+        defer! {
+            chunks.remove(&indx);
+        };
         let (num_slices, delta, attr) = self.do_write(inode, indx, off, slice, mtime).await?;
         self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
             .await;
@@ -2769,10 +2813,9 @@ where
         off_out: u64,
         size: u64,
         flags: u32,
-        copied: &u64,
-        out_length: &u64,
-    ) -> Result<()> {
-        todo!()
+    ) -> Result<u64> {
+        self.do_copy_file_range(fin, off_in, fout, off_out, size, flags)
+            .await
     }
 
     // GetDirStat returns the space and inodes usage of a directory.

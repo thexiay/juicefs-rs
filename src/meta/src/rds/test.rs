@@ -2,13 +2,13 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock,
+        Arc,
     },
     time::Duration,
 };
 
 use crate::{
-    api::{new_client, Meta},
+    api::Meta,
     config::Config,
     rds::RedisEngine,
 };

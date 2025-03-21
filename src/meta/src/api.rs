@@ -230,6 +230,7 @@ bitflags! {
     }
 
     pub struct Falloc: u8 {
+        const NONE = 0;
         const KEEP_SIZE = 1 << 0;
         const PUNCH_HOLE = 1 << 1;
         // const NO_HODE_STALE = 1 << 2;  RESERVED
@@ -629,9 +630,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         off_out: u64,
         size: u64,
         flags: u32,
-        copied: &u64,
-        out_length: &u64,
-    ) -> Result<()>;
+    ) -> Result<u64>;
 
     // GetDirStat returns the space and inodes usage of a directory.
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
@@ -736,18 +735,18 @@ pub trait Meta: WithContext + Send + Sync + 'static {
 clone_trait_object!(Meta);
 
 // NewClient creates a Meta client for given uri.
-pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
+pub async fn new_client(uri: &str, conf: Config) -> Arc<dyn Meta> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
-        uri
+        uri.to_string()
     };
     let (driver, addr) = match uri.find("://") {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
     match driver {
-        "redis" => Box::new(
+        "redis" => Arc::new(
             RedisEngine::new(driver, addr, conf)
                 .await
                 .expect(&format!("Meta {uri} is not available")),

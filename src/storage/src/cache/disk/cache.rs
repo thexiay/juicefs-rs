@@ -22,7 +22,7 @@ use futures::{stream, StreamExt, TryFutureExt};
 use hashring::HashRing;
 use humansize::{format_size, format_size_i};
 use nix::sys::stat::stat;
-use opendal::Buffer;
+use opendal::{Buffer, Operator};
 use parking_lot::{Mutex, RwLock};
 use snafu::{whatever, OptionExt, ResultExt};
 use tokio::{
@@ -73,13 +73,15 @@ static PROBE_DURATION: Duration = Duration::milliseconds(500);
 const PROBE_DATA: [u8; 3] = [1, 2, 3];
 
 /// A cache manager that manage lots of [ `DiskCache` ] keyed by a object key
+#[derive(Clone)]
 pub struct DiskCacheManager {
     cache_stores: Arc<RwLock<ConsistentHashDiskCache>>,
     stopped: Arc<AtomicBool>,
 }
 
 impl DiskCacheManager {
-    pub fn new(config: &Config, uploader: NormalUploader) -> Result<Self> {
+    pub fn new(config: &Config, operator: Arc<Operator>) -> Result<Self> {
+        let uploader = NormalUploader::new(operator.clone(), None);
         if let Some(upload_hours) = config.upload_hours {
             if upload_hours.0 != upload_hours.1 {
                 info!(
@@ -1621,9 +1623,8 @@ mod tests {
             .into_iter()
             .map(|num| dir.path().join(num.to_string()))
             .collect::<Vec<_>>();
-        let operator = Operator::new(()).unwrap().finish();
-        let uploader = NormalUploader::new(Arc::new(operator), None);
-        let cache_manager = DiskCacheManager::new(&config, uploader).unwrap();
+        let operator = Arc::new(Operator::new(()).unwrap().finish());
+        let cache_manager = DiskCacheManager::new(&config, operator).unwrap();
         {
             let cache_stores = cache_manager.cache_stores.read();
             assert_eq!(cache_stores.caches.len(), dir_num as usize);
@@ -1790,10 +1791,9 @@ mod tests {
             dir2.path().to_path_buf(),
             dir3.path().to_path_buf(),
         ];
-        let operator = Operator::new(()).unwrap().finish();
-        let uploader = NormalUploader::new(Arc::new(operator), None);
+        let operator = Arc::new(Operator::new(()).unwrap().finish());
         let manager =
-            DiskCacheManager::new(&config, uploader).expect("create disk cache manager failed");
+            DiskCacheManager::new(&config, operator.clone()).expect("create disk cache manager failed");
         assert!(!manager.is_invalid());
         {
             let cache_stores = manager.cache_stores.read();

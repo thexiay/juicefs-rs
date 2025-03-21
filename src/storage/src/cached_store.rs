@@ -38,6 +38,8 @@ pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
 // Config contains options for cachedStore
 #[derive(Clone)]
 pub struct Config {
+    // TODO: Optimize disk cache and memory cache config
+    pub cache_type: String,
     pub cache_dirs: Vec<PathBuf>,
     pub cache_file_mode: Permissions,
     pub cache_size: u64,
@@ -70,13 +72,14 @@ pub struct Config {
     pub put_timeout: Duration,
     pub cache_full_block: bool,
     pub buffer_size: u64,
-    pub read_ahead: isize,
+    pub read_ahead: u64,
     pub prefetch_parallelism: Option<u32>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
+            cache_type: "memory".to_string(),
             cache_dirs: vec![env::temp_dir().join("cache")],
             cache_file_mode: Permissions::from_mode(0o600),
             cache_size: 10 << 20, // 10MB
@@ -507,13 +510,16 @@ pub struct CachedStore {
 }
 
 impl CachedStore {
-    pub fn new(storage: Arc<Operator>, config: Config, uploader: NormalUploader) -> Result<Self> {
-        let cache_manager = Arc::new(CacheManagerImpl::new(&config, uploader)?);
+    pub fn new(storage: Arc<Operator>, config: Config) -> Result<Self> {
+        let cache_manager = Arc::new(CacheManagerImpl::new(&config, storage.clone())?);
+        let uploader = cache_manager
+            .uploader()
+            .unwrap_or(Arc::new(NormalUploader::new(storage.clone(), None)));
         Ok(CachedStore {
-            storage,
+            storage: storage.clone(),
             cache_manager: cache_manager.clone(),
             compressor: None,
-            uploader: cache_manager,
+            uploader,
             fetcher: Arc::new(PreFetcher::new()),
             group: Arc::new(SingleFlight::new()),
             conf: Arc::new(config),
@@ -648,8 +654,7 @@ mod test {
 
     fn new_cached_store(config: Config, op: Operator) -> Result<Arc<CachedStore>> {
         let operator = Arc::new(op);
-        let uploader = NormalUploader::new(operator.clone(), None);
-        let cache_store = CachedStore::new(operator, config, uploader)?;
+        let cache_store = CachedStore::new(operator, config)?;
         Ok(Arc::new(cache_store))
     }
 

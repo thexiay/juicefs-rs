@@ -15,3 +15,6 @@ mod frange;
 mod vfs;
 mod handle;
 mod internal;
+
+#[cfg(test)]
+mod vfs_test;
