@@ -39,7 +39,7 @@ use crate::error::{
 };
 use crate::openfile::{OpenFileChunkGuard, INVALIDATE_ALL_CHUNK, INVALIDATE_ATTR_ONLY};
 use crate::quota::{MetaQuota, Quota, QuotaView};
-use crate::slice::{PSlice, PSlices, Slices};
+use crate::slice::{PSlice, PSlices};
 use crate::utils::{self, align_4k, DeleteFileOption};
 use std::collections::HashMap;
 
@@ -2992,7 +2992,7 @@ impl Engine for RedisEngine {
         })
     }
 
-    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Option<PSlices>> {
+    async fn do_read(&self, inode: Ino, indx: u32) -> Result<PSlices> {
         let mut conn = self.share_conn();
         Ok(conn.lrange(self.chunk_key(inode, indx), 0, -1).await?)
     }
@@ -3105,8 +3105,7 @@ impl Engine for RedisEngine {
             let parents = self.get_parents(inode).await.into_keys().collect();
             self.check_quotas(delta.space, 0, parents).await?;
 
-            // When expanding, fill zero
-            // when shrinking, fill zero, and do not delete immediately
+            // Whenever expanding or shrinking, fill zero for [left, right]
             let (left, right) = (min(length, attr.length), max(length, attr.length));
             let zero_chunks = if (right - left) / CHUNK_SIZE as u64 >= 10000 {
                 // super large
@@ -3151,7 +3150,7 @@ impl Engine for RedisEngine {
             let mut pipe = pipe();
             pipe.atomic();
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
-            // zero out from left to right
+            // fill zero from left to right
             let l = if right > (left / CHUNK_SIZE + 1) * CHUNK_SIZE {
                 CHUNK_SIZE - left % CHUNK_SIZE
             } else {
@@ -3254,7 +3253,7 @@ impl Engine for RedisEngine {
                 }
             );
             ensure!(
-                dst_attr.flags.intersects(Flag::IMMUTABLE | Flag::APPEND),
+                !dst_attr.flags.intersects(Flag::IMMUTABLE | Flag::APPEND),
                 OpNotPermittedSnafu {
                     op: "copy to a immutable or append file"
                 }
@@ -3300,9 +3299,10 @@ impl Engine for RedisEngine {
             pipe.atomic();
             // align to CHUNK_SIZE
             let mut coff = dst_off / CHUNK_SIZE * CHUNK_SIZE;
-            for pslices in chunk_slices {
-                // Add a zero chunk for hole
+            for mut pslices in chunk_slices {
                 let mut tpos = coff;
+                // Important: Add a zero slice for hole, build_slices can't handle hole slice Scene
+                pslices.fill();
                 let slices = pslices.build_slices();
                 for mut slice in slices {
                     let mut pos = tpos;
@@ -3339,7 +3339,6 @@ impl Engine for RedisEngine {
                                 );
                             }
                         } else {
-                            // 在一个chunk内就完成了
                             pipe.rpush(self.chunk_key(dst, indx), PSlice::new(&slice, dpos));
                             if slice.id > 0 {
                                 pipe.hincr(
@@ -3350,8 +3349,8 @@ impl Engine for RedisEngine {
                             }
                         }
                     }
-                    coff += CHUNK_SIZE;
                 }
+                coff += CHUNK_SIZE;
             }
             pipe.set(self.inode_key(dst), bincode::serialize(&dst_attr).unwrap());
             if delta.space > 0 {

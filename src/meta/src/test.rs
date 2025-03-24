@@ -3,8 +3,7 @@ use std::time::Duration;
 use crate::{
     align_4k,
     api::{
-        Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice,
-        Summary, XattrF, ROOT_INODE,
+        Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice, Summary, XattrF, CHUNK_SIZE, ROOT_INODE
     },
     base::{CommonMeta, Engine},
     config::Format,
@@ -12,7 +11,11 @@ use crate::{
 };
 use chrono::Utc;
 use dyn_clone::DynClone;
-use tokio::{sync::Barrier, task::JoinSet, time::{self, sleep}};
+use tokio::{
+    sync::Barrier,
+    task::JoinSet,
+    time::{self, sleep},
+};
 use tracing::info;
 
 pub fn test_format() -> Format {
@@ -850,7 +853,6 @@ pub async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta> + Cl
         res.expect("write file");
     }
 
-
     for indx in 0..=10 {
         let m = m.clone();
         let _ = task_set.spawn(async move {
@@ -880,7 +882,106 @@ pub async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta> + Cl
 
 async fn test_compaction<M: Meta>(m: M, flag: bool) {}
 
-async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
+    let (src_ino, _) = m
+        .create(ROOT_INODE, "fin", 0o644, 0o22, OFlag::empty())
+        .await
+        .expect("create file");
+    let (dst_ino, _) = m
+        .create(ROOT_INODE, "fout", 0o644, 0o22, OFlag::empty())
+        .await
+        .expect("create file");
+    m.write(
+        src_ino,
+        0,
+        100,
+        Slice {
+            id: 10,
+            size: 200,
+            off: 0,
+            len: 100,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        src_ino,
+        1,
+        100 << 10,
+        Slice {
+            id: 11,
+            size: 40 << 20,
+            off: 0,
+            len: 40 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        src_ino,
+        3,
+        0,
+        Slice {
+            id: 12,
+            size: 63 << 20,
+            off: 10 << 20,
+            len: 30 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        dst_ino,
+        2,
+        10 << 20,
+        Slice {
+            id: 13,
+            size: 50 << 20,
+            off: 10 << 20,
+            len: 30 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    // cross three chunks
+    let copied = m.copy_file_range(src_ino, 150, dst_ino, 30 << 20, 200 << 20, 0)
+        .await
+        .expect("copy file range");
+    assert_eq!(copied, 200 << 20);
+
+    let expected_slices = vec![
+        vec![
+            (0, 30 << 20, 0, 30 << 20).into(),
+            (10, 200, 50, 50).into(),
+            (0, 0, 200, CHUNK_SIZE as u32 - (30 << 20) - 50).into(),
+        ],
+        vec![
+            (0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20)), (30 << 20) - 150).into(),
+            (0, 0, 0, 100 << 10).into(),
+            (11, 40 << 20, 0, (34 << 20) + 150 - (100 << 10)).into(),
+        ],
+        vec![
+            (11, 40 << 20, (34 << 20) + 150 - (100 << 10), (6 << 20) - 150 + (100 << 10)).into(),
+            (0, 0, (40 << 20) + (100 << 10), CHUNK_SIZE as u32 - (40 << 20) - (100 << 10)).into(),
+            (0, 0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20))).into(),
+        ],
+        vec![
+            (0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20)), (30 << 20) - 150).into(),
+            (12, 63 << 20, 10 << 20, (8 << 20) + 150).into(),
+        ],
+    ];
+    for i in 0..4_usize {
+        let slices = m.read(dst_ino, i as u32).await.expect("read chunk");
+        assert_eq!(slices.len(), expected_slices[i].len(), "expect slices len not equal in chunk {i}");
+        for j in 0..slices.len() {
+            assert_eq!(slices[j], expected_slices[i][j], "expect slice equal in chunk {i} slice {j}");
+        }
+    }
+}
 
 async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 

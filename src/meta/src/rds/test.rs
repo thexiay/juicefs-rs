@@ -152,7 +152,7 @@ async fn test_trash() {}
 
 async fn test_parents() {}
 
-// TODO: wrap them with macro
+#[traced_test]
 #[tokio::test]
 async fn test_remove() {
     let guard = REDIS_DB_HOLDER.read();
@@ -178,7 +178,13 @@ async fn test_concurrent_write() {
 
 async fn test_compaction<M: Meta>(meta: M, flag: bool) {}
 
-async fn test_copy_file_range() {}
+#[traced_test]
+#[tokio::test]
+async fn test_copy_file_range() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_copy_file_range(&mut holder.engine).await;
+}
 
 async fn test_close_session() {}
 

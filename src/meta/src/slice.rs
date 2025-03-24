@@ -5,7 +5,7 @@ use redis::{ErrorKind, FromRedisValue, RedisError, ToRedisArgs, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api::{Ino, Slice},
+    api::{Ino, Slice, CHUNK_SIZE},
     base::{CommonMeta, Engine},
 };
 
@@ -13,9 +13,9 @@ use crate::{
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PSlice {
     pub(crate) id: u64,
-    pub(crate)size: u32,
-    pub(crate)off: u32,
-    pub(crate)len: u32,
+    pub(crate) size: u32,
+    pub(crate) off: u32,
+    pub(crate) len: u32,
     coff: u32,
     #[serde(skip)]
     left: Option<Box<PSlice>>,
@@ -174,7 +174,7 @@ impl PSlices {
         if let Some(root) = root {
             root.visit(&mut |s| {
                 if s.coff > pos {
-                    // blank interva, fill it with default slice id 0
+                    // blank interval, fill it with default slice id 0
                     chunk.push(Slice {
                         size: s.coff - pos,
                         len: s.coff - pos,
@@ -193,20 +193,19 @@ impl PSlices {
         }
         chunk
     }
-}
 
-pub struct Slices(pub Vec<Slice>);
-
-impl TryFrom<Vec<String>> for Slices {
-    type Error = bincode::Error;
-
-    fn try_from(vals: Vec<String>) -> Result<Self, Self::Error> {
-        let mut slices = Vec::with_capacity(vals.len());
-        for val in vals {
-            let slice = bincode::deserialize(val.as_bytes())?;
-            slices.push(slice);
-        }
-        Ok(Slices(slices))
+    /// Fill in the chunk's hole, let the returned slice total length equals [`CHUNK_SIZE`]
+    /// Put a whole chunk of zero data at the beginning of the chunk, assume the chunk is full.
+    pub fn fill(&mut self) {
+        self.pslices.insert(0, PSlice {
+            size: 0,
+            id: 0,
+            off: 0,
+            len: CHUNK_SIZE as u32,
+            coff: 0,
+            left: None,
+            right: None,
+        });
     }
 }
 
@@ -240,6 +239,7 @@ mod tests {
     use super::{PSlice, PSlices};
 
     // id, (off, end)
+    // full valid
     impl From<(u64, Range<u32>)> for PSlice {
         fn from((id, range): (u64, Range<u32>)) -> Self {
             PSlice {
@@ -248,6 +248,22 @@ mod tests {
                 off: 0,
                 len: range.end - range.start,
                 coff: range.start,
+                left: None,
+                right: None,
+            }
+        }
+    }
+
+    // part valid
+    // id, (off, (off, end), end)
+    impl From<(u64, Range<u32>, Range<u32>)> for PSlice {
+        fn from((id, total, valid): (u64, Range<u32>, Range<u32>)) -> Self {
+            PSlice {
+                id,
+                size: total.end - total.start,
+                off: valid.start - total.start,
+                len: valid.end - valid.start,
+                coff: total.start,
                 left: None,
                 right: None,
             }
@@ -320,6 +336,21 @@ mod tests {
         let s1 = (0, 0..10, 0..10).into();
         let s2 = (2, 10..20, 10..20).into();
         let expect = vec![s1, s2];
+        assert_eq!(slices, expect);
+    }
+
+    #[test]
+    fn slice_len_gt_size() {
+        let p1: PSlice = (0, 0..64, 0..64).into();
+        let p2: PSlice = (2, 0..63, 10..40).into();
+        let pslices = PSlices {
+            pslices: vec![p1, p2]
+        };
+        let slices = pslices.build_slices();
+        let s1 = (0, 0..64, 0..18).into();
+        let s2 = (2, 8..64, 18..48).into();
+        let s3 = (0, 0..64, 48..64).into();
+        let expect = vec![s1, s2, s3];
         assert_eq!(slices, expect);
     }
 }

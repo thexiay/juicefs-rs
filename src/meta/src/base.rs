@@ -221,7 +221,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn do_remove_xattr(&self, inode: Ino, name: &str) -> Result<()>;
     async fn do_repair(&self, inode: Ino, attr: &mut Attr) -> Result<()>;
     async fn do_touch_atime(&self, inode: Ino, ts: Duration) -> Result<Attr>;
-    async fn do_read(&self, inode: Ino, indx: u32) -> Result<Option<PSlices>>;
+    async fn do_read(&self, inode: Ino, indx: u32) -> Result<PSlices>;
     async fn do_write(
         &self,
         inode: Ino,
@@ -2760,8 +2760,6 @@ where
         }
 
         let pslices = self.do_read(inode, indx).await?;
-        ensure_whatever!(pslices.is_some(), "read chunk not found");
-        let pslices = pslices.unwrap();
         if pslices.is_empty() {
             let attr = self.do_get_attr(inode).await?;
             if attr.typ != INodeType::File {

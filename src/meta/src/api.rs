@@ -103,6 +103,9 @@ pub struct Entry {
 /// Slice is a continuous write in a chunk
 /// Multiple slices could be combined together as a chunk.
 /// One slice can only in one chunk.
+/// 1. refs
+/// 2. normal
+/// 3. zero hole
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slice {
     // slice id
@@ -114,6 +117,12 @@ pub struct Slice {
     // valid data length
     // actually not all data in slice is valid, only `slice_array[off:off+len]` is valid data
     pub len: u32,
+}
+
+impl From<(u64, u32, u32, u32)> for Slice {
+    fn from((id, size, off, len): (u64, u32, u32, u32)) -> Self {
+        Slice { id, size, off, len }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
