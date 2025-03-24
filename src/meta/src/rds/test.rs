@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_test::traced_test;
 
 use crate::test as base_test;
 
@@ -28,6 +29,7 @@ fn before_all() {
     let mut guard = REDIS_DB_HOLDER.write();
     *guard = Some(RedisDbOffer::new(16));
     // init logger
+    /*
     let default_timer = OffsetTime::local_rfc_3339().unwrap_or_else(|e| {
         println!(
             "failed to get local time offset, falling back to UTC: {}",
@@ -45,6 +47,7 @@ fn before_all() {
         .with_file(true)
         .with_line_number(true);
     tracing_subscriber::registry().with(fmt_layer).init();
+     */
 }
 
 #[dtor]
@@ -129,6 +132,7 @@ impl Drop for RedisDbHodler {
     }
 }
 
+#[traced_test]
 #[tokio::test]
 async fn test_meta_client() {
     let guard = REDIS_DB_HOLDER.read();
@@ -136,7 +140,8 @@ async fn test_meta_client() {
     base_test::test_meta_client(&mut holder.engine).await;
 }
 
-//#[tokio::test]
+#[traced_test]
+#[tokio::test]
 async fn test_truncate_and_delete() {
     let guard = REDIS_DB_HOLDER.read();
     let mut holder = guard.as_ref().unwrap().take(Config::default()).await;

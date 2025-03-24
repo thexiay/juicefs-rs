@@ -15,10 +15,8 @@ use crate::{
 pub struct Config {
     pub strict: bool,   // update ctime
     pub retries: u32, // number of retries
-    // max delete gc threads
-    pub max_deletes_threads: isize,
-    // max delete task in queue
-    pub max_deletes_task: isize,
+    // max delete slice task in queue
+    pub max_deletes_task: u32,
     pub skip_dir_nlink: isize,
     pub case_insensi: bool,
     pub read_only: bool,
@@ -44,8 +42,7 @@ impl Default for Config {
         Self {
             strict: true,
             retries: 3,
-            max_deletes_threads: 2,
-            max_deletes_task: 100,
+            max_deletes_task: 2,
             skip_dir_nlink: 0,
             case_insensi: false,
             read_only: false,
@@ -65,7 +62,7 @@ impl Default for Config {
 
 impl Config {
     pub fn check(&mut self) {
-        if self.max_deletes_threads == 0 {
+        if self.max_deletes_task == 0 {
             warn!("Deleting object will be disabled since max-deletes is 0")
         }
         if self.heartbeat < Duration::from_secs(1) {

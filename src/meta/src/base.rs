@@ -1,3 +1,4 @@
+use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use juice_utils::process::Bar;
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
@@ -248,7 +248,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         dst_off: u64,
         len: u64,
         flags: u32,
-    ) -> Result<u64>;
+    ) -> Result<(u64, Option<(Ino, DirStat)>)>;
 
     async fn do_fallocate(
         &self,
@@ -270,6 +270,8 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         size: u32,
         delayed: &[u8],
     ) -> Result<()>;
+
+    async fn do_list_slices(&self, delete: bool) -> Result<HashMap<Ino, Vec<Slice>>>;
 
     async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, u32>;
     /// do add dirstats batch periodly
@@ -347,6 +349,8 @@ pub trait MetaOtherFunction {
         max_removing: Arc<Semaphore>,
     ) -> Result<()>;
 
+    async fn remove_slice(&self, id: u64, size: u32);
+
     /// ------------------------------ attr func ------------------------------
     fn clear_sugid(&self, cur: &mut Attr, set: &mut u16);
 
@@ -392,7 +396,10 @@ pub struct CommonMeta {
     pub current_trash_dir: Mutex<Option<InternalNode>>,
     pub removed_files: Mutex<HashMap<Ino, bool>>,
     pub compacting: HashMap<u64, bool>,
-    pub max_deleting: Arc<Semaphore>,
+    /// The max amount of concurrency of tasks that delete files
+    pub max_deleting_file: Arc<Semaphore>,
+    /// Channel of to be delete slice(id, size)
+    pub deleting_slice_ctx: Option<(Sender<(u64, u32)>, Receiver<(u64, u32)>)>,
     pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>, // ino -> (atime, path)
     pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
     pub acl_cache: AsyncMutex<AclCache>,
@@ -421,7 +428,12 @@ pub struct CommonMeta {
 
 impl CommonMeta {
     pub fn new(addr: &str, conf: Config) -> Self {
-        let max_deleting = Arc::new(Semaphore::new(conf.max_deletes_task as usize));
+        let deleting_slice_ctx = if conf.max_deletes_task > 0 {
+            let (tx, rx) = async_channel::bounded(conf.max_deletes_task as usize * 10 * 1024);
+            Some((tx, rx))
+        } else {
+            None
+        };
         let open_files = OpenFiles2::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
             addr: addr.to_string(),
@@ -429,7 +441,8 @@ impl CommonMeta {
             current_trash_dir: Mutex::new(None),
             removed_files: Mutex::new(HashMap::new()),
             compacting: HashMap::new(),
-            max_deleting,
+            max_deleting_file: Arc::new(Semaphore::new(100)),
+            deleting_slice_ctx,
             symlinks: Mutex::new(HashMap::new()),
             reload_format_callbacks: Vec::new(),
             ses_umounting: AsyncMutex::new(false),
@@ -628,7 +641,7 @@ where
             DeleteFileOption::Immediate { force } => {
                 let mut meta = dyn_clone::clone_box(self);
                 meta.with_cancel(self.token().child_token());
-                let max_deleting = base.max_deleting.clone();
+                let max_deleting = base.max_deleting_file.clone();
                 tokio::spawn(async move {
                     let permit = match force {
                         // TODO: 这里如果拿不到被关闭了，是不是要处理下
@@ -838,6 +851,14 @@ where
             if inode == TRASH_INODE {
                 return Ok(());
             }
+        }
+    }
+
+    async fn remove_slice(&self, id: u64, size: u32) {
+        if let Some(ref deleting_slices) = self.as_ref().deleting_slice_ctx
+            && id != 0
+        {
+            deleting_slices.0.send((id, size)).await;
         }
     }
 
@@ -1285,6 +1306,24 @@ where
             }
         });
 
+        // ---------------------------------------- delete slice job ------------------------------------------
+        if let Some(ref ctx) = base.deleting_slice_ctx {
+            for _ in 0..base.conf.max_deletes_task {
+                let mut meta = dyn_clone::clone_box(self);
+                meta.with_cancel(self.token().child_token());
+                let rx = ctx.1.clone();
+                let m = dyn_clone::clone_box(self);
+                tokio::spawn(async move {
+                    while let Ok((id, size)) = rx.recv().await {
+                        if let Err(e) = m.do_delete_slice(id, size).await {
+                            error!("Delete meta entry of slice {id} ({size} bytes): {e}");
+                        }
+                    }
+                });
+            }
+        }
+
+        // ----------------------------------------- background job --------------------------------------------
         if base.conf.enable_bg_job {
             // cleanup deleted files
             let mut meta = dyn_clone::clone_box(self);
@@ -2750,7 +2789,7 @@ where
     async fn new_slice(&self) -> Result<u64> {
         let mut slices = self.as_ref().free_slices.lock().await;
         if slices.next >= slices.maxid {
-            let v = self.incr_counter("nextChunk", SLICE_ID_BATCH).await?;
+            let v = self.incr_counter(NEXT_CHUNK, SLICE_ID_BATCH).await?;
             slices.next = (v - SLICE_ID_BATCH) as u64;
             slices.maxid = v as u64;
         }
@@ -2801,7 +2840,19 @@ where
 
     // InvalidateChunkCache invalidate chunk cache
     async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()> {
-        todo!()
+        let chunks = match self.as_ref().open_files.chunks(inode) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(inode)
+                    .await?
+                    .then(|| BadFDSnafu { fd: inode }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: inode }.fail())?;
+            }
+        };
+        let mut chunks = chunks.write().await;
+        chunks.remove(&indx);
+        Ok(())
     }
 
     // CopyFileRange copies part of a file to another one.
@@ -2814,8 +2865,28 @@ where
         size: u64,
         flags: u32,
     ) -> Result<u64> {
-        self.do_copy_file_range(fin, off_in, fout, off_out, size, flags)
-            .await
+        let chunks = match self.as_ref().open_files.chunks(fout) {
+            Some(chunks) => chunks,
+            None => {
+                return self
+                    .do_exists(fout)
+                    .await?
+                    .then(|| BadFDSnafu { fd: fout }.fail())
+                    .unwrap_or_else(|| NoEntryFound2Snafu { ino: fout }.fail())?;
+            }
+        };
+        let mut chunks = chunks.write().await;
+        defer! {
+            chunks.clear();
+        }
+        let (copy_size, delta) = self
+            .do_copy_file_range(fin, off_in, fout, off_out, size, flags)
+            .await?;
+        if let Some((delta_ino, delta_stat)) = delta {
+            self.update_parent_stats(fout, delta_ino, delta_stat.length, delta_stat.space)
+                .await;
+        }
+        Ok(copy_size)
     }
 
     // GetDirStat returns the space and inodes usage of a directory.
@@ -2922,7 +2993,7 @@ where
         delete: bool,
         show_progress: Box<dyn Fn() + Send>,
     ) -> Result<HashMap<Ino, Vec<Slice>>> {
-        todo!()
+        self.do_list_slices(delete).await
     }
 
     // Remove all files and directories recursively.

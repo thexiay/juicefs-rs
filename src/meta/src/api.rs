@@ -685,7 +685,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         post_func: Box<dyn Fn() + Send>,
     ) -> Result<()>;
 
-    // ListSlices returns all slices used by all files.
+    /// ListSlices returns all slices used by all files.
+    ///
+    /// # Arguments
+    /// * `delete` - if true, it will clean useless slices
+    /// * `show_progress` - show progress
     async fn list_slices(
         &self,
         delete: bool,

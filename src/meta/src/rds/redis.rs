@@ -1,24 +1,22 @@
+use async_channel::Sender;
 use async_trait::async_trait;
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Object, Pool};
 use futures::StreamExt;
 use juice_utils::process::Bar;
-use redis::aio::{ConnectionLike, ConnectionManager};
+use redis::aio::ConnectionManager;
 use redis::{
-    cmd, from_redis_value, pipe, AsyncCommands, AsyncIter, Client, FromRedisValue, InfoDict,
-    IntoConnectionInfo, Pipeline, RedisError, RedisResult, ScanOptions, Script, Value,
+    cmd, from_redis_value, pipe, AsyncCommands, Client, FromRedisValue, InfoDict,
+    IntoConnectionInfo, RedisError, RedisResult, Script, Value,
 };
 use regex::Regex;
 use scopeguard::defer;
-use snafu::{ensure, ensure_whatever, whatever, FromString, ResultExt};
+use snafu::{ensure, ensure_whatever, whatever, ResultExt};
 use std::cmp::{max, min};
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::acl::{self, AclExt, AclId, AclType, Rule};
@@ -655,38 +653,34 @@ impl RedisEngine {
         let conn = pool_conn.deref_mut();
         let key = self.chunk_key(inode, indx);
         match async_transaction!(conn, &[&key], {
-            let mut todel: Vec<Slice> = Vec::new();
             // if not exists, ignore it
-            let vals: Vec<String> = conn.lrange(&key, 0, -1).await?;
-
-            let slices = match TryInto::<Slices>::try_into(vals) {
-                Ok(Slices(slices)) => slices,
-                Err(e) => {
-                    error!("Corrupt value for inode {} chunk index {}, use `gc` to clean up leaked slices", inode, indx);
-                    Vec::new()
-                }
-            };
+            let slices = conn
+                .lrange::<_, Option<PSlices>>(&key, 0, -1)
+                .await?
+                .map(|pslices| (*pslices).iter().filter(|s| s.id > 0).cloned().collect())
+                .unwrap_or(Vec::new());
             let mut pipe = pipe();
             pipe.atomic().del(&key).ignore();
-            slices.into_iter().filter(|s| s.id > 0).for_each(|slice| {
+            let mut to_del = Vec::new();
+            slices.into_iter().for_each(|slice| {
                 pipe.hincr(
                     self.slice_refs(),
                     RedisHandle::slice_key(slice.id, slice.size),
                     -1,
                 );
-                todel.push(slice);
+                to_del.push(slice);
             });
             let rs: Vec<i64> = pipe.query_async(conn).await?;
-            Ok(Some((todel, rs)))
+            Ok(Some((to_del, rs)))
         }) {
-            Ok((todel, rs)) => {
-                assert!(rs.len() == todel.len());
-                todel
+            Ok((to_del, rs)) => {
+                assert!(rs.len() == to_del.len());
+                to_del
                     .iter()
                     .zip(rs.iter())
                     .filter(|(_, r)| **r < 0)
                     .for_each(|(s, _)| {
-                        self.delete_slice(s.id, s.size);
+                        self.remove_slice(s.id, s.size);
                     });
                 Ok(())
             }
@@ -696,8 +690,6 @@ impl RedisEngine {
             }
         }
     }
-
-    fn delete_slice(&self, id: u64, size: u32) {}
 
     async fn get_acl(&self, conn: &mut impl AsyncCommands, id: AclId) -> Result<Option<Rule>> {
         if !id.is_valid_acl() {
@@ -978,8 +970,7 @@ impl Engine for RedisEngine {
         ensure!(!self.meta.conf.read_only, ReadFSSnafu);
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        let name_lower = name.to_lowercase();
-        if name_lower.eq(NEXT_INODE) || name.eq(NEXT_CHUNK) {
+        if name.eq(NEXT_INODE) || name.eq(NEXT_CHUNK) {
             let key = format!("{}{}", self.prefix, name.to_lowercase());
             let v: i64 = conn.incr(key, value).await?;
             Ok(v + 1)
@@ -1412,7 +1403,13 @@ impl Engine for RedisEngine {
     }
 
     async fn do_delete_slice(&self, id: u64, size: u32) -> Result<()> {
-        unimplemented!()
+        let mut conn = self.share_conn();
+        conn.hdel(self.slice_refs(), RedisHandle::slice_key(id, size))
+            .await
+            .context(RedisDetailSnafu {
+                detail: format!("delete slice {} {}", id, size),
+            })?;
+        Ok(())
     }
 
     async fn do_clone_entry(
@@ -3108,7 +3105,8 @@ impl Engine for RedisEngine {
             let parents = self.get_parents(inode).await.into_keys().collect();
             self.check_quotas(delta.space, 0, parents).await?;
 
-            // When expanding, fill zero, and when shrinking, fill zero, and do not delete immediately
+            // When expanding, fill zero
+            // when shrinking, fill zero, and do not delete immediately
             let (left, right) = (min(length, attr.length), max(length, attr.length));
             let zero_chunks = if (right - left) / CHUNK_SIZE as u64 >= 10000 {
                 // super large
@@ -3213,155 +3211,156 @@ impl Engine for RedisEngine {
         dst_off: u64,
         len: u64,
         flags: u32,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<(Ino, DirStat)>)> {
         let base = AsRef::<CommonMeta>::as_ref(self);
-        let chunks = base
-            .open_files
-            .chunks(dst)
-            .ok_or_else(|| BadFDSnafu { fd: dst }.build())?;
-        let mut chunks = chunks.write().await;
-        defer! {
-            chunks.clear();
-        }
-
-        /*
-                defer m.timeit("CopyFileRange", time.Now())
-        f := m.of.find(fout)
-        if f != nil {
-            f.Lock()
-            defer f.Unlock()
-        }
-        var newLength, newSpace int64
-        var sattr, attr Attr
-        defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
-        err := m.txn(ctx, func(tx *redis.Tx) error {
-            newLength, newSpace = 0, 0
-            rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
-            if err != nil {
-                return err
+        let mut pool_conn = self.exclusive_conn().await?;
+        let conn = pool_conn.deref_mut();
+        let res = {
+            let inos = vec![src, dst];
+            let keys = inos
+                .iter()
+                .map(|inode| self.inode_key(*inode))
+                .collect::<Vec<String>>();
+            let rs = conn.mget::<_, Vec<Option<Vec<u8>>>>(&keys).await?;
+            if rs.len() != keys.len() {
+                whatever!("Illigal len for mget {keys:?}, {}", rs.len());
             }
-            if rs[0] == nil || rs[1] == nil {
-                return redis.Nil
-            }
-            sattr = Attr{}
-            m.parseAttr([]byte(rs[0].(string)), &sattr)
-            if sattr.Typ != TypeFile {
-                return syscall.EINVAL
-            }
-            if offIn >= sattr.Length {
-                if copied != nil {
-                    *copied = 0
+            for (r, ino) in rs.iter().zip(inos.iter()) {
+                if r.is_none() {
+                    error!("no attribute for inode {}", ino);
+                    return NoEntryFound2Snafu { ino: *ino }.fail()?;
                 }
-                return nil
-            }
-            size := size
-            if offIn+size > sattr.Length {
-                size = sattr.Length - offIn
-            }
-            attr = Attr{}
-            m.parseAttr([]byte(rs[1].(string)), &attr)
-            if attr.Typ != TypeFile {
-                return syscall.EINVAL
-            }
-            if (attr.Flags&FlagImmutable) != 0 || (attr.Flags&FlagAppend) != 0 {
-                return syscall.EPERM
             }
 
-            newleng := offOut + size
-            if newleng > attr.Length {
-                newLength = int64(newleng - attr.Length)
-                newSpace = align4K(newleng) - align4K(attr.Length)
-                attr.Length = newleng
-            }
-            if err := m.checkQuota(ctx, newSpace, 0, m.getParents(ctx, tx, fout, attr.Parent)...); err != 0 {
-                return err
-            }
-            now := time.Now()
-            attr.Mtime = now.Unix()
-            attr.Mtimensec = uint32(now.Nanosecond())
-            attr.Ctime = now.Unix()
-            attr.Ctimensec = uint32(now.Nanosecond())
-            if outLength != nil {
-                *outLength = attr.Length
-            }
-
-            var vals [][]string
-            for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
-                val, err := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
-                if err != nil {
-                    return err
+            // src
+            let src_attr: Attr = bincode::deserialize(&rs[0].as_ref().unwrap())?;
+            ensure!(
+                src_attr.typ == INodeType::File,
+                OpNotPermittedSnafu {
+                    op: "copy from a non file"
                 }
-                vals = append(vals, val)
+            );
+            if src_off >= src_attr.length {
+                return Ok((0, None));
             }
 
-            _, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-                coff := offIn / ChunkSize * ChunkSize
-                for _, sv := range vals {
-                    // Add a zero chunk for hole
-                    ss := readSlices(sv)
-                    if ss == nil {
-                        return syscall.EIO
-                    }
-                    ss = append([]*slice{{len: ChunkSize}}, ss...)
-                    cs := buildSlice(ss)
-                    tpos := coff
-                    for _, s := range cs {
-                        pos := tpos
-                        tpos += uint64(s.Len)
-                        if pos < offIn+size && pos+uint64(s.Len) > offIn {
-                            if pos < offIn {
-                                dec := offIn - pos
-                                s.Off += uint32(dec)
-                                pos += dec
-                                s.Len -= uint32(dec)
-                            }
-                            if pos+uint64(s.Len) > offIn+size {
-                                dec := pos + uint64(s.Len) - (offIn + size)
-                                s.Len -= uint32(dec)
-                            }
-                            doff := pos - offIn + offOut
-                            indx := uint32(doff / ChunkSize)
-                            dpos := uint32(doff % ChunkSize)
-                            if dpos+s.Len > ChunkSize {
-                                pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, ChunkSize-dpos))
-                                if s.Id > 0 {
-                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
-                                }
+            // dst
+            let mut dst_attr: Attr = bincode::deserialize(&rs[1].as_ref().unwrap())?;
+            let copy_size = min(len, src_attr.length - src_off);
+            ensure!(
+                dst_attr.typ == INodeType::File,
+                OpNotPermittedSnafu {
+                    op: "copy to a non file"
+                }
+            );
+            ensure!(
+                dst_attr.flags.intersects(Flag::IMMUTABLE | Flag::APPEND),
+                OpNotPermittedSnafu {
+                    op: "copy to a immutable or append file"
+                }
+            );
 
-                                skip := ChunkSize - dpos
-                                pipe.RPush(ctx, m.chunkKey(fout, indx+1), marshalSlice(0, s.Id, s.Size, s.Off+skip, s.Len-skip))
-                                if s.Id > 0 {
-                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
-                                }
-                            } else {
-                                pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, s.Len))
-                                if s.Id > 0 {
-                                    pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
-                                }
+            // check
+            let delta = if dst_off + copy_size > dst_attr.length {
+                dst_attr.length = dst_off + copy_size;
+                DirStat {
+                    length: (dst_off + copy_size) as i64 - dst_attr.length as i64,
+                    space: align_4k(dst_off + copy_size) - align_4k(dst_attr.length),
+                    inodes: 0,
+                }
+            } else {
+                DirStat::default()
+            };
+            let dst_parents = if dst_attr.parent > 0 {
+                vec![dst_attr.parent]
+            } else {
+                self.do_get_parents_inner(conn, dst)
+                    .await
+                    .into_keys()
+                    .collect()
+            };
+            self.check_quotas(delta.space, delta.inodes, dst_parents)
+                .await?;
+
+            // modify attr(time, chunks)
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos();
+            dst_attr.mtime = now;
+            dst_attr.ctime = now;
+            let mut chunk_slices = vec![];
+            for indx in (src_off / CHUNK_SIZE)..=((src_off + copy_size) / CHUNK_SIZE) {
+                chunk_slices.push(
+                    conn.lrange::<_, PSlices>(self.chunk_key(src, indx as u32), 0, -1)
+                        .await?,
+                );
+            }
+            let mut pipe = pipe();
+            pipe.atomic();
+            // align to CHUNK_SIZE
+            let mut coff = dst_off / CHUNK_SIZE * CHUNK_SIZE;
+            for pslices in chunk_slices {
+                // Add a zero chunk for hole
+                let mut tpos = coff;
+                let slices = pslices.build_slices();
+                for mut slice in slices {
+                    let mut pos = tpos;
+                    tpos += slice.len as u64;
+                    if pos < src_off + copy_size && pos + slice.len as u64 > src_off {
+                        // only remain slice.overlap(copy_range)
+                        if pos < src_off {
+                            let dec = src_off - pos;
+                            slice.off += dec as u32;
+                            pos += dec;
+                            slice.len -= dec as u32;
+                        }
+                        if pos + slice.len as u64 > src_off + copy_size {
+                            let dec = pos + slice.len as u64 - (src_off + copy_size);
+                            slice.len -= dec as u32;
+                        }
+                        // copy src slice into dst slice, but maybe one slice cross two chunk in dst inode
+                        let doff = pos - src_off + dst_off;
+                        let indx = (doff / CHUNK_SIZE) as u32;
+                        let dpos = (doff % CHUNK_SIZE) as u32;
+                        if dpos + slice.len > CHUNK_SIZE as u32 {
+                            let mut lslice = slice.clone();
+                            lslice.len = CHUNK_SIZE as u32 - dpos;
+                            pipe.rpush(self.chunk_key(dst, indx), PSlice::new(&lslice, dpos));
+                            let mut rslice = slice.clone();
+                            rslice.off += lslice.len;
+                            rslice.len -= lslice.len;
+                            pipe.rpush(self.chunk_key(dst, indx + 1), PSlice::new(&rslice, 0));
+                            if slice.id > 0 {
+                                pipe.hincr(
+                                    self.slice_refs(),
+                                    RedisHandle::slice_key(slice.id, slice.size),
+                                    2,
+                                );
+                            }
+                        } else {
+                            // 在一个chunk内就完成了
+                            pipe.rpush(self.chunk_key(dst, indx), PSlice::new(&slice, dpos));
+                            if slice.id > 0 {
+                                pipe.hincr(
+                                    self.slice_refs(),
+                                    RedisHandle::slice_key(slice.id, slice.size),
+                                    1,
+                                );
                             }
                         }
                     }
-                    coff += ChunkSize
-                }
-                pipe.Set(ctx, m.inodeKey(fout), m.marshal(&attr), 0)
-                if newSpace > 0 {
-                    pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
-                }
-                return nil
-            })
-            if err == nil {
-                if copied != nil {
-                    *copied = size
+                    coff += CHUNK_SIZE;
                 }
             }
-            return err
-        }, m.inodeKey(fout), m.inodeKey(fin))
-        if err == nil {
-            m.updateParentStat(ctx, fout, attr.Parent, newLength, newSpace)
-        }
-        return errno(err)
-             */
-        unimplemented!()
+            pipe.set(self.inode_key(dst), bincode::serialize(&dst_attr).unwrap());
+            if delta.space > 0 {
+                pipe.incr(self.used_space_key(), delta.space);
+            }
+            pipe.query_async(conn).await?;
+            (copy_size, Some((dst_attr.parent, delta)))
+        };
+        Ok(res)
     }
 
     async fn do_fallocate(
@@ -3486,6 +3485,68 @@ impl Engine for RedisEngine {
         delayed: &[u8],
     ) -> Result<()> {
         unimplemented!()
+    }
+
+    async fn do_list_slices(&self, delete: bool) -> Result<HashMap<Ino, Vec<Slice>>> {
+        // TODO: In this case, the memory will overflow? return stream?
+        let mut all_slices = HashMap::new();
+        let mut conn = self.share_conn();
+        let mut iter = conn
+            .scan_match::<_, String>(format!("{}c*_*", self.prefix))
+            .await?
+            .chunks(10000);
+        while let Some(keys) = iter.next().await {
+            let mut pipe = pipe();
+            for key in keys.iter() {
+                pipe.lrange(key, 0, -1);
+            }
+            let mut conn2 = self.share_conn();
+            let res = pipe.query_async::<Value>(&mut conn2).await?;
+            match res {
+                Value::Array(vals) => {
+                    ensure_whatever!(vals.len() == keys.len(), "Invalid len for list slices");
+                    for (val, key) in vals.iter().zip(keys.iter()) {
+                        match PSlices::from_redis_value(val) {
+                            Ok(pslices) => {
+                                let inode = if let Some(caps) = self.chunk_re.captures(&key)
+                                    && let Ok(inode) = caps.get(1).unwrap().as_str().parse::<u64>()
+                                {
+                                    inode
+                                } else {
+                                    error!(
+                                        "Invalid key {} don't match chunk_re when list slices.",
+                                        key
+                                    );
+                                    continue;
+                                };
+                                let slices = (*pslices)
+                                    .iter()
+                                    .filter(|pslice| pslice.id > 0)
+                                    .map(|pslice| Slice {
+                                        id: pslice.id,
+                                        size: pslice.size,
+                                        off: pslice.off,
+                                        len: pslice.len,
+                                    })
+                                    .collect::<Vec<Slice>>();
+                                all_slices
+                                    .entry(inode)
+                                    .and_modify(|ss: &mut Vec<Slice>| ss.extend_from_slice(&slices))
+                                    .or_insert(slices);
+                            }
+                            Err(e) => {
+                                warn!("Invalid val {} when list slices for chunk key: {}", e, key)
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    error!("Invalid type when list slices");
+                }
+            }
+        }
+        // TODO: add slices for trash entries
+        Ok(all_slices)
     }
 
     async fn do_get_parents(&self, inode: Ino) -> HashMap<Ino, u32> {

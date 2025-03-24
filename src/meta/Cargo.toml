@@ -40,7 +40,9 @@ dyn-clone = { workspace = true }
 nix = { workspace = true }
 time = { workspace = true }
 scopeguard = { workspace = true }
+async-channel = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"
 ctor = "0.2.8"
+tracing-test = { workspace = true }

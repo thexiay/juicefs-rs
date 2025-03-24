@@ -10,12 +10,12 @@ use crate::{
 };
 
 /// PSlice is a tree with it's node is a data range with latest data.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PSlice {
-    id: u64,
-    size: u32,
-    off: u32,
-    len: u32,
+    pub(crate) id: u64,
+    pub(crate)size: u32,
+    pub(crate)off: u32,
+    pub(crate)len: u32,
     coff: u32,
     #[serde(skip)]
     left: Option<Box<PSlice>>,

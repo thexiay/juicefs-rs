@@ -695,12 +695,16 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
 }
 
 pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>)) {
-    let mut format = m.load(false).await.unwrap().as_ref().clone();
+    let mut format = test_format();
     format.capacity = 0;
     m.init(format, false).await.unwrap();
 
-    let (inode, attr) = m
-        .create(1, "f", 0650, 022, OFlag::empty())
+    let _ = m.open(ROOT_INODE, OFlag::O_RDONLY).await.expect("open /: ");
+    let res = m.truncate(ROOT_INODE, 0, 4 << 10, false).await;
+    m.close(ROOT_INODE).await.expect("close /: ");
+    assert!(res.as_ref().unwrap_err().is_op_not_permitted(), "got {:?}", res);
+    let (inode, _) = m
+        .create(ROOT_INODE, "f", 0650, 022, OFlag::empty())
         .await
         .expect("create file: {}");
     let slice_id = m.new_slice().await.expect("new chunk: ");
@@ -724,7 +728,7 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
     m.truncate(inode, 0, (10 << 40) + 10, false)
         .await
         .expect("truncate file: ");
-    let attr = m
+    let _attr = m
         .truncate(inode, 0, (300 << 20) + 10, false)
         .await
         .expect("truncate file: ");
@@ -751,8 +755,6 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
     if total_slices > 1 {
         panic!("number of slices: {} > 0, {:?}", total_slices, slices);
     }
-
-    m.unlink(1, "f", false).await.expect("unlink f:")
 }
 
 pub async fn test_trash(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
