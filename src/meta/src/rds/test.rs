@@ -168,7 +168,13 @@ async fn test_locks() {}
 
 async fn test_list_locks() {}
 
-async fn test_concurrent_write() {}
+#[traced_test]
+#[tokio::test]
+async fn test_concurrent_write() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_concurrent_write(&mut holder.engine).await;
+}
 
 async fn test_compaction<M: Meta>(meta: M, flag: bool) {}
 
