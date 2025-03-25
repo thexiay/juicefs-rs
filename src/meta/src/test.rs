@@ -976,6 +976,7 @@ pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     ];
     for i in 0..4_usize {
         let slices = m.read(dst_ino, i as u32).await.expect("read chunk");
+        println!("slices: {:?}", slices);
         assert_eq!(slices.len(), expected_slices[i].len(), "expect slices len not equal in chunk {i}");
         for j in 0..slices.len() {
             assert_eq!(slices[j], expected_slices[i][j], "expect slice equal in chunk {i} slice {j}");

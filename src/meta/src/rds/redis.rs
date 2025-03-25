@@ -657,7 +657,12 @@ impl RedisEngine {
             let slices = conn
                 .lrange::<_, Option<PSlices>>(&key, 0, -1)
                 .await?
-                .map(|pslices| (*pslices).iter().filter(|s| s.id > 0).cloned().collect())
+                .map(|pslices| {
+                    (*pslices)
+                        .iter()
+                        .filter_map(|s| s.slice())
+                        .collect()
+                })
                 .unwrap_or(Vec::new());
             let mut pipe = pipe();
             pipe.atomic().del(&key).ignore();
@@ -675,13 +680,9 @@ impl RedisEngine {
         }) {
             Ok((to_del, rs)) => {
                 assert!(rs.len() == to_del.len());
-                to_del
-                    .iter()
-                    .zip(rs.iter())
-                    .filter(|(_, r)| **r < 0)
-                    .for_each(|(s, _)| {
-                        self.remove_slice(s.id, s.size);
-                    });
+                for (s, _) in to_del.iter().zip(rs.iter()).filter(|(_, r)| **r < 0) {
+                    self.remove_slice(s.id, s.size).await;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -3001,7 +3002,7 @@ impl Engine for RedisEngine {
         &self,
         inode: Ino,
         indx: u32,
-        off: u32,
+        coff: u32,
         slice: Slice,
         mtime: DateTime<Utc>,
     ) -> Result<(u32, DirStat, Attr)> {
@@ -3019,7 +3020,7 @@ impl Engine for RedisEngine {
                     op: "write into a non file"
                 }
             );
-            let new_len = CHUNK_SIZE * indx as u64 + off as u64 + slice.len as u64;
+            let new_len = CHUNK_SIZE * indx as u64 + coff as u64 + slice.len as u64;
             let delta = if new_len > attr.length {
                 attr.length = new_len;
                 DirStat {
@@ -3049,7 +3050,7 @@ impl Engine for RedisEngine {
 
             let mut pipe = pipe();
             pipe.atomic();
-            pipe.rpush(self.chunk_key(inode, indx), PSlice::new(&slice, off));
+            pipe.rpush(self.chunk_key(inode, indx), PSlice::new(&slice, coff));
             // most of chunk are used by single inode, so use that as the default (1 == not exists)
             // pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap())
@@ -3158,42 +3159,18 @@ impl Engine for RedisEngine {
             };
             pipe.rpush(
                 self.chunk_key(inode, (left / CHUNK_SIZE) as u32),
-                PSlice::new(
-                    &Slice {
-                        id: 0,
-                        size: 0,
-                        off: 0,
-                        len: l as u32,
-                    },
-                    (left % CHUNK_SIZE) as u32,
-                ),
+                PSlice::new_hole((left % CHUNK_SIZE) as u32, l as u32),
             );
             for indx in zero_chunks {
                 pipe.rpush(
                     self.chunk_key(inode, indx as u32),
-                    PSlice::new(
-                        &Slice {
-                            id: 0,
-                            size: 0,
-                            off: 0,
-                            len: CHUNK_SIZE as u32,
-                        },
-                        0,
-                    ),
+                    PSlice::new_hole(0, CHUNK_SIZE as u32),
                 );
             }
             if right > (left / CHUNK_SIZE + 1) * CHUNK_SIZE && right % CHUNK_SIZE > 0 {
                 pipe.rpush(
                     self.chunk_key(inode, (right / CHUNK_SIZE) as u32),
-                    PSlice::new(
-                        &Slice {
-                            id: 0,
-                            size: 0,
-                            off: 0,
-                            len: (right % CHUNK_SIZE) as u32,
-                        },
-                        0,
-                    ),
+                    PSlice::new_hole(0, (right % CHUNK_SIZE) as u32),
                 );
             }
             pipe.incr(self.used_space_key(), delta.space);
@@ -3330,7 +3307,10 @@ impl Engine for RedisEngine {
                             let mut rslice = slice.clone();
                             rslice.off += lslice.len;
                             rslice.len -= lslice.len;
-                            pipe.rpush(self.chunk_key(dst, indx + 1), PSlice::new(&rslice, 0));
+                            pipe.rpush(
+                                self.chunk_key(dst, indx + 1),
+                                PSlice::new(&rslice, 0),
+                            );
                             if slice.id > 0 {
                                 pipe.hincr(
                                     self.slice_refs(),
@@ -3447,15 +3427,7 @@ impl Engine for RedisEngine {
                     };
                     pipe.rpush(
                         self.chunk_key(inode, indx),
-                        PSlice::new(
-                            &Slice {
-                                id: 0,
-                                size: 0,
-                                off: 0,
-                                len: len as u32,
-                            },
-                            coff as u32,
-                        ),
+                        PSlice::new_hole(coff as u32, len as u32),
                     );
                     off += len;
                     size -= len;
@@ -3520,13 +3492,7 @@ impl Engine for RedisEngine {
                                 };
                                 let slices = (*pslices)
                                     .iter()
-                                    .filter(|pslice| pslice.id > 0)
-                                    .map(|pslice| Slice {
-                                        id: pslice.id,
-                                        size: pslice.size,
-                                        off: pslice.off,
-                                        len: pslice.len,
-                                    })
+                                    .filter_map(|pslice| pslice.slice())
                                     .collect::<Vec<Slice>>();
                                 all_slices
                                     .entry(inode)

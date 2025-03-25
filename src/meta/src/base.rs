@@ -21,7 +21,7 @@ use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
     Attr, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp,
     RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF,
-    MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    CHUNK_SIZE, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -226,7 +226,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         &self,
         inode: Ino,
         indx: u32,
-        off: u32,
+        coff: u32,
         slice: Slice,
         mtime: DateTime<Utc>,
     ) -> Result<(u32, DirStat, Attr)>;
@@ -858,7 +858,12 @@ where
         if let Some(ref deleting_slices) = self.as_ref().deleting_slice_ctx
             && id != 0
         {
-            deleting_slices.0.send((id, size)).await;
+            let _ = deleting_slices.0.send((id, size)).await.inspect_err(|e| {
+                warn!(
+                    "Failed to send deleting slice({}) to deleting channel: {}",
+                    id, e
+                );
+            });
         }
     }
 
@@ -2801,10 +2806,19 @@ where
         &self,
         inode: Ino,
         indx: u32,
-        off: u32,
+        coff: u32,
         slice: Slice,
         mtime: DateTime<Utc>,
     ) -> Result<()> {
+        ensure!(
+            slice.id != 0
+                && coff <= CHUNK_SIZE as u32
+                && slice.len <= slice.size
+                && coff + slice.len <= CHUNK_SIZE as u32,
+            InvalidArgSnafu {
+                arg: format!("invalid slice {slice:?} in coff {coff} in write func")
+            }
+        );
         let chunks = match self.as_ref().open_files.chunks(inode) {
             Some(chunks) => chunks,
             None => {
@@ -2819,7 +2833,9 @@ where
         defer! {
             chunks.remove(&indx);
         };
-        let (num_slices, delta, attr) = self.do_write(inode, indx, off, slice, mtime).await?;
+        let (num_slices, delta, attr) = self
+            .do_write(inode, indx, coff, slice, mtime)
+            .await?;
         self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
             .await;
         if num_slices % 100 == 99 || num_slices > 350 {

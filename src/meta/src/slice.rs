@@ -3,6 +3,7 @@ use std::ops::Deref;
 use async_trait::async_trait;
 use redis::{ErrorKind, FromRedisValue, RedisError, ToRedisArgs, Value};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::{
     api::{Ino, Slice, CHUNK_SIZE},
@@ -33,6 +34,31 @@ impl PSlice {
             coff,
             left: None,
             right: None,
+        }
+    }
+
+    pub fn new_hole(coff: u32, len: u32) -> Self {
+        PSlice {
+            id: 0,
+            size: 0,
+            off: 0,
+            len,
+            coff,
+            left: None,
+            right: None,
+        }
+    }
+
+    pub fn slice(&self) -> Option<Slice> {
+        if self.id == 0 {
+            None
+        } else {
+            Some(Slice {
+                id: self.id,
+                size: self.size,
+                off: self.off,
+                len: self.len,
+            })
         }
     }
 
@@ -197,15 +223,10 @@ impl PSlices {
     /// Fill in the chunk's hole, let the returned slice total length equals [`CHUNK_SIZE`]
     /// Put a whole chunk of zero data at the beginning of the chunk, assume the chunk is full.
     pub fn fill(&mut self) {
-        self.pslices.insert(0, PSlice {
-            size: 0,
-            id: 0,
-            off: 0,
-            len: CHUNK_SIZE as u32,
-            coff: 0,
-            left: None,
-            right: None,
-        });
+        self.pslices.insert(
+            0,
+            PSlice::new_hole(0, CHUNK_SIZE as u32),
+        );
     }
 }
 
@@ -238,35 +259,19 @@ mod tests {
 
     use super::{PSlice, PSlices};
 
-    // id, (off, end)
-    // full valid
-    impl From<(u64, Range<u32>)> for PSlice {
-        fn from((id, range): (u64, Range<u32>)) -> Self {
-            PSlice {
-                id,
-                size: range.end - range.start,
-                off: 0,
-                len: range.end - range.start,
-                coff: range.start,
-                left: None,
-                right: None,
-            }
-        }
-    }
-
     // part valid
     // id, (off, (off, end), end)
     impl From<(u64, Range<u32>, Range<u32>)> for PSlice {
         fn from((id, total, valid): (u64, Range<u32>, Range<u32>)) -> Self {
-            PSlice {
-                id,
-                size: total.end - total.start,
-                off: valid.start - total.start,
-                len: valid.end - valid.start,
-                coff: total.start,
-                left: None,
-                right: None,
-            }
+            PSlice::new(
+                &Slice {
+                    id,
+                    size: total.end - total.start,
+                    off: valid.start - total.start,
+                    len: valid.end - valid.start,
+                },
+                total.start,
+            )
         }
     }
 
@@ -285,10 +290,10 @@ mod tests {
     #[test]
     fn slice_overlap() {
         // lead overlap
-        let p1: PSlice = (1, 10..20).into();
-        let p2: PSlice = (2, 15..25).into();  // latest
+        let p1: PSlice = (1, 10..20, 10..20).into();
+        let p2: PSlice = (2, 15..25, 15..25).into(); // latest
         let pslices = PSlices {
-            pslices: vec![p1, p2]
+            pslices: vec![p1, p2],
         };
         let slices = pslices.build_slices();
         let s1 = (0, 0..10, 0..10).into();
@@ -298,10 +303,10 @@ mod tests {
         assert_eq!(slices, expect);
 
         // tail overlap
-        let p1: PSlice = (1, 15..25).into();
-        let p2: PSlice = (2, 10..20).into();  // latest
+        let p1: PSlice = (1, 15..25, 15..25).into();
+        let p2: PSlice = (2, 10..20, 10..20).into(); // latest
         let pslices = PSlices {
-            pslices: vec![p1, p2]
+            pslices: vec![p1, p2],
         };
         let slices = pslices.build_slices();
         let s1 = (0, 0..10, 0..10).into();
@@ -314,10 +319,10 @@ mod tests {
     #[test]
     fn slice_contains() {
         // contains
-        let p1: PSlice = (1, 10..20).into();
-        let p2: PSlice = (2, 15..20).into();  // latest
+        let p1: PSlice = (1, 10..20, 10..20).into();
+        let p2: PSlice = (2, 15..20, 15..20).into(); // latest
         let pslices = PSlices {
-            pslices: vec![p1, p2]
+            pslices: vec![p1, p2],
         };
         let slices = pslices.build_slices();
         let s1 = (0, 0..10, 0..10).into();
@@ -327,10 +332,10 @@ mod tests {
         assert_eq!(slices, expect);
 
         // contained
-        let p1: PSlice = (1, 15..20).into();
-        let p2: PSlice = (2, 10..20).into();  // latest
+        let p1: PSlice = (1, 15..20, 15..20).into();
+        let p2: PSlice = (2, 10..20, 10..20).into(); // latest
         let pslices = PSlices {
-            pslices: vec![p1, p2]
+            pslices: vec![p1, p2],
         };
         let slices = pslices.build_slices();
         let s1 = (0, 0..10, 0..10).into();
@@ -340,17 +345,16 @@ mod tests {
     }
 
     #[test]
-    fn slice_len_gt_size() {
-        let p1: PSlice = (0, 0..64, 0..64).into();
-        let p2: PSlice = (2, 0..63, 10..40).into();
+    fn slice_part_read() {
+        let p1: PSlice = (1, 0..64, 0..64).into();
+        let p2: PSlice = (2, 0..63, 10..40).into();  // slice view
         let pslices = PSlices {
-            pslices: vec![p1, p2]
+            pslices: vec![p1, p2],
         };
         let slices = pslices.build_slices();
-        let s1 = (0, 0..64, 0..18).into();
-        let s2 = (2, 8..64, 18..48).into();
-        let s3 = (0, 0..64, 48..64).into();
-        let expect = vec![s1, s2, s3];
+        let s1 = (2, 0..63, 10..40).into();
+        let s2 = (1, 0..64, 30..64).into();
+        let expect = vec![s1, s2];
         assert_eq!(slices, expect);
     }
 }

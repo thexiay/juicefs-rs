@@ -89,23 +89,31 @@ pub struct Entry {
     pub attr: Attr,
 }
 
-/*
-   |-----------------------chunk---------------------|
-   |------|---------|--------------|------|----------|
+/* 
+   |----------------------chunk1---------------------|
+   |------|--refs slice--|---------------------------|
+   |------|--------------|---------------------------|
+   |	  ↑              ↑                           |
+   |     coff          cend                          |
+   |      ↑              ↑                           |
+   |      |<----len----->|                           |
+   |-------------------------------------------------|
+                ↘
+                  ↘
+                    ↘
+                    off           end
+                    ↑              ↑
+                    |<----len----->|
+   |----------------------chunk2---------------------|
+   |------|-----------raw slice-----------|----------|
    |	  ↑                               ↑          |
-   |     coff(in `PSlice`)               cend        |
-   |                ↑              ↑                 |
-   |	           off            end                |
-   |                |<----len----->|                 |
-   |      |<---------------size---------->|          |
+   |   slice_coff                       slice_cend   |
+   |      |<----------------size--------->|          |
    |-------------------------------------------------|
 */
 /// Slice is a continuous write in a chunk
 /// Multiple slices could be combined together as a chunk.
 /// One slice can only in one chunk.
-/// 1. refs
-/// 2. normal
-/// 3. zero hole
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slice {
     // slice id
@@ -119,6 +127,13 @@ pub struct Slice {
     pub len: u32,
 }
 
+impl Slice {
+    pub fn is_hole(&self) -> bool {
+        self.id == 0
+    }
+}
+
+#[cfg(test)]
 impl From<(u64, u32, u32, u32)> for Slice {
     fn from((id, size, off, len): (u64, u32, u32, u32)) -> Self {
         Slice { id, size, off, len }
@@ -615,14 +630,14 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ///
     /// * `inode` - inode of the file
     /// * `indx` - index of the chunk
-    /// * `off` - offset of the chunk
+    /// * `coff` - offset of the chunk
     /// * `slice` - slice description
     /// * `mtime` - modified time
     async fn write(
         &self,
         inode: Ino,
         indx: u32,
-        off: u32,
+        coff: u32,
         slice: Slice,
         mtime: DateTime<Utc>,
     ) -> Result<()>;
