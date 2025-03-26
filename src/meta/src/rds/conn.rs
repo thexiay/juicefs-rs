@@ -1,8 +1,8 @@
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use deadpool::managed::{Manager, Object, RecycleError};
+use deadpool::managed::{Manager, RecycleError};
 use redis::{
-    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig}, cmd, Client, RedisError
+    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig}, Client, RedisError
 };
 
 pub struct RedisClient {

@@ -2617,14 +2617,14 @@ where
             Ok((ino, attr)) => (ino, attr),
             Err(err) => {
                 if let MetaErrorEnum::EntryExists {
-                    parent: parent,
-                    name: name,
+                    parent: _,
+                    name: _,
                     exist_ino,
                     exist_attr,
                 } = err.inner()
                     && !flags.intersects(OFlag::O_EXCL)
                 {
-                    let mut attr = match exist_attr {
+                    let attr = match exist_attr {
                         Some(attr) => attr.clone(),
                         None => self.get_attr(*exist_ino).await?,
                     };

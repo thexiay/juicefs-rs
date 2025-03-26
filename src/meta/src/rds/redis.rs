@@ -158,9 +158,10 @@ impl Display for LuaScriptArg {
  * key:
  * body: Fn() -> Result<Option<T>>,
  *       Ok(Some(T)) => exec ok
- *       Ok(None) => exec faile, but can retry to exec
+ *       Ok(None) => exec ok, but watch fail, retry to exec
  *       Err(e) => exec faile, can't retry to exec
  */
+// TODO: refactor this macro, it's difficult to distinguish Option and whether it's exec ok
 macro_rules! async_transaction {
     ($conn:expr, $keys:expr, $body:expr) => {
         loop {
@@ -657,12 +658,7 @@ impl RedisEngine {
             let slices = conn
                 .lrange::<_, Option<PSlices>>(&key, 0, -1)
                 .await?
-                .map(|pslices| {
-                    (*pslices)
-                        .iter()
-                        .filter_map(|s| s.slice())
-                        .collect()
-                })
+                .map(|pslices| (*pslices).iter().filter_map(|s| s.slice()).collect())
                 .unwrap_or(Vec::new());
             let mut pipe = pipe();
             pipe.atomic().del(&key).ignore();
@@ -675,8 +671,10 @@ impl RedisEngine {
                 );
                 to_del.push(slice);
             });
-            let rs: Vec<i64> = pipe.query_async(conn).await?;
-            Ok(Some((to_del, rs)))
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                other => Ok(Some((to_del, from_redis_value::<Vec<i64>>(&other)?))),
+            }
         }) {
             Ok((to_del, rs)) => {
                 assert!(rs.len() == to_del.len());
@@ -703,23 +701,28 @@ impl RedisEngine {
 
         let mut pipe = pipe();
         pipe.atomic();
-        let res: Vec<Value> = pipe
+        match pipe
             .hget(self.acl_key(), id)
             .query_async(conn)
             .await
             .context(RedisDetailSnafu {
                 detail: format!("get acl {}", id),
-            })?;
-        let cmds = from_redis_value::<Option<Vec<u8>>>(&res[0])?;
-        match cmds {
-            None => {
-                whatever!("Missing acl id: {}", id);
+            })? {
+            Value::Nil => Ok(None),
+            Value::Array(res) => {
+                ensure_whatever!(res.len() == 1, "invalid response");
+                match from_redis_value::<Option<Vec<u8>>>(&res[0])? {
+                    None => {
+                        whatever!("Missing acl id: {}", id);
+                    }
+                    Some(cmds) => {
+                        let rule: Rule = bincode::deserialize(&cmds)?;
+                        cache.put(id, rule.clone());
+                        Ok(Some(rule))
+                    }
+                }
             }
-            Some(cmds) => {
-                let rule: Rule = bincode::deserialize(&cmds)?;
-                cache.put(id, rule.clone());
-                Ok(Some(rule))
-            }
+            _ => whatever!("invalid response"),
         }
     }
 
@@ -991,11 +994,19 @@ impl Engine for RedisEngine {
             match old {
                 Some(old) if Duration::from_millis(old as u64) + diff > value => Ok(Some(false)),
                 _ => {
-                    pipe.atomic()
+                    match pipe
+                        .atomic()
                         .set(&name, value.as_millis() as u64)
                         .query_async(conn)
-                        .await?;
-                    Ok(Some(true))
+                        .await?
+                    {
+                        Value::Nil => Ok(None),
+                        Value::Array(res) => {
+                            ensure_whatever!(res.len() == 1, "invalid response length");
+                            Ok(Some(from_redis_value::<bool>(&res[0])?))
+                        }
+                        _ => whatever!("invalid response type"),
+                    }
                 }
             }
         })
@@ -1338,7 +1349,9 @@ impl Engine for RedisEngine {
                         .expect("Time went backwards")
                         .as_secs();
                     let mut pipe = pipe();
-                    pipe.atomic()
+
+                    match pipe
+                        .atomic()
                         .zadd(
                             self.del_files(),
                             RedisHandle::to_delete(inode, attr.length),
@@ -1349,8 +1362,12 @@ impl Engine for RedisEngine {
                         .decr(self.used_inodes_key(), 1)
                         .srem(self.sustained(sid), inode.to_string())
                         .query_async(conn)
-                        .await?;
-                    Ok(Some((delete_space, attr)))
+                        .await?
+                    {
+                        Value::Nil => Ok(None),
+                        Value::Array(_) => Ok(Some((delete_space, attr))),
+                        _ => whatever!("invalid response type"),
+                    }
                 }
                 None => Ok(None),
             }
@@ -1505,9 +1522,10 @@ impl Engine for RedisEngine {
                 pipe.hset(self.dir_quota_used_space_key(), inode, used_space);
                 pipe.hset(self.dir_quota_used_inodes_key(), inode, used_inodes);
             }
-            match pipe.query_async::<Option<Value>>(conn).await? {
-                Some(_) => Ok(Some(origin)),
-                None => Ok(None),
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(_) => Ok(Some(origin)),
+                _ => whatever!("invalid response type"),
             }
         })
     }
@@ -1519,7 +1537,7 @@ impl Engine for RedisEngine {
         pipe.hdel(self.dir_quota_key(), inode);
         pipe.hdel(self.dir_quota_used_space_key(), inode);
         pipe.hdel(self.dir_quota_used_inodes_key(), inode);
-        pipe.query_async(&mut conn).await?;
+        pipe.query_async(&mut conn).await?; // TODO: distinguish () and Nil
         Ok(())
     }
 
@@ -1571,7 +1589,7 @@ impl Engine for RedisEngine {
             pipe.hincr(self.dir_quota_used_space_key(), ino, new_space);
             pipe.hincr(self.dir_quota_used_inodes_key(), ino, new_inodes);
         }
-        pipe.query_async(conn).await?;
+        pipe.query_async(conn).await?; // TODO: distinguish () and Nil
         Ok(())
     }
 
@@ -1626,10 +1644,15 @@ impl Engine for RedisEngine {
                 dirty_attr.ctime = now.as_nanos();
                 let mut pipe = pipe();
                 pipe.atomic();
-                pipe.set(self.inode_key(inode), bincode::serialize(&dirty_attr)?)
+                match pipe
+                    .set(self.inode_key(inode), bincode::serialize(&dirty_attr)?)
                     .query_async(conn)
-                    .await?;
-                Ok(Some(Some(dirty_attr)))
+                    .await?
+                {
+                    Value::Nil => Ok(None),
+                    Value::Array(_) => Ok(Some(Some(dirty_attr))),
+                    _ => whatever!("invalid response type"),
+                }
             } else {
                 Ok(Some(None))
             }
@@ -1884,8 +1907,10 @@ impl Engine for RedisEngine {
             }
             pipe.incr(self.used_space_key(), utils::align_4k(0));
             pipe.incr(self.used_inodes_key(), 1);
-            pipe.query_async(conn).await?;
-            Ok(Some(attr.clone()))
+            match pipe.query_async::<Value>(conn).await? {
+                Value::Nil => Ok(None),
+                _ => Ok(Some(attr.clone())),
+            }
         })
     }
 
@@ -1999,8 +2024,10 @@ impl Engine for RedisEngine {
                     pipe.hincr(self.parent_key(inode), old_parent.to_string(), 1);
                 }
                 pipe.hincr(self.parent_key(inode), parent.to_string(), 1);
-                pipe.exec_async(conn).await?;
-                Ok(Some(attr))
+                match pipe.query_async(conn).await? {
+                    Value::Nil => Ok(None),
+                    _ => Ok(Some(attr)),
+                }
             }
         )
     }
@@ -2194,8 +2221,9 @@ impl Engine for RedisEngine {
                     }
                     guaga
                 };
-                match pipe.query_async::<Option<Value>>(conn).await? {
-                    Some(_) => Ok::<Option<_>, MetaError>(Some((
+                match pipe.query_async(conn).await? {
+                    Value::Nil => Ok(None),
+                    _ => Ok::<Option<_>, MetaError>(Some((
                         guaga.0,
                         guaga.1,
                         should_del,
@@ -2203,7 +2231,6 @@ impl Engine for RedisEngine {
                         ino,
                         attr.clone(),
                     ))),
-                    None => Ok(None),
                 }
             })?;
 
@@ -2323,9 +2350,9 @@ impl Engine for RedisEngine {
             pipe.hdel(self.dir_quota_key(), ino);
             pipe.hdel(self.dir_quota_used_space_key(), ino);
             pipe.hdel(self.dir_quota_used_inodes_key(), ino);
-            match pipe.query_async::<Option<Value>>(conn).await? {
-                Some(_) => Ok::<_, MetaError>(Some(ino)),
-                None => Ok::<_, MetaError>(None),
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok::<_, MetaError>(None),
+                _ => Ok::<_, MetaError>(Some(ino)),
             }
         })?;
         if trash.is_none() {
@@ -2377,8 +2404,10 @@ impl Engine for RedisEngine {
             let mut pipe = pipe();
             pipe.atomic();
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
-            pipe.query_async(conn).await?;
-            Ok(Some((Some(attr.atime), path)))
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                _ => Ok(Some((Some(attr.atime), path)))
+            }
         })
     }
 
@@ -2856,16 +2885,18 @@ impl Engine for RedisEngine {
                         bincode::serialize(&pattr_dst).unwrap(),
                     );
                 }
-                pipe.query_async(conn).await?;
-                Ok::<_, MetaErrorEnum>(Some((
-                    ino_src,
-                    attr_src,
-                    exists_dst.map(|dst| (dst.1, exists_attr_dst.unwrap())),
-                    trash,
-                    delete_option,
-                    new_space,
-                    new_inode,
-                )))
+                match pipe.query_async::<Value>(conn).await? {
+                    Value::Nil => Ok(None),
+                    _ => Ok::<_, MetaErrorEnum>(Some((
+                        ino_src,
+                        attr_src,
+                        exists_dst.map(|dst| (dst.1, exists_attr_dst.unwrap())),
+                        trash,
+                        delete_option,
+                        new_space,
+                        new_inode,
+                    ))),
+                }
             })?;
 
         // trash is none and not exchange, should delete file.
@@ -2988,8 +3019,10 @@ impl Engine for RedisEngine {
             let mut pipe = pipe();
             pipe.atomic();
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
-            pipe.query_async(conn).await?;
-            Ok::<_, MetaError>(Some(attr))
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok::<_, MetaError>(None),
+                _ => Ok::<_, MetaError>(Some(attr)),
+            }
         })
     }
 
@@ -3058,12 +3091,13 @@ impl Engine for RedisEngine {
             if delta.space > 0 {
                 pipe.incr(self.used_space_key(), delta.space).ignore();
             }
-            match pipe.query_async::<Option<Vec<u32>>>(conn).await? {
-                Some(rs) => {
-                    ensure_whatever!(rs.len() == 1, "Invalid len for write: {:?}", rs);
-                    Ok(Some((rs[0], delta, attr)))
-                }
-                None => Ok(None),
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(res) => {
+                    ensure_whatever!(res.len() == 1, "invalid response length for write {:?}", res);
+                    Ok(Some((from_redis_value::<u32>(&res[0])?, delta, attr)))
+                },
+                _ => whatever!("invalid response type"),
             }
         })
     }
@@ -3174,8 +3208,11 @@ impl Engine for RedisEngine {
                 );
             }
             pipe.incr(self.used_space_key(), delta.space);
-            pipe.query_async(conn).await?;
-            Ok(Some((attr, delta)))
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(_) => Ok(Some((attr, delta))),
+                _ => whatever!("invalid response type"),
+            }
         })
     }
 
@@ -3191,7 +3228,7 @@ impl Engine for RedisEngine {
         let base = AsRef::<CommonMeta>::as_ref(self);
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        let res = {
+        async_transaction!(conn, &[self.inode_key(src), self.inode_key(dst)], {
             let inos = vec![src, dst];
             let keys = inos
                 .iter()
@@ -3307,10 +3344,7 @@ impl Engine for RedisEngine {
                             let mut rslice = slice.clone();
                             rslice.off += lslice.len;
                             rslice.len -= lslice.len;
-                            pipe.rpush(
-                                self.chunk_key(dst, indx + 1),
-                                PSlice::new(&rslice, 0),
-                            );
+                            pipe.rpush(self.chunk_key(dst, indx + 1), PSlice::new(&rslice, 0));
                             if slice.id > 0 {
                                 pipe.hincr(
                                     self.slice_refs(),
@@ -3336,10 +3370,12 @@ impl Engine for RedisEngine {
             if delta.space > 0 {
                 pipe.incr(self.used_space_key(), delta.space);
             }
-            pipe.query_async(conn).await?;
-            (copy_size, Some((dst_attr.parent, delta)))
-        };
-        Ok(res)
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(_) => Ok(Some((copy_size, Some((dst_attr.parent, delta))))),
+                _ => whatever!("invalid response type"),
+            }
+        })
     }
 
     async fn do_fallocate(
@@ -3438,8 +3474,11 @@ impl Engine for RedisEngine {
                 align_4k(length) - align_4k(old)
             );
             pipe.incr(self.used_space_key(), align_4k(length) - align_4k(old));
-            pipe.query_async(conn).await?;
-            Ok::<_, MetaError>(Some((delta, attr)))
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(_) => Ok::<_, MetaError>(Some((delta, attr))),
+                _ => whatever!("invalid response type"),
+            }
         })
     }
 
@@ -3526,11 +3565,14 @@ impl Engine for RedisEngine {
         batch.keys().for_each(|ino| {
             p.hexists(self.dir_used_space_key(), ino);
         });
-        let exists = p.query_async::<Vec<bool>>(&mut conn).await?;
-        ensure_whatever!(
-            batch.keys().len() == exists.len(),
-            "Invalid len for flush redis return list"
-        );
+        let exists = match p.query_async(&mut conn).await? {
+            Value::Nil => whatever!("atomic exec fail because conflict"),
+            Value::Array(res) => {
+                ensure_whatever!(res.len() == batch.keys().len(), "Invalid len for flush redis return list");
+                from_redis_value::<Vec<bool>>(&Value::Array(res))?
+            },
+            _ => whatever!("Invalid resopnse type")
+        };
         let used_space_exists = batch
             .keys()
             .zip(exists.iter())
@@ -3559,7 +3601,10 @@ impl Engine for RedisEngine {
                     }
                 }
             }
-            pipe.query_async(&mut conn).await?;
+            match pipe.query_async(&mut conn).await? {
+                Value::Nil => whatever!("atomic exec fail because conflict"),
+                _ => (),
+            }
         }
         Ok(())
     }
@@ -3613,9 +3658,10 @@ impl Engine for RedisEngine {
             pipe.hset(self.dir_data_length_key(), ino, stat.length);
             pipe.hset(self.dir_used_space_key(), ino, stat.space);
             pipe.hset(self.dir_used_inodes_key(), ino, stat.inodes);
-            match pipe.query_async::<Option<Value>>(conn).await? {
-                Some(_) => Ok(Some(stat.clone())),
-                None => Ok(None),
+            match pipe.query_async(conn).await? {
+                Value::Nil => Ok(None),
+                Value::Array(_) => Ok(Some(stat.clone())),
+                _ => whatever!("invalid response type"),
             }
         })
     }

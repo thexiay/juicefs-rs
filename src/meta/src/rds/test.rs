@@ -188,7 +188,13 @@ async fn test_copy_file_range() {
 
 async fn test_close_session() {}
 
-async fn test_concurrent_dir() {}
+#[traced_test]
+#[tokio::test]
+async fn test_concurrent_dir() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_concurrent_dir(&mut holder.engine).await;
+}
 
 async fn test_attr_flags() {}
 

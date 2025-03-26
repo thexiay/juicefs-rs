@@ -3,7 +3,8 @@ use std::time::Duration;
 use crate::{
     align_4k,
     api::{
-        Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice, Summary, XattrF, CHUNK_SIZE, ROOT_INODE
+        Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice,
+        Summary, XattrF, CHUNK_SIZE, ROOT_INODE,
     },
     base::{CommonMeta, Engine},
     config::Format,
@@ -822,7 +823,7 @@ async fn test_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 async fn test_list_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
 pub async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
-    let (inode, attr) = m
+    let (inode, _) = m
         .create(ROOT_INODE, "f", 0o644, 0o22, OFlag::empty())
         .await
         .expect("create file");
@@ -948,7 +949,8 @@ pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     .await
     .expect("write file");
     // cross three chunks
-    let copied = m.copy_file_range(src_ino, 150, dst_ino, 30 << 20, 200 << 20, 0)
+    let copied = m
+        .copy_file_range(src_ino, 150, dst_ino, 30 << 20, 200 << 20, 0)
         .await
         .expect("copy file range");
     assert_eq!(copied, 200 << 20);
@@ -960,33 +962,116 @@ pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             (0, 0, 200, CHUNK_SIZE as u32 - (30 << 20) - 50).into(),
         ],
         vec![
-            (0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20)), (30 << 20) - 150).into(),
+            (
+                0,
+                0,
+                150 + (CHUNK_SIZE as u32 - (30 << 20)),
+                (30 << 20) - 150,
+            )
+                .into(),
             (0, 0, 0, 100 << 10).into(),
             (11, 40 << 20, 0, (34 << 20) + 150 - (100 << 10)).into(),
         ],
         vec![
-            (11, 40 << 20, (34 << 20) + 150 - (100 << 10), (6 << 20) - 150 + (100 << 10)).into(),
-            (0, 0, (40 << 20) + (100 << 10), CHUNK_SIZE as u32 - (40 << 20) - (100 << 10)).into(),
+            (
+                11,
+                40 << 20,
+                (34 << 20) + 150 - (100 << 10),
+                (6 << 20) - 150 + (100 << 10),
+            )
+                .into(),
+            (
+                0,
+                0,
+                (40 << 20) + (100 << 10),
+                CHUNK_SIZE as u32 - (40 << 20) - (100 << 10),
+            )
+                .into(),
             (0, 0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20))).into(),
         ],
         vec![
-            (0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20)), (30 << 20) - 150).into(),
+            (
+                0,
+                0,
+                150 + (CHUNK_SIZE as u32 - (30 << 20)),
+                (30 << 20) - 150,
+            )
+                .into(),
             (12, 63 << 20, 10 << 20, (8 << 20) + 150).into(),
         ],
     ];
     for i in 0..4_usize {
         let slices = m.read(dst_ino, i as u32).await.expect("read chunk");
         println!("slices: {:?}", slices);
-        assert_eq!(slices.len(), expected_slices[i].len(), "expect slices len not equal in chunk {i}");
+        assert_eq!(
+            slices.len(),
+            expected_slices[i].len(),
+            "expect slices len not equal in chunk {i}"
+        );
         for j in 0..slices.len() {
-            assert_eq!(slices[j], expected_slices[i][j], "expect slice equal in chunk {i} slice {j}");
+            assert_eq!(
+                slices[j], expected_slices[i][j],
+                "expect slice equal in chunk {i} slice {j}"
+            );
         }
     }
 }
 
-async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
 
-async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+}
+
+pub async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
+    let mut task_set = JoinSet::new();
+    for i in 0..100 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            let (d1, _) = match m.mkdir(ROOT_INODE, "d1", 0o640, 0o22, 0).await {
+                Ok(res) => res,
+                Err(e) => {
+                    assert!(e.is_entry_exists(&ROOT_INODE, "d1"), "{e}");
+                    m.lookup(ROOT_INODE, "d1", true).await.expect("lookup d1")
+                }
+            };
+
+            let (d2, _) = match m.mkdir(ROOT_INODE, "d2", 0o640, 0o22, 0).await {
+                Ok(res) => res,
+                Err(e) => {
+                    assert!(e.is_entry_exists(&ROOT_INODE, "d2"), "e");
+                    m.lookup(ROOT_INODE, "d2", true).await.expect("lookup d2")
+                }
+            };
+            let name = format!("file{i}");
+            m.create(d1, &name, 0o644, 0, OFlag::empty())
+                .await
+                .expect(&format!("create d1/{name}"));
+            m.rename(d1, &name, d2, &name, RenameMask::empty())
+                .await
+                .expect(&format!("rename d1/{name} -> d2/{name}"));
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("concurrent dir");
+    }
+
+    for i in 0..100 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            let (d2, _) = m.lookup(ROOT_INODE, "d2", true).await.expect("lookup d2");
+            let name = format!("file{i}");
+            m.unlink(d2, &name, false).await.expect(&format!("unlink d2/{name}"));
+            if let Err(e) = m.rmdir(ROOT_INODE, "d1", false).await {
+                assert!(e.is_dir_not_empty(&ROOT_INODE, "d1") || e.is_no_entry_found(&ROOT_INODE, "d1"));
+            }
+            if let Err(e) = m.rmdir(ROOT_INODE, "d2", false).await {
+                assert!(e.is_dir_not_empty(&ROOT_INODE, "d2") || e.is_no_entry_found(&ROOT_INODE, "d2"));
+            }
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("concurrent dir");
+    }
+}
 
 async fn test_attr_flags(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
