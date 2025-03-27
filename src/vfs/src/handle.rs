@@ -19,17 +19,41 @@ use crate::{
 };
 
 pub type Fh = u64;
+
+pub enum HandleType {
+    File,
+    Dir,
+    Control,
+}
+
 /// Proxy of [`FileReader`] and [`FileWriter`]
 /// Can handle write and read progres bar.
 pub struct Handle {
     inode: Ino,
     fh: u64,
+    // fast check
+    handle_type: HandleType,
+    readable: bool,
+    writeable: bool,
+
     handle: AsyncRwLock<HandleInner>,
 }
 
 impl Handle {
     pub fn fh(&self) -> Fh {
         self.fh
+    }
+
+    pub fn typ(&self) -> &HandleType {
+        &self.handle_type
+    }
+
+    pub fn writable(&self) -> bool {
+        self.writeable
+    }
+
+    pub fn readable(&self) -> bool {
+        self.readable
     }
 
     pub async fn write(&self, accept_interrupt: bool) -> Option<RwLockWriteGuard<'_, HandleInner>> {
@@ -97,7 +121,8 @@ impl FileHandle {
 }
 
 pub struct DirHandle {
-    read_dir: Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<Entry>>> + Send>> + Send + Sync>,
+    read_dir:
+        Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<Entry>>> + Send>> + Send + Sync>,
     children: Vec<Entry>,
     indexs: HashMap<String, usize>,
     read_at: DateTime<Utc>,
@@ -191,18 +216,18 @@ impl Vfs {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let handle_inner = match flags {
             Some(flags) => {
-                let file_type = match flags {
-                    OFlag::O_RDONLY => FileHandleType::ReadOnlyFile {
+                let file_type = if flags.contains(OFlag::O_WRONLY) || flags.contains(OFlag::O_RDWR)
+                {
+                    FileHandleType::WRFile {
                         reader: self.reader.clone().open(ino, length),
-                    },
-                    OFlag::O_WRONLY | OFlag::O_RDWR => {
-                        // FUSE writeback_cache mode need reader even for WRONLY
-                        FileHandleType::WRFile {
-                            reader: self.reader.clone().open(ino, length),
-                            writer: self.writer.clone().open(ino, length),
-                        }
+                        writer: self.writer.clone().open(ino, length),
                     }
-                    _ => return Err(InvalidOFlagSnafu.build().into()),
+                } else if flags.contains(OFlag::O_RDONLY) {
+                    FileHandleType::ReadOnlyFile {
+                        reader: self.reader.clone().open(ino, length),
+                    }
+                } else {
+                    return Err(InvalidOFlagSnafu.build().into());
                 };
                 HandleInner::File(FileHandle {
                     flags,
@@ -243,9 +268,22 @@ impl Vfs {
                 })
             }
         };
+        let typ = match &handle_inner {
+            HandleInner::File(_) => HandleType::File,
+            HandleInner::Dir(_) => HandleType::Dir,
+            HandleInner::Control(_) => HandleType::Control,
+        };
+        let writeable = matches!(
+            &handle_inner, 
+            HandleInner::File(f) if matches!(f.handle, FileHandleType::WRFile { .. })
+        );
+        let readable = true;
         let handle = Handle {
             inode: ino,
             fh,
+            handle_type: typ,
+            readable,
+            writeable,
             handle: AsyncRwLock::new(handle_inner),
         };
         self.handles

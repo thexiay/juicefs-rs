@@ -4,35 +4,31 @@ use std::{
     mem::take,
     ops::Deref,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, OnceLock,
     },
 };
 
+use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use juice_meta::error::Result as MetaResult;
 use juice_meta::{
     api::{Ino, Meta, Slice, CHUNK_SIZE},
     error::MetaError,
 };
-use juice_storage::api::{CachedStore, ChunkStore, SliceWriter as SSliceWriter, WSlice};
+use juice_storage::{
+    api::{CachedStore, ChunkStore, SliceWriter as SSliceWriter, WSlice},
+    error::StorageErrorEnum,
+};
 use opendal::Buffer;
 use parking_lot::Mutex;
-use snafu::FromString;
-use tokio::{
-    sync::{
-        mpsc::{channel, Receiver},
-        Notify,
-    },
-    task::JoinSet,
-    time::sleep,
-};
-use tracing::{error, warn};
+use snafu::{whatever, FromString, ResultExt};
+use tokio::{sync::Mutex as AsyncMutex, task::JoinSet, time::sleep};
+use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
-    error::{Result, VfsError, VfsErrorEnum},
+    error::{Result, StorageSnafu, VfsError, VfsErrorEnum},
     frange::Frange,
     reader::DataReaderInvalidator,
 };
@@ -46,12 +42,36 @@ type CRange = Frange;
 struct DataWriterCtx {
     meta: Arc<dyn Meta>,
     store: Arc<CachedStore>,
-    id_pool: SliceIDPool,
+    ids: SliceIdPool,
     dr_invalidator: DataReaderInvalidator,
     block_size: u64,
     used_read_buffer: AtomicU64,
     max_read_buffer: u64,
     max_retries: u32,
+}
+
+struct SliceIdPool {
+    meta: Arc<dyn Meta>,
+    rx: Receiver<u64>,
+    tx: Sender<u64>,
+}
+
+impl SliceIdPool {
+    pub fn new(meta: Arc<dyn Meta>) -> Self {
+        let (tx, rx) = async_channel::bounded(100);
+        Self { meta, rx, tx }
+    }
+
+    pub fn reuse(&self, id: u64) {
+        self.tx.try_send(id).ok();
+    }
+
+    pub async fn get(&self) -> Result<u64> {
+        match self.rx.try_recv().ok() {
+            Some(id) => Ok(id),
+            None => Ok(self.meta.new_slice().await?),
+        }
+    }
 }
 
 pub struct DataWriter {
@@ -70,7 +90,7 @@ impl DataWriter {
             dw_ctx: Arc::new(DataWriterCtx {
                 meta: meta.clone(),
                 store,
-                id_pool: SliceIDPool::new(meta.clone()),
+                ids: SliceIdPool::new(meta.clone()),
                 dr_invalidator: invalidator,
                 block_size: config.chunk.max_block_size as u64,
                 used_read_buffer: AtomicU64::new(0),
@@ -177,6 +197,8 @@ struct FileWriterCtx {
     ino: Ino,
     ferr: OnceLock<Arc<VfsError>>,
     slices_cnt: AtomicU32,
+    // The length of the file(include mem cache len), it may a little longer than the real file length
+    length: AtomicU64,
 }
 
 impl FileWriterCtx {
@@ -193,7 +215,6 @@ impl FileWriterCtx {
 }
 
 struct FileWriterCore {
-    len: u64,
     chunks: HashMap<u32, ChunkWriter>,
 }
 
@@ -201,7 +222,7 @@ pub struct FileWriter {
     dw_ctx: Arc<DataWriterCtx>,
     fw_ctx: Arc<FileWriterCtx>,
     ino: Ino,
-    writer: Arc<Mutex<FileWriterCore>>,
+    writer: Arc<AsyncMutex<FileWriterCore>>,
     refs: Arc<AtomicU32>,
 }
 
@@ -230,9 +251,9 @@ impl FileWriter {
             ino,
             ferr: OnceLock::new(),
             slices_cnt: AtomicU32::new(0),
+            length: AtomicU64::new(length),
         });
-        let writer = Arc::new(Mutex::new(FileWriterCore {
-            len: length,
+        let writer = Arc::new(AsyncMutex::new(FileWriterCore {
             chunks: HashMap::new(),
         }));
         Self {
@@ -263,7 +284,7 @@ impl FileWriter {
         }
 
         // TODO: use tokio::select to handle cancel
-        let mut core = self.writer.lock();
+        let mut core = self.writer.lock().await;
         let new_length = off + data.len() as u64;
         let mut idx = (off / CHUNK_SIZE) as u32;
         let mut coff = (off % CHUNK_SIZE) as u32;
@@ -273,18 +294,18 @@ impl FileWriter {
                 .chunks
                 .entry(idx)
                 .or_insert_with(|| ChunkWriter::new(idx, self.dw_ctx.clone(), self.fw_ctx.clone()));
-            cw.write(coff, data.split_off(len as usize))?;
+            cw.write(coff, data.split_to(len as usize)).await?;
             idx += 1;
             coff = ((coff as u64 + len) % CHUNK_SIZE) as u32;
         }
-        if new_length > core.len {
-            core.len = new_length;
+        if new_length > self.fw_ctx.length.load(Ordering::SeqCst) {
+            self.fw_ctx.length.store(new_length, Ordering::SeqCst);
         }
         self.fw_ctx.get_result()
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let mut core = self.writer.lock();
+        let mut core = self.writer.lock().await;
         let max_flush_time = max(
             std::time::Duration::from_secs(
                 ((self.dw_ctx.max_retries + 2) * (self.dw_ctx.max_retries + 2) / 2) as u64,
@@ -293,9 +314,9 @@ impl FileWriter {
         );
         let mut flush_set = JoinSet::new();
         let chunks = take(&mut core.chunks);
-        chunks.into_iter().for_each(|(_, mut cw)| {
+        chunks.into_iter().for_each(|(_, cw)| {
             flush_set.spawn(async move {
-                cw.flush().await;
+                cw.finish().await;
             });
         });
         let fw_ctx = self.fw_ctx.clone();
@@ -310,15 +331,15 @@ impl FileWriter {
         tokio::select! {
             _ = flush_set.join_all() => self.fw_ctx.get_result(),
             _ = sleep(max_flush_time) => {
-                warn!("flush timeout after waited {:?}", max_flush_time);
+                warn!(ino = %self.fw_ctx.ino, "flush timeout after waited {:?}", max_flush_time);
                 // TODO: interrupt all flush task
                 Err(VfsErrorEnum::EIO.into())
             },
-            err = check_err => {
+            err = check_err => {  // any error happen in chunkWriter interrupt flush
                 match err {
                     Ok(e) => Err(e.into()),
                     Err(e) => {
-                        error!("Check flush error thread error happen: {:?}", e);
+                        error!(ino = %self.fw_ctx.ino, "Check flush error thread error happen: {:?}", e);
                         Err(VfsErrorEnum::EIO.into())
                     },
                 }
@@ -327,62 +348,12 @@ impl FileWriter {
     }
 
     pub fn truncate(&self, length: u64) {
-        let mut writer = self.writer.lock();
         // TODO: truncate write buffer if length < f.length
-        writer.len = length;
+        self.fw_ctx.length.store(length, Ordering::Relaxed)
     }
 
     pub fn len(&self) -> u64 {
-        let core = self.writer.lock();
-        core.len
-    }
-}
-
-// TODO: Make it more reliable
-struct SliceIDPool {
-    meta: Arc<dyn Meta>,
-    id_rx: Mutex<Receiver<MetaResult<u64>>>,
-}
-
-impl SliceIDPool {
-    pub fn new(meta: Arc<dyn Meta>) -> SliceIDPool {
-        let (tx, rx) = channel(1000);
-        let meta_clone = meta.clone();
-        tokio::spawn(async move {
-            async fn get_slice_id(meta: &Arc<dyn Meta>) -> u64 {
-                loop {
-                    match meta.new_slice().await {
-                        Ok(id) => return id,
-                        Err(e) => warn!("get slice id error: {:?}", e),
-                    }
-                }
-            }
-
-            loop {
-                let id = tokio::select! {
-                    _ = sleep(std::time::Duration::from_millis(100)) =>
-                        Err(MetaError::without_source("timeout to get slice id".to_string())),
-                    id = get_slice_id(&meta_clone) => Ok(id),
-                };
-                if let Err(e) = tx.send(id).await {
-                    error!("send id channel closed: {:?}", e);
-                    break;
-                }
-            }
-        });
-        Self {
-            meta,
-            id_rx: Mutex::new(rx),
-        }
-    }
-
-    pub fn get_id(&self) -> Result<u64> {
-        let mut rx = self.id_rx.lock();
-        match rx.blocking_recv() {
-            Some(Ok(id)) => Ok(id),
-            Some(Err(e)) => Err(e.into()),
-            None => panic!("slice id channel closed"),
-        }
+        self.fw_ctx.length.load(Ordering::Relaxed)
     }
 }
 
@@ -392,67 +363,79 @@ struct ChunkWriter {
     fw_ctx: Arc<FileWriterCtx>,
     slices: Arc<Mutex<LinkedList<SliceWriter>>>,
     commit_task: JoinSet<()>,
+    finished: Arc<AtomicBool>,
 }
 
 impl ChunkWriter {
     pub fn new(idx: u32, dw_ctx: Arc<DataWriterCtx>, fw_ctx: Arc<FileWriterCtx>) -> Self {
         let slices = Arc::new(Mutex::new(LinkedList::new()));
         let commit_task = JoinSet::new();
+        let finished = Arc::new(AtomicBool::new(false));
         let mut cw = Self {
             idx,
             dw_ctx,
             fw_ctx,
             slices,
             commit_task,
+            finished,
         };
+        info!("spawn commit task for chunk {idx}");
         cw.spawn_commit_finish();
         cw
     }
 
-    pub fn write(&self, coff: u32, data: Bytes) -> Result<()> {
-        let mut slices = self.slices.lock();
-        let slice_writer = {
-            let block_size = self.dw_ctx.block_size;
-            let mut writing_slices = 0;
-            // final writable slice
-            let writer = slices.iter_mut().rev().find_map(|w| {
-                if !w.freezed() {
-                    let flush_off = w.size / block_size as u32 * block_size as u32;
-                    if (w.coff + flush_off..=w.coff + w.size).contains(&coff) {
-                        return Some(Some(w));
+    pub async fn write(&self, coff: u32, data: Bytes) -> Result<()> {
+        let id = self.dw_ctx.ids.get().await?;
+        let reuse_id = {
+            info!("chunkWriter({}) op write: start to lock slices.", self.idx);
+            let mut slices = self.slices.lock();
+            let (reuse, slice_writer) = {
+                let block_size = self.dw_ctx.block_size;
+                let mut writing_slices = 0;
+                // final writable slice
+                let writer = slices.iter_mut().rev().find_map(|w| {
+                    if !w.freezed() {
+                        let flush_off = w.size / block_size as u32 * block_size as u32;
+                        if (w.coff + flush_off..=w.coff + w.size).contains(&coff) {
+                            return Some(Some(w));
+                        }
+                        writing_slices += 1;
+                        if writing_slices > MAX_WRITING_SLICES_IN_CHUNK {
+                            w.flush();
+                        }
                     }
-                    writing_slices += 1;
-                    if writing_slices > MAX_WRITING_SLICES_IN_CHUNK {
-                        w.flush();
-                    }
-                }
 
-                let slice_range = CRange {
-                    off: w.coff as u64,
-                    len: w.size as u64,
-                };
-                let write_range = CRange {
-                    off: coff as u64,
-                    len: data.len() as u64,
-                };
-                slice_range.is_overlap(&write_range).then_some(None)
-            });
-            match writer {
-                Some(Some(writer)) => writer,
-                _ => {
-                    let slice_id = self.dw_ctx.id_pool.get_id()?;
-                    slices.push_back(SliceWriter::new(
-                        self.dw_ctx.clone(),
-                        self.fw_ctx.clone(),
-                        self.idx,
-                        slice_id,
-                        coff,
-                    ));
-                    slices.back_mut().unwrap()
+                    let slice_range = CRange {
+                        off: w.coff as u64,
+                        len: w.size as u64,
+                    };
+                    let write_range = CRange {
+                        off: coff as u64,
+                        len: data.len() as u64,
+                    };
+                    slice_range.is_overlap(&write_range).then_some(None)
+                });
+                match writer {
+                    Some(Some(writer)) => (true, writer),
+                    _ => {
+                        slices.push_back(SliceWriter::new(
+                            self.dw_ctx.clone(),
+                            self.fw_ctx.clone(),
+                            id,
+                            self.idx,
+                            coff,
+                        ));
+                        (false, slices.back_mut().unwrap())
+                    }
                 }
-            }
+            };
+            slice_writer.write(coff - slice_writer.coff, data)?;
+            info!("chunkWriter({}) op write: start to unlock slices.", self.idx);
+            reuse.then_some(id)
         };
-        slice_writer.write(coff - slice_writer.coff, data)?;
+        if let Some(id) = reuse_id {
+            self.dw_ctx.ids.reuse(id);
+        }
         self.fw_ctx
             .ferr
             .get()
@@ -460,32 +443,46 @@ impl ChunkWriter {
             .unwrap_or(Ok(()))
     }
 
-    pub async fn flush(&mut self) {
+    pub async fn finish(mut self) {
         {
+            info!("chunkWriter({}) op flush: start to lock slices.", self.idx);
             let mut slices = self.slices.lock();
             for slice in slices.iter_mut() {
                 slice.flush();
             }
+            info!("chunkWriter({}) op flush: start to unlock slices.", self.idx);
         }
+        self.finished.store(true, Ordering::Relaxed);
         match self.commit_task.join_next().await {
             Some(Ok(_)) => (),
             Some(Err(e)) => {
-                error!("Commit thread error happend: {:?}", e);
+                error!(ino = %self.fw_ctx.ino, chunk = %self.idx, "Commit thread error happend: {:?}", e);
                 self.fw_ctx.init_err(Arc::new(VfsErrorEnum::EIO.into()));
             }
-            None => (),
+            None => {
+                warn!(
+                    ino = %self.fw_ctx.ino, 
+                    chunk = %self.idx,
+                    "Already finish, No commit task exist.",
+                );
+            }
         }
     }
 
     fn spawn_commit_finish(&mut self) {
         let slice = self.slices.clone();
+        let idx = self.idx;
+        let dw_ctx = self.dw_ctx.clone();
+        let fw_ctx = self.fw_ctx.clone();
+        let finished = self.finished.clone();
         self.commit_task.spawn(async move {
             loop {
-                let flusher = {
+                let sw = {
+                    info!("chunkWriter({}) op commit: start to lock slices.", idx);
                     let mut slices = slice.lock();
-                    slices
-                        .pop_front()
-                        .map(|w| {
+                    let w = slices.pop_front();
+                    match w {
+                        Some(w) => {
                             let is_timeout = w.start_time
                                 < Utc::now() - FLUSH_DURATION.checked_mul(2).expect("overflow");
                             let flush = w.freezed() || is_timeout;
@@ -495,13 +492,48 @@ impl ChunkWriter {
                                 slices.push_front(w);
                                 None
                             }
-                        })
-                        .flatten()
+                        }
+                        None => {
+                            if finished.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            None
+                        }
+                    }
                 };
-
-                match flusher {
-                    Some(flusher) => flusher.finish().await,
-                    None => sleep(std::time::Duration::from_millis(100)).await,
+                info!("chunkWriter({}) op commit: start to unlock slices.", idx);
+                match sw {
+                    Some(mut sw) => match sw.finish().await {
+                        Ok(_) => {
+                            info!("chunk slice {idx} commit write");
+                            let _ = dw_ctx
+                                .meta
+                                .write(
+                                    fw_ctx.ino,
+                                    sw.chunk_idx,
+                                    sw.coff,
+                                    Slice {
+                                        id: sw.slice_id,
+                                        size: sw.size,
+                                        off: 0,
+                                        len: sw.size,
+                                    },
+                                    sw.last_modify,
+                                )
+                                .await
+                                .inspect_err(|e| {
+                                    error!("Commit slice error: {:?}", e);
+                                })
+                                .map_err(|e| fw_ctx.init_err(Arc::new(e.into())));
+                        }
+                        Err(e) => {
+                            error!("Flush slice error: {:?}", e);
+                            fw_ctx.init_err(Arc::new(e));
+                        }
+                    },
+                    None => {
+                        sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
             }
         });
@@ -512,11 +544,11 @@ struct SliceWriter {
     dw_ctx: Arc<DataWriterCtx>,
     fw_ctx: Arc<FileWriterCtx>,
     chunk_idx: u32,
-    slice_id: u64,
     coff: u32,
     size: u32,
+    slice_id: u64,
     writer: Option<WSlice>,
-    flush_task: JoinSet<()>,
+    flush_task: JoinSet<Result<usize>>,
     last_modify: DateTime<Utc>,
     start_time: DateTime<Utc>,
 }
@@ -525,8 +557,8 @@ impl SliceWriter {
     pub fn new(
         dw_ctx: Arc<DataWriterCtx>,
         fw_ctx: Arc<FileWriterCtx>,
-        chunk_idx: u32,
         slice_id: u64,
+        chunk_idx: u32,
         coff: u32,
     ) -> Self {
         fw_ctx.slices_cnt.fetch_add(1, Ordering::Relaxed);
@@ -534,9 +566,9 @@ impl SliceWriter {
             dw_ctx: dw_ctx.clone(),
             fw_ctx,
             chunk_idx,
-            slice_id,
             coff,
             size: 0,
+            slice_id,
             writer: Some(dw_ctx.store.new_writer(slice_id)),
             flush_task: JoinSet::new(),
             last_modify: Utc::now(),
@@ -547,12 +579,13 @@ impl SliceWriter {
     pub fn write(&mut self, off: u32, data: Bytes) -> Result<()> {
         let writer = self.writer.as_mut().expect("write into freezed writer");
         let write_len = data.len() as u32;
+        info!("write: chunk: {} slice_id: {}, off: {} len: {}, datas: {:?}", self.chunk_idx, self.slice_id, off, write_len, data);
         writer
             .write_all_at(Buffer::from(data), off as usize)
-            .map_err(|e| {
-                error!("write: chunk: {} off: {} {}", self.slice_id, off, e);
-                VfsErrorEnum::EIO
-            })?;
+            .inspect_err(|e| {
+                error!("write: chunk: {} off: {} {}", self.chunk_idx, off, e);
+            })
+            .context(StorageSnafu { path: None })?;
         // because all slice is new slice, soff is always 0
         if off + write_len > self.size {
             self.size = off + write_len as u32;
@@ -575,43 +608,19 @@ impl SliceWriter {
             return;
         }
         let mut writer = self.writer.take().expect("flush freezed writer");
-        let fw_ctx = self.fw_ctx.clone();
-        let dw_ctx = self.dw_ctx.clone();
-        let slice_id = self.slice_id;
-        let chunk_idx = self.chunk_idx;
-        let coff = self.coff;
-        let size = self.size;
-        let last_modify = self.last_modify;
-
         self.flush_task.spawn(async move {
             match writer.finish().await {
-                Ok(written_size) => {
-                    if written_size != size as usize {
-                        error!("flush size non eq with write size");
-                        fw_ctx.init_err(Arc::new(VfsErrorEnum::EIO.into()));
-                    } else {
-                        let slice = Slice {
-                            id: slice_id,
-                            size: size,
-                            off: 0,
-                            len: size,
-                        };
-                        let _ = dw_ctx
-                            .meta
-                            .write(fw_ctx.ino, chunk_idx, coff, slice, last_modify)
-                            .await
-                            .inspect_err(|e| {
-                                error!("Write slice into meta node error: {:?}", e);
-                            })
-                            .map_err(|e| fw_ctx.init_err(Arc::new(e.into())));
-                    }
-                }
+                Ok(written_size) => Ok(written_size),
                 Err(e) => {
                     writer.abort().await;
                     error!("flush error: {:?}", e);
-                    let _ = fw_ctx.init_err(Arc::new(VfsErrorEnum::EIO.into()));
+                    Err(VfsErrorEnum::StorageError {
+                        source: e,
+                        path: None,
+                    }
+                    .into())
                 }
-            };
+            }
         });
     }
 
@@ -619,17 +628,22 @@ impl SliceWriter {
         self.writer.is_none()
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(&mut self) -> Result<()> {
         if !self.freezed() {
             self.flush();
         }
+        self.dw_ctx.meta.new_slice().await?;
         match self.flush_task.join_next().await {
-            Some(Ok(_)) => (),
-            Some(Err(e)) => {
-                error!("Flush thread error happend: {:?}", e);
-                self.fw_ctx.init_err(Arc::new(VfsErrorEnum::EIO.into()));
+            Some(Ok(Ok(written_size))) => {
+                if written_size != self.size as usize {
+                    whatever!("flush size non eq with write size");
+                } else {
+                    Ok(())
+                }
             }
-            None => (),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(e)) => whatever!("Flush thread error happen {e:?}"),
+            None => whatever!("No Flush Task exist!"),
         }
     }
 }

@@ -253,6 +253,9 @@ impl SliceReader for RSlice {
             if len == 0 {
                 return Ok(Bytes::new().into());
             }
+            if self.id == 0 {
+                return Ok(Buffer::from(vec![0; len]));
+            }
             if off >= self.length || off + len > self.length {
                 return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
             }
@@ -477,7 +480,7 @@ impl SliceWriter for WSlice {
     }
 
     async fn finish(&mut self) -> Result<usize> {
-        let n = (self.length - 1) / self.conf.max_block_size + 1;
+        let n = (self.length + self.conf.max_block_size - 1) / self.conf.max_block_size;
         self.spawn_flush_until(n * self.conf.max_block_size)?;
         while let Some(join_res) = self.pengind_upload_tasks.join_next().await {
             match join_res {

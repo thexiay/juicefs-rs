@@ -19,6 +19,7 @@ use crate::base::{
 use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
 use crate::error::Result;
+use crate::mem::MemEngine;
 use crate::quota::QuotaView;
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
@@ -645,7 +646,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     // InvalidateChunkCache invalidate chunk cache
     async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()>;
 
-    // CopyFileRange copies part of a file to another one.
+    /// CopyFileRange copies part of a file to another one.
+    ///
+    /// # Returns
+    /// 
+    /// return copied size and dst final length
     async fn copy_file_range(
         &self,
         fin: Ino,
@@ -654,7 +659,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         off_out: u64,
         size: u64,
         flags: u32,
-    ) -> Result<u64>;
+    ) -> Result<Option<(u64, u64)>>;
 
     // GetDirStat returns the space and inodes usage of a directory.
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
@@ -778,6 +783,9 @@ pub async fn new_client(uri: &str, conf: Config) -> Arc<dyn Meta> {
             RedisEngine::new(driver, addr, conf)
                 .await
                 .expect(&format!("Meta {uri} is not available")),
+        ),
+        "mem" => Arc::new(
+            MemEngine::new(conf),
         ),
         _ => panic!("unknown driver {driver}"),
     }

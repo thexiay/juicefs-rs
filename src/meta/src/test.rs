@@ -949,10 +949,11 @@ pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     .await
     .expect("write file");
     // cross three chunks
-    let copied = m
+    let (copied, _) = m
         .copy_file_range(src_ino, 150, dst_ino, 30 << 20, 200 << 20, 0)
         .await
-        .expect("copy file range");
+        .expect("copy file range")
+        .expect("copy happend");
     assert_eq!(copied, 200 << 20);
 
     let expected_slices = vec![

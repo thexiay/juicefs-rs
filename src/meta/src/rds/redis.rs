@@ -515,6 +515,7 @@ impl RedisHandle {
 
 /// Redis Engine with Context
 /// Context is independent execution context
+#[derive(Clone)]
 pub struct RedisEngine {
     engine: Arc<RedisHandle>,
     context: FsContext,
@@ -571,7 +572,7 @@ impl RedisEngine {
                 detail: "load scriptResolve",
             })?;
 
-        let meta = CommonMeta::new(addr, conf);
+        let meta = CommonMeta::new(conf);
         let chunk_re = Regex::new(&format!(r"{}c(\d+)_(\d+)", &prefix))
             .with_whatever_context::<_, String, MetaErrorEnum>(|err| {
                 format!("compile chunk regex: {}", err)
@@ -951,15 +952,6 @@ impl RedisEngine {
     }
 }
 
-impl Clone for RedisEngine {
-    fn clone(&self) -> Self {
-        RedisEngine {
-            engine: self.engine.clone(),
-            context: self.context.clone(),
-        }
-    }
-}
-
 #[async_trait]
 impl Engine for RedisEngine {
     async fn get_counter(&self, name: &str) -> Result<i64> {
@@ -1011,11 +1003,7 @@ impl Engine for RedisEngine {
             }
         })
     }
-
-    async fn update_stats(&self, space: i64, inodes: i64) {
-        self.meta.fs_stat.update_used_stats(space, inodes);
-    }
-
+    
     // redisMeta updates the usage in each transaction
     async fn flush_stats(&self) {}
 
@@ -2406,7 +2394,7 @@ impl Engine for RedisEngine {
             pipe.set(self.inode_key(inode), bincode::serialize(&attr).unwrap());
             match pipe.query_async(conn).await? {
                 Value::Nil => Ok(None),
-                _ => Ok(Some((Some(attr.atime), path)))
+                _ => Ok(Some((Some(attr.atime), path))),
             }
         })
     }
@@ -3094,9 +3082,13 @@ impl Engine for RedisEngine {
             match pipe.query_async(conn).await? {
                 Value::Nil => Ok(None),
                 Value::Array(res) => {
-                    ensure_whatever!(res.len() == 1, "invalid response length for write {:?}", res);
+                    ensure_whatever!(
+                        res.len() == 1,
+                        "invalid response length for write {:?}",
+                        res
+                    );
                     Ok(Some((from_redis_value::<u32>(&res[0])?, delta, attr)))
-                },
+                }
                 _ => whatever!("invalid response type"),
             }
         })
@@ -3224,8 +3216,7 @@ impl Engine for RedisEngine {
         dst_off: u64,
         len: u64,
         flags: u32,
-    ) -> Result<(u64, Option<(Ino, DirStat)>)> {
-        let base = AsRef::<CommonMeta>::as_ref(self);
+    ) -> Result<Option<(u64, u64, (Ino, DirStat))>> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         async_transaction!(conn, &[self.inode_key(src), self.inode_key(dst)], {
@@ -3254,7 +3245,7 @@ impl Engine for RedisEngine {
                 }
             );
             if src_off >= src_attr.length {
-                return Ok((0, None));
+                return Ok(None);
             }
 
             // dst
@@ -3372,7 +3363,11 @@ impl Engine for RedisEngine {
             }
             match pipe.query_async(conn).await? {
                 Value::Nil => Ok(None),
-                Value::Array(_) => Ok(Some((copy_size, Some((dst_attr.parent, delta))))),
+                Value::Array(_) => Ok(Some(Some((
+                    copy_size,
+                    dst_attr.length,
+                    (dst_attr.parent, delta),
+                )))),
                 _ => whatever!("invalid response type"),
             }
         })
@@ -3568,10 +3563,13 @@ impl Engine for RedisEngine {
         let exists = match p.query_async(&mut conn).await? {
             Value::Nil => whatever!("atomic exec fail because conflict"),
             Value::Array(res) => {
-                ensure_whatever!(res.len() == batch.keys().len(), "Invalid len for flush redis return list");
+                ensure_whatever!(
+                    res.len() == batch.keys().len(),
+                    "Invalid len for flush redis return list"
+                );
                 from_redis_value::<Vec<bool>>(&Value::Array(res))?
-            },
-            _ => whatever!("Invalid resopnse type")
+            }
+            _ => whatever!("Invalid resopnse type"),
         };
         let used_space_exists = batch
             .keys()

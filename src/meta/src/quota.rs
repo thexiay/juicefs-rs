@@ -97,7 +97,7 @@ pub(crate) trait MetaQuota {
     async fn get_dir_parent(&self, inode: Ino) -> Result<Ino>;
     fn update_dir_stats(&self, inode: Ino, length: i64, space: i64, inodes: i64);
     async fn update_parent_stats(&self, inode: Ino, parent: Ino, length: i64, space: i64);
-
+    async fn update_stats(&self, space: i64, inodes: i64);
     async fn calc_dir_stat(&self, ino: Ino) -> Result<DirStat>;
 
     /// check if the space and inodes exceed the quota limit for parents ino
@@ -181,6 +181,10 @@ where
                 }
             });
         }
+    }
+
+    async fn update_stats(&self, space: i64, inodes: i64) {
+        self.as_ref().fs_stat.update_used_stats(space, inodes);
     }
 
     async fn calc_dir_stat(&self, ino: Ino) -> Result<DirStat> {

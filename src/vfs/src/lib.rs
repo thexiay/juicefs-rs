@@ -5,6 +5,7 @@
 #![feature(assert_matches)]
 #![feature(once_cell_try_insert)]
 #![feature(duration_constructors)]
+#![feature(extend_one)]
 
 mod reader;
 mod writer;

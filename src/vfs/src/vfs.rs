@@ -21,12 +21,12 @@ use juice_meta::{
 use juice_storage::api::CachedStore;
 use nix::errno::Errno;
 use parking_lot::RwLock;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     config::Config,
     frange::Frange,
-    handle::{Fh, Handle, HandleInner},
+    handle::{Fh, Handle, HandleInner, HandleType},
     internal::{CONTROL_INODE, LOG_INODE},
     reader::DataReader,
     writer::DataWriter,
@@ -158,7 +158,7 @@ impl Vfs {
         })
     }
 
-    pub async fn truncate(&self, ino: Ino, size: u64, fh: Fh) -> Result<Attr, Errno> {
+    pub async fn truncate(&self, ino: Ino, fh: Fh, size: u64) -> Result<Attr, Errno> {
         if VfsInner::is_special_inode(ino) {
             return Err(Errno::EPERM);
         }
@@ -166,17 +166,16 @@ impl Vfs {
             return Err(Errno::EFBIG);
         }
 
-        // Lock all active handles
+        // Lock all active handles, but ops after this truncates will not be locked
         let mut hs = self.find_all_handle(ino);
         hs.sort_by_key(|h| h.fh());
         let mut locks = Vec::new();
         for h in hs.iter() {
             locks.push(h.write(true).await.ok_or(Errno::EINTR)?);
         }
-        self.writer.flush(ino).await.map_err(|e| {
-            error!("flush writer failed: {:?}", e);
-            e.fs_err()
-        })?;
+        let _ = self.writer.flush(ino).await.inspect_err(|e| {
+            info!("flush writer {ino} failed: {:?}, ignore.", e);
+        });
 
         let attr = if fh == 0 {
             self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
@@ -249,94 +248,93 @@ impl Vfs {
         }
     }
 
-    pub async fn copy_filerange(
+    pub async fn copy_file_range(
         &self,
         ino_in: Ino,
         fh_in: Fh,
         off_in: u64,
         ino_out: Ino,
         fh_out: Fh,
+        off_out: u64,
         size: u64,
         flags: u32,
     ) -> Result<u64, Errno> {
-        todo!()
-        /*
-                func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {
-            defer func() {
-                logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
-            }()
-            if IsSpecialNode(nodeIn) {
-                err = syscall.ENOTSUP
-                return
-            }
-            if IsSpecialNode(nodeOut) {
-                err = syscall.EPERM
-                return
-            }
-            hi := v.findHandle(nodeIn, fhIn)
-            if fhIn == 0 || hi == nil || hi.inode != nodeIn {
-                err = syscall.EBADF
-                return
-            }
-            ho := v.findHandle(nodeOut, fhOut)
-            if fhOut == 0 || ho == nil || ho.inode != nodeOut {
-                err = syscall.EBADF
-                return
-            }
-            if hi.reader == nil {
-                err = syscall.EBADF
-                return
-            }
-            if ho.writer == nil {
-                err = syscall.EACCES
-                return
-            }
-            if offIn >= maxFileSize || offIn+size >= maxFileSize || offOut >= maxFileSize || offOut+size >= maxFileSize {
-                err = syscall.EFBIG
-                return
-            }
-            if flags != 0 {
-                err = syscall.EINVAL
-                return
-            }
-            if nodeIn == nodeOut && (offIn <= offOut && offOut < offIn+size || offOut <= offIn && offIn < offOut+size) {
-                err = syscall.EINVAL // overlap
-                return
-            }
+        if VfsInner::is_special_inode(ino_in) {
+            return Err(Errno::ENOTSUP);
+        }
+        if VfsInner::is_special_inode(ino_out) {
+            return Err(Errno::EPERM);
+        }
 
-            if !ho.Wlock(ctx) {
-                err = syscall.EINTR
-                return
-            }
-            defer ho.Wunlock()
-            defer ho.removeOp(ctx)
-            if nodeIn != nodeOut {
-                if !hi.Rlock(ctx) {
-                    err = syscall.EINTR
-                    return
-                }
-                defer hi.Runlock()
-                defer hi.removeOp(ctx)
-            }
+        let hi = match self.find_handle(ino_in, fh_in) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        let ho = match self.find_handle(ino_out, fh_out) {
+            Some(h) => h,
+            None => return Err(Errno::EBADF),
+        };
+        if !hi.readable() {
+            return Err(Errno::EBADF);
+        }
+        if !ho.writable() {
+            return Err(Errno::EBADF);
+        }
+        if off_in >= MAX_FILE_LEN
+            || off_in + size >= MAX_FILE_LEN
+            || off_out >= MAX_FILE_LEN
+            || off_out + size >= MAX_FILE_LEN
+        {
+            return Err(Errno::EFBIG);
+        }
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if ino_in == ino_out
+            && (off_in <= off_out && off_out < off_in + size
+                || off_out <= off_in && off_in < off_out + size)
+        // overlap
+        {
+            return Err(Errno::EINVAL);
+        }
 
-            err = v.writer.Flush(ctx, nodeIn)
-            if err != 0 {
-                return
-            }
-            err = v.writer.Flush(ctx, nodeOut)
-            if err != 0 {
-                return
-            }
-            var length uint64
-            err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, size, flags, &copied, &length)
-            if err == 0 {
-                v.writer.Truncate(nodeOut, length)
-                v.reader.Invalidate(nodeOut, offOut, size)
-                v.invalidateAttr(nodeOut)
-            }
-            return
-        }s
-                 */
+        let ho = ho.write(true).await.ok_or(Errno::EINTR)?;
+        let hi = if ino_in != ino_out {
+            Some(hi.read(true).await.ok_or(Errno::EINTR)?)
+        } else {
+            None
+        };
+        self.writer.flush(ino_in).await.map_err(|e| {
+            error!("flush writer {ino_in} failed: {:?}", e);
+            e.fs_err()
+        })?;
+        self.writer.flush(ino_out).await.map_err(|e| {
+            error!("flush writer {ino_out} failed: {:?}", e);
+            e.fs_err()
+        })?;
+        if let Some((copied, length)) = self
+            .meta
+            .copy_file_range(ino_in, off_in, ino_out, off_out, size, flags)
+            .await
+            .map_err(|e| {
+                error!("copy_file_range failed: {:?}", e);
+                e.fs_err()
+            })?
+        {
+            self.writer.truncate(ino_out, length);
+            self.reader.invalidate(
+                ino_out,
+                Frange {
+                    off: off_out,
+                    len: copied,
+                },
+            );
+            let mut last_modified = self.last_modified.write();
+            last_modified.insert(ino_out, Utc::now());
+            Ok(copied)
+        } else {
+            Ok(0)
+        }
     }
 
     pub async fn mkdir(
@@ -648,7 +646,7 @@ impl Vfs {
                 })?;
                 let reader = h.reader();
                 let mut buf = BytesMut::with_capacity(size as usize);
-                let _ = reader.read(off, &mut buf).await.map_err(|e| {
+                let _ = reader.read(off, size, &mut buf).await.map_err(|e| {
                     error!("read failed: {:?}", e);
                     e.fs_err()
                 })?;
@@ -667,9 +665,11 @@ impl Vfs {
         if off >= MAX_FILE_LEN || off + data.len() as u64 >= MAX_FILE_LEN {
             return Err(Errno::EFBIG);
         }
+        if !h.writable() {
+            return Err(Errno::EBADF);
+        }
 
         if ino == CONTROL_INODE {
-            // 拼装消息并且处理控制节点的消息
             todo!()
         }
 

@@ -129,7 +129,6 @@ pub trait Engine: WithContext + Send + Sync + 'static {
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64>;
     // Set counter name to value if old <= value - diff.
     async fn set_if_small(&self, name: &str, value: Duration, diff: Duration) -> Result<bool>;
-    async fn update_stats(&self, space: i64, inodes: i64);
     async fn flush_stats(&self);
     async fn do_load(&self) -> Result<Option<Format>>;
     async fn do_new_session(&self, sid: u64, sinfo: &[u8], update: bool) -> Result<()>;
@@ -248,7 +247,7 @@ pub trait Engine: WithContext + Send + Sync + 'static {
         dst_off: u64,
         len: u64,
         flags: u32,
-    ) -> Result<(u64, Option<(Ino, DirStat)>)>;
+    ) -> Result<Option<(u64, u64, (Ino, DirStat))>>;
 
     async fn do_fallocate(
         &self,
@@ -391,7 +390,6 @@ pub trait MetaOtherFunction {
 }
 
 pub struct CommonMeta {
-    pub addr: String,
     root: AtomicU64,
     pub current_trash_dir: Mutex<Option<InternalNode>>,
     pub removed_files: Mutex<HashMap<Ino, bool>>,
@@ -427,7 +425,7 @@ pub struct CommonMeta {
 }
 
 impl CommonMeta {
-    pub fn new(addr: &str, conf: Config) -> Self {
+    pub fn new(conf: Config) -> Self {
         let deleting_slice_ctx = if conf.max_deletes_task > 0 {
             let (tx, rx) = async_channel::bounded(conf.max_deletes_task as usize * 10 * 1024);
             Some((tx, rx))
@@ -436,7 +434,6 @@ impl CommonMeta {
         };
         let open_files = OpenFiles2::new(conf.open_cache, conf.open_cache_limit);
         CommonMeta {
-            addr: addr.to_string(),
             root: AtomicU64::new(ROOT_INODE),
             current_trash_dir: Mutex::new(None),
             removed_files: Mutex::new(HashMap::new()),
@@ -2833,9 +2830,7 @@ where
         defer! {
             chunks.remove(&indx);
         };
-        let (num_slices, delta, attr) = self
-            .do_write(inode, indx, coff, slice, mtime)
-            .await?;
+        let (num_slices, delta, attr) = self.do_write(inode, indx, coff, slice, mtime).await?;
         self.update_parent_stats(inode, attr.parent, delta.length, delta.space)
             .await;
         if num_slices % 100 == 99 || num_slices > 350 {
@@ -2878,7 +2873,7 @@ where
         off_out: u64,
         size: u64,
         flags: u32,
-    ) -> Result<u64> {
+    ) -> Result<Option<(u64, u64)>> {
         let chunks = match self.as_ref().open_files.chunks(fout) {
             Some(chunks) => chunks,
             None => {
@@ -2893,14 +2888,16 @@ where
         defer! {
             chunks.clear();
         }
-        let (copy_size, delta) = self
+        if let Some((copy_size, dst_length, (delta_ino, delta_stat))) = self
             .do_copy_file_range(fin, off_in, fout, off_out, size, flags)
-            .await?;
-        if let Some((delta_ino, delta_stat)) = delta {
+            .await?
+        {
             self.update_parent_stats(fout, delta_ino, delta_stat.length, delta_stat.space)
-                .await;
+            .await;
+            Ok(Some((copy_size, dst_length)))
+        } else {
+            Ok(None)
         }
-        Ok(copy_size)
     }
 
     // GetDirStat returns the space and inodes usage of a directory.

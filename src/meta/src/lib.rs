@@ -16,6 +16,7 @@ pub mod context;
 pub mod quota;
 
 mod rds;
+mod mem;
 mod utils;
 mod base;
 mod slice;
