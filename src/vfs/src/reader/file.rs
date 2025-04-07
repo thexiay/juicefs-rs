@@ -82,9 +82,9 @@ impl FileReaderCore {
             self.readahead(last_frange);
         }
          */
-        
+
         // reuse before slice reader requests
-        let reqs = Self::prepare_slices(&mut self.chunk_readers, &frange, |mut range| {
+        let reqs = Self::prepare_slices(&mut self.chunk_readers, &frange, &mut |mut range| {
             let mut sub_reqs = Vec::new();
             while range.len > 0 {
                 sub_reqs.push(Self::new_slice(
@@ -184,13 +184,16 @@ impl FileReaderCore {
         }
     }
 
-    fn prepare_slices<C, T, F>(slices: &mut C, frange: &Frange, mut on_new_slice: F) -> Vec<T>
+    fn prepare_slices<C, T, F>(slices: &mut C, frange: &Frange, on_new_slice: &mut F) -> Vec<T>
     where
         for<'a> &'a C: IntoIterator<Item = &'a T>,
         C: Extend<T>,
         T: ReusableFRange,
         F: FnMut(Frange) -> Vec<T>,
     {
+        if frange.len == 0 {
+            return Vec::new();
+        }
         let mut range_points = vec![frange.off, frange.end()];
         fn contain(ranges: &[u64], p: u64) -> bool {
             ranges.iter().any(|i| *i == p)
@@ -492,9 +495,52 @@ mod test {
     use opendal::{services::Memory, Operator};
     use tracing_test::traced_test;
 
-    use crate::config::Config;
+    use crate::{
+        config::Config,
+        frange::Frange,
+        reader::{chunk::ReusableFRange, file::FileReaderCore},
+    };
 
     use super::DataReader;
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct TestFrange {
+        off: u64,
+        len: u64,
+        frange: Frange,
+    }
+
+    impl TestFrange {
+        fn new(frange: Frange) -> Self {
+            TestFrange {
+                off: 0,
+                len: frange.len,
+                frange,
+            }
+        }
+    }
+
+    impl ReusableFRange for TestFrange {
+        fn frange(&self) -> &Frange {
+            &self.frange
+        }
+
+        fn valid(&self) -> bool {
+            true
+        }
+
+        fn reuse(&self, frange: &Frange) -> Option<Self> {
+            if self.frange.is_include(&frange) {
+                Some(TestFrange {
+                    off: frange.off - self.frange.off,
+                    len: frange.len,
+                    frange: self.frange.clone(),
+                })
+            } else {
+                None
+            }
+        }
+    }
 
     async fn mock_reader() -> Arc<DataReader> {
         // meta
@@ -553,11 +599,38 @@ mod test {
     #[traced_test]
     #[tokio::test]
     async fn test_file_read_decompose() {
-        // 检测对于file中已经存在的chunks，进行一段新的读取，是否分割的ok
-        let reader = mock_reader().await;
-        let file_reader = reader.open(1, 100);
-        let mut file_core = file_reader.core.lock();
-        let reqs = file_core.into_chunks(0, 100).unwrap();
+        let mut on_slice_new = |frange: Frange| vec![TestFrange::new(frange)];
+        let mut slices = vec![
+            TestFrange::new((0..10).into()),
+            TestFrange::new((20..30).into()),
+        ];
+        // case1: overlap two slices
+        let reqs =
+            FileReaderCore::prepare_slices(&mut slices, &(5..25).into(), &mut on_slice_new);
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0], TestFrange {
+            off: 5,
+            len: 5,
+            frange: Frange { off: 0, len: 10 },
+        });
+        assert_eq!(reqs[1], TestFrange {
+            off: 0,
+            len: 10,
+            frange: Frange { off: 10, len: 10 },
+        });
+        assert_eq!(reqs[2], TestFrange {
+            off: 0,
+            len: 5,
+            frange: Frange { off: 20, len: 10 },
+        });
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0], TestFrange::new((0..10).into()));
+        assert_eq!(slices[1], TestFrange::new((20..30).into()));
+        assert_eq!(slices[2], TestFrange::new((10..20).into()));
+
+        // case2: empty reqs        
+        let reqs = FileReaderCore::prepare_slices(&mut slices, &(0..0).into(), &mut on_slice_new);
+        assert_eq!(reqs.len(), 0);
     }
 
     fn test_readahead() {}

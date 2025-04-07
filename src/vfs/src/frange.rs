@@ -1,10 +1,19 @@
-use std::cmp::{max, min};
+use std::{cmp::{max, min}, ops::Range};
 
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Frange {
     pub off: u64,
     pub len: u64,
+}
+
+impl From<Range<u64>> for Frange {
+    fn from(range: Range<u64>) -> Self {
+        Frange {
+            off: range.start,
+            len: range.end - range.start,
+        }
+    }
 }
 
 impl Frange {
