@@ -79,7 +79,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            cache_type: "memory".to_string(),
+            cache_type: "mem".to_string(),
             cache_dirs: vec![env::temp_dir().join("cache")],
             cache_file_mode: Permissions::from_mode(0o600),
             cache_size: 10 << 20, // 10MB
@@ -629,6 +629,10 @@ impl ChunkStore for CachedStore {
     fn set_update_limit(&self, upload: i64, download: i64) {
         todo!()
     }
+    
+    fn config(&self) -> &Config {
+        &self.conf
+    }
 }
 
 #[cfg(test)]
@@ -685,18 +689,17 @@ mod test {
         let mut writer = store.new_writer(1);
         let data = Buffer::from("hello world");
         writer.write_all_at(data.clone(), 0).expect("write failed");
-        let conf = Config::default();
-        let offset = conf.max_block_size - 3;
+        let offset = store.config().max_block_size - 3;
         writer
             .write_all_at(data.clone(), offset)
             .expect("write failed");
         writer
-            .spawn_flush_until(conf.max_block_size + 3)
+            .spawn_flush_until(store.config().max_block_size + 3)
             .expect("flush failed");
 
         let size = offset + data.len();
         assert_eq!(size, writer.finish().await.expect("finish failed"));
-
+        
         // read
         let reader = store.new_reader(1, size);
         let n = reader.read_at(6, 5).await.expect("read failed");
@@ -714,7 +717,7 @@ mod test {
         assert!(word.is_ok(), "word is not a valid utf8 string");
         assert_eq!(word.unwrap(), "hello world");
 
-        let b_size = conf.max_block_size / 2;
+        let b_size = store.config().max_block_size / 2;
         let mut join_set = JoinSet::new();
         for i in 2_u64..5 {
             let store_cloned = store.clone();
@@ -786,6 +789,20 @@ mod test {
         let store = new_cached_store(config, op).expect("create chunk store failed");
         test_store(store.clone()).await;
     }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_small_block() {
+        let op = new_op();
+        let dir = tempdir().unwrap();
+        let mut config = new_config();
+        config.cache_dirs = vec![dir.path().to_path_buf()];
+        config.max_block_size = 15;
+
+        let store = new_cached_store(config, op).expect("create chunk store failed");
+        test_store(store.clone()).await;
+    }
+
 
     #[traced_test]
     #[tokio::test]

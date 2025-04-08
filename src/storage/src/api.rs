@@ -89,6 +89,9 @@ pub trait ChunkStore: Send + Sync {
 
     /// Update rate limit
     fn set_update_limit(&self, upload: i64, download: i64);
+
+    /// Get config
+    fn config(&self) -> &Config;
 }
 
 pub fn new_chunk_store(config: Config, operator: Operator) -> Result<CachedStore> {
