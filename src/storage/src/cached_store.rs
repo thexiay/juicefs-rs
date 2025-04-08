@@ -296,7 +296,7 @@ impl SliceReader for RSlice {
             match self.cache_manager.get(&key).await {
                 Ok(Some(Either::Left(p))) => {
                     assert!(p.len() > b_off);
-                    return Ok(p.slice(b_off..min(len, p.len() - b_off)).into());
+                    return Ok(p.slice(b_off..min(b_off + len, p.len())).into());
                 }
                 Ok(Some(Either::Right(mut p))) => {
                     assert!(p.len() > b_off);
@@ -326,7 +326,8 @@ impl SliceReader for RSlice {
                         .await
                 })
                 .await?;
-            Ok(cache.slice(b_off..cache.len()).into())
+            assert!(cache.len() > b_off);
+            Ok(cache.slice(b_off..min(cache.len(), b_off + len)).into())
         }
     }
 }

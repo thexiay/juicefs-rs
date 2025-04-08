@@ -1,6 +1,7 @@
 use std::{future::Future, sync::Arc};
 
 use opendal::{Buffer, Operator};
+use tracing::info;
 
 pub use crate::cached_store::CachedStore;
 pub use crate::cached_store::Config;

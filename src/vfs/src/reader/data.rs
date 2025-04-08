@@ -96,6 +96,7 @@ impl DataReader {
     }
 
     /// Truncate file length
+    /// Purpose: Set file length.
     pub fn truncate(&self, inode: Ino, length: u64) {
         self.visit(inode, |fr| {
             let mut f = fr.lock();
@@ -112,9 +113,13 @@ impl DataReader {
     }
 
     /// Invalidate part of file range
+    /// Purpose: Write data to invalidate reading data.
     pub fn invalidate(&self, inode: Ino, frange: Frange) {
         self.visit(inode, |fr| {
             let mut f = fr.lock();
+            if frange.end() > f.length {
+                f.length = frange.end();
+            }
             f.visit(|cr| {
                 if frange.is_overlap(&cr.frange) {
                     cr.clone().invalid();

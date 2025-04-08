@@ -387,7 +387,7 @@ impl ChunkWriter {
     pub async fn write(&self, coff: u32, data: Bytes) -> Result<()> {
         let id = self.dw_ctx.ids.get().await?;
         let reuse_id = {
-            info!("chunkWriter({}) op write: start to lock slices.", self.idx);
+            // info!("chunkWriter({}) op write: start to lock slices.", self.idx);
             let mut slices = self.slices.lock();
             let (reuse, slice_writer) = {
                 let block_size = self.dw_ctx.block_size;
@@ -430,7 +430,7 @@ impl ChunkWriter {
                 }
             };
             slice_writer.write(coff - slice_writer.coff, data)?;
-            info!("chunkWriter({}) op write: start to unlock slices.", self.idx);
+            // info!("chunkWriter({}) op write: start to unlock slices.", self.idx);
             reuse.then_some(id)
         };
         if let Some(id) = reuse_id {
@@ -445,12 +445,12 @@ impl ChunkWriter {
 
     pub async fn finish(mut self) {
         {
-            info!("chunkWriter({}) op flush: start to lock slices.", self.idx);
+            // info!("chunkWriter({}) op flush: start to lock slices.", self.idx);
             let mut slices = self.slices.lock();
             for slice in slices.iter_mut() {
                 slice.flush();
             }
-            info!("chunkWriter({}) op flush: start to unlock slices.", self.idx);
+            // info!("chunkWriter({}) op flush: start to unlock slices.", self.idx);
         }
         self.finished.store(true, Ordering::Relaxed);
         match self.commit_task.join_next().await {
@@ -478,7 +478,7 @@ impl ChunkWriter {
         self.commit_task.spawn(async move {
             loop {
                 let sw = {
-                    info!("chunkWriter({}) op commit: start to lock slices.", idx);
+                    // info!("chunkWriter({}) op commit: start to lock slices.", idx);
                     let mut slices = slice.lock();
                     let w = slices.pop_front();
                     match w {
@@ -501,11 +501,10 @@ impl ChunkWriter {
                         }
                     }
                 };
-                info!("chunkWriter({}) op commit: start to unlock slices.", idx);
+                // info!("chunkWriter({}) op commit: start to unlock slices.", idx);
                 match sw {
                     Some(mut sw) => match sw.finish().await {
                         Ok(_) => {
-                            info!("chunk slice {idx} commit write");
                             let _ = dw_ctx
                                 .meta
                                 .write(
@@ -579,7 +578,6 @@ impl SliceWriter {
     pub fn write(&mut self, off: u32, data: Bytes) -> Result<()> {
         let writer = self.writer.as_mut().expect("write into freezed writer");
         let write_len = data.len() as u32;
-        info!("write: chunk: {} slice_id: {}, off: {} len: {}, datas: {:?}", self.chunk_idx, self.slice_id, off, write_len, data);
         writer
             .write_all_at(Buffer::from(data), off as usize)
             .inspect_err(|e| {

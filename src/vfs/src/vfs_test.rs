@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{ops::Index, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use juice_meta::{
@@ -6,14 +6,17 @@ use juice_meta::{
     config::{Config as MetaConfig, Format as MetaFormat},
 };
 use juice_storage::api::{new_chunk_store, Config as ChunkConfig};
-use nix::unistd::{getpid, getppid};
+use nix::{
+    errno::Errno,
+    unistd::{getpid, getppid},
+};
 use opendal::{services::Memory, Operator};
 use parking_lot::Mutex;
 use tokio::time::sleep;
 use tracing::info;
 use tracing_test::traced_test;
 
-use crate::{config::Config, vfs::Vfs};
+use crate::{config::Config, internal::STATS_INODE, vfs::Vfs};
 
 // TODO: fix it with mem object and mem meta. But at now only has redis meta.
 async fn new_vfs() -> Vfs {
@@ -68,22 +71,23 @@ async fn new_vfs() -> Vfs {
 async fn test_vfs_meta() {}
 
 #[traced_test]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_vfs_io() {
+    info!("1");
     let vfs = new_vfs().await;
-	
+
     let (fh, entry) = vfs
         .create(ROOT_INODE, "file", 0o755, 0, OFlag::O_RDWR)
         .await
         .expect("create file:");
-    vfs.fallocate(entry.inode, Falloc::NONE, 0, 64 << 10, fh)
+    vfs.fallocate(entry.inode, fh, Falloc::NONE, 0, 64 << 10)
         .await
         .expect("fallocate:");
-	
+
     vfs.write(entry.inode, fh, 0, Bytes::from_static(b"hello"))
         .await
         .expect("write file:");
-	
+
     vfs.fsync(entry.inode, fh).await.expect("fsync file:");
     vfs.write(entry.inode, fh, 100 << 20, Bytes::from_static(b"world"))
         .await
@@ -99,140 +103,208 @@ async fn test_vfs_io() {
         .expect("copy file range");
     assert_eq!(n, 10);
 
-	let buf = vfs.read(entry.inode, fh, 0, 128 << 10).await.expect("read file err");
-	assert_eq!(buf.len(), 128 << 10);  // head write
-	assert_eq!(&(buf.slice(0..5))[..], b"hello");
-    
-    let buf = vfs.read(entry.inode, fh, 10 << 20, 6).await.expect("read file end");
+    let buf = vfs
+        .read(entry.inode, fh, 0, 128 << 10)
+        .await
+        .expect("read file err");
+    assert_eq!(buf.len(), 128 << 10); // head write
+    assert_eq!(&(buf.slice(0..5))[..], b"hello");
+
+    let buf = vfs
+        .read(entry.inode, fh, 10 << 20, 6)
+        .await
+        .expect("read file end");
     assert_eq!(buf.len(), 6); // copyed range
     assert_eq!(&buf[..], b"hello\x00");
 
-    let buf = vfs.read(entry.inode, fh, 100 << 20, 128 << 10).await.expect("read file end");
-    assert_eq!(buf.len(), 2);  // truncated
- 	assert_eq!(&buf[..], b"wo");
+    let buf = vfs
+        .read(entry.inode, fh, 100 << 20, 128 << 10)
+        .await
+        .expect("read file end");
+    assert_eq!(buf.len(), 2); // truncated
+    assert_eq!(&buf[..], b"wo");
     vfs.flush(entry.inode, fh, 0).await.expect("flush file:");
-    
-    /*
+
     // edge cases
-    _, fh2, _ := v.Open(ctx, fe.Inode, syscall.O_RDONLY)
-    _, fh3, _ := v.Open(ctx, fe.Inode, syscall.O_WRONLY)
-    wHandle := v.findHandle(fe.Inode, fh3)
-    if wHandle == nil {
-        t.Fatalf("failed to find O_WRONLY handle")
+    let (fh2, _) = vfs
+        .open(entry.inode, OFlag::O_RDONLY)
+        .await
+        .expect("open file:");
+    let (fh3, _) = vfs
+        .open(entry.inode, OFlag::O_WRONLY)
+        .await
+        .expect("open file:");
+    let w_handle = vfs.find_handle(entry.inode, fh3);
+    if w_handle.is_none() {
+        panic!("failed to find O_WRONLY handle");
     }
-    wHandle.reader = nil
     // read
-    if _, e = v.Read(ctx, fe.Inode, nil, 0, 0); e != syscall.EBADF {
-        t.Fatalf("read bad fd: %s", e)
-    }
-    if _, e = v.Read(ctx, fe.Inode, make([]byte, 1024), 0, fh3); e != syscall.EBADF {
-        t.Fatalf("read write-only fd: %s", e)
-    }
-    if _, e = v.Read(ctx, fe.Inode, nil, 1<<60, fh2); e != syscall.EFBIG {
-        t.Fatalf("read off too big: %s", e)
-    }
+    assert_eq!(
+        vfs.read(entry.inode, 0, 0, 10).await.err(),
+        Some(Errno::EBADF),
+        "should 'invalid fh'"
+    );
+    assert_eq!(
+        vfs.read(entry.inode, fh2, 1 << 60, 10).await.err(),
+        Some(Errno::EFBIG),
+        "should 'overflow file len'"
+    );
     // write
-    if e = v.Write(ctx, fe.Inode, nil, 0, 0); e != syscall.EBADF {
-        t.Fatalf("write bad fd: %s", e)
-    }
-    if e = v.Write(ctx, fe.Inode, nil, 1<<60, fh2); e != syscall.EFBIG {
-        t.Fatalf("write off too big: %s", e)
-    }
-    if e = v.Write(ctx, fe.Inode, make([]byte, 1024), 0, fh2); e != syscall.EBADF {
-        t.Fatalf("write read-only fd: %s", e)
-    }
+    assert_eq!(
+        vfs.write(entry.inode, 0, 0, Bytes::new()).await.err(),
+        Some(Errno::EBADF),
+        "should 'invalid fh'"
+    );
+    assert_eq!(
+        vfs.write(entry.inode, fh2, 1 << 60, Bytes::new())
+            .await
+            .err(),
+        Some(Errno::EFBIG),
+        "should 'overflow file len'"
+    );
+    assert_eq!(
+        vfs.write(entry.inode, fh2, 0, Bytes::new()).await.err(),
+        Some(Errno::EBADF),
+        "should 'writes read-only fd'"
+    );
     // truncate
-    if e = v.Truncate(ctx, fe.Inode, -1, 0, &meta.Attr{}); e != syscall.EINVAL {
-        t.Fatalf("truncate invalid off,length: %s", e)
-    }
-    if e = v.Truncate(ctx, fe.Inode, 1<<60, 0, &meta.Attr{}); e != syscall.EFBIG {
-        t.Fatalf("truncate too large: %s", e)
-    }
+    assert_eq!(
+        vfs.truncate(entry.inode, fh2, 1 << 60).await.err(),
+        Some(Errno::EFBIG),
+        "should 'truncate overflow file len'"
+    );
     // fallocate
-    if e = v.Fallocate(ctx, fe.Inode, 0, -1, -1, fh); e != syscall.EINVAL {
-        t.Fatalf("fallocate invalid off,length: %s", e)
-    }
-    if e = v.Fallocate(ctx, statsInode, 0, 0, 1, fh); e != syscall.EPERM {
-        t.Fatalf("fallocate invalid off,length: %s", e)
-    }
-    if e = v.Fallocate(ctx, fe.Inode, 0, 0, 100, 0); e != syscall.EBADF {
-        t.Fatalf("fallocate invalid off,length: %s", e)
-    }
-    if e = v.Fallocate(ctx, fe.Inode, 0, 1<<60, 1<<60, fh); e != syscall.EFBIG {
-        t.Fatalf("fallocate invalid off,length: %s", e)
-    }
-    if e = v.Fallocate(ctx, fe.Inode, 0, 1<<10, 1<<20, fh2); e != syscall.EBADF {
-        t.Fatalf("fallocate read-only fd: %s", e)
-    }
-
-    // copy file range
-    if n, e := v.CopyFileRange(ctx, statsInode, fh, 0, fe.Inode, fh, 10<<20, 10, 0); e != syscall.ENOTSUP {
-        t.Fatalf("copyfilerange internal file: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, statsInode, fh, 10<<20, 10, 0); e != syscall.EPERM {
-        t.Fatalf("copyfilerange internal file: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, 0, 0, fe.Inode, fh, 10<<20, 10, 0); e != syscall.EBADF {
-        t.Fatalf("copyfilerange invalid fh: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, fe.Inode, 0, 10<<20, 10, 0); e != syscall.EBADF {
-        t.Fatalf("copyfilerange invalid fh: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, fe.Inode, fh, 10<<20, 10, 1); e != syscall.EINVAL {
-        t.Fatalf("copyfilerange invalid flag: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, fe.Inode, fh, 10<<20, 1<<50, 0); e != syscall.EINVAL {
-        t.Fatalf("copyfilerange overlap: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, fe.Inode, fh, 1<<63, 1<<63, 0); e != syscall.EFBIG {
-        t.Fatalf("copyfilerange too big file: %s %d", e, n)
-    }
-    if n, e := v.CopyFileRange(ctx, fe.Inode, fh, 0, fe.Inode, fh2, 1<<20, 1<<10, 0); e != syscall.EACCES {
-        t.Fatalf("copyfilerange too big file: %s %d", e, n)
-    }
-
+    assert_eq!(
+        vfs.fallocate(STATS_INODE, fh, Falloc::NONE, 0, 1)
+            .await
+            .err(),
+        Some(Errno::EPERM),
+        "should 'fallocate invalid off'"
+    );
+    assert_eq!(
+        vfs.fallocate(entry.inode, 0, Falloc::NONE, 0, 100)
+            .await
+            .err(),
+        Some(Errno::EBADF),
+        "should 'fallocate invalid fn'"
+    );
+    assert_eq!(
+        vfs.fallocate(entry.inode, fh, Falloc::NONE, 1 << 60, 1 << 60)
+            .await
+            .err(),
+        Some(Errno::EFBIG),
+        "should 'fallocate overflow file len'"
+    );
+    assert_eq!(
+        vfs.fallocate(entry.inode, fh2, Falloc::NONE, 1 << 10, 1 << 20)
+            .await
+            .err(),
+        Some(Errno::EBADF),
+        "should 'fallocate read-only fd'"
+    );
+    // copy file range 
+    assert_eq!(
+        vfs.copy_file_range(STATS_INODE, fh, 0, entry.inode, fh, 10 << 20, 10, 0)
+            .await
+            .err(),
+        Some(Errno::ENOTSUP),
+        "should 'copy file range from internal file is illigal'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, STATS_INODE, fh, 10 << 20, 10, 0)
+            .await
+            .err(),
+        Some(Errno::EPERM),
+        "should 'copy file range to internal file is illigal'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, 0, 0, entry.inode, fh, 10 << 20, 10, 0)
+            .await
+            .err(),
+        Some(Errno::EBADF),
+        "should 'copy file range from invalid fh'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, entry.inode, 0, 10 << 20, 10, 0)
+            .await
+            .err(),
+        Some(Errno::EBADF),
+        "should 'copy file range to invalid fh'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, entry.inode, fh, 10 << 20, 10, 1)
+            .await
+            .err(),
+        Some(Errno::EINVAL),
+        "should 'copy file range invalid flag'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, entry.inode, fh, 1 << 20, 1 << 50, 0)
+            .await
+            .err(),
+        Some(Errno::EINVAL),
+        "should 'copy file range overlap'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, entry.inode, fh, 1 << 63, 1 << 63, 0)
+            .await
+            .err(),
+        Some(Errno::EFBIG),
+        "should 'copy file range too big file'"
+    );
+    assert_eq!(
+        vfs.copy_file_range(entry.inode, fh, 0, entry.inode, fh2, 1 << 20, 1 << 10, 0)
+            .await
+            .err(),
+        Some(Errno::EBADF),
+        "should 'copy file range to read-only fd'"
+    );
+    info!("2");
     // sequntial write/read
-    for i := uint64(0); i < 1001; i++ {
-        if e := v.Write(ctx, fe.Inode, make([]byte, 128<<10), i*(128<<10), fh); e != 0 {
-            t.Fatalf("write big file: %s", e)
+    for i in 0..1001 {
+        if vfs
+            .write(entry.inode, fh, i * (128 << 10), Bytes::from(vec![1; 128 << 10]))
+            .await
+            .is_err()
+        {
+            panic!("write big file");
         }
     }
-    buf = make([]byte, 128<<10)
-    for i := uint64(0); i < 1000; i++ {
-        if n, e := v.Read(ctx, fe.Inode, buf, i*(128<<10), fh); e != 0 || n != (128<<10) {
-            t.Fatalf("read big file: %s", e)
-        } else {
-            for j := 0; j < 128<<10; j++ {
-                if buf[j] != 0 {
-                    t.Fatalf("read big file: %d %d", j, buf[j])
-                }
-            }
-        }
-    }
-    // many small write
-    buf = make([]byte, 5<<10)
-    for j := range buf {
-        buf[j] = 1
-    }
-    for i := int64(32 - 1); i >= 0; i-- {
-        if e := v.Write(ctx, fe.Inode, buf, uint64(i)*(4<<10), fh); e != 0 {
-            t.Fatalf("write big file: %s", e)
-        }
-    }
-    time.Sleep(time.Millisecond * 1500) // wait for it to be flushed
-    buf = make([]byte, 128<<10)
-    if n, e := v.Read(ctx, fe.Inode, buf, 0, fh); e != 0 || n != (128<<10) {
-        t.Fatalf("read big file: %s", e)
-    } else {
-        for j := range buf {
+    for i in 0..1000 {
+        let buf = vfs
+            .read(entry.inode, fh, i * (128 << 10), 128 << 10)
+            .await.expect("read big file");
+        for j in 0..(128 << 10) {
             if buf[j] != 1 {
-                t.Fatalf("read big file: %d %d", j, buf[j])
+                panic!("read big file: {} {}", j, buf[j]);
             }
         }
     }
-
-    v.Release(ctx, fe.Inode, fh)
-     */
+    info!("3");
+    
+    // many small write
+    for i in (0..=31).rev() {
+        if vfs
+            .write(entry.inode, fh, i * (4 << 10), Bytes::from(vec![2; 5 << 10]))
+            .await
+            .is_err()
+        {
+            panic!("write big file");
+        }
+    }
+    sleep(Duration::from_millis(1500)).await; // wait for it to be flushed
+    let buf = vfs
+        .read(entry.inode, fh, 0, 128 << 10)
+        .await
+        .expect("read big file");
+    assert_eq!(buf.len(), 128 << 10);
+    for j in 0..(128 << 10) {
+        if buf[j] != 2 {
+            panic!("read big file: {} {}", j, buf[j]);
+        }
+    }
+    info!("4");
+    vfs.release(entry.inode, fh).await.expect("release file:");
 }
 
 async fn test_vfs_xattr() {}

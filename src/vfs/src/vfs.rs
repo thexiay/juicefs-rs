@@ -200,10 +200,10 @@ impl Vfs {
     pub async fn fallocate(
         &self,
         ino: Ino,
+        fh: Fh,
         mode: Falloc,
         off: u64,
-        size: u64,
-        fh: Fh,
+        size: u64
     ) -> Result<(), Errno> {
         if VfsInner::is_special_inode(ino) {
             return Err(Errno::EPERM);
