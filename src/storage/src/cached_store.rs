@@ -803,7 +803,6 @@ mod test {
         test_store(store.clone()).await;
     }
 
-
     #[traced_test]
     #[tokio::test]
     async fn test_write_back_no_delay() {

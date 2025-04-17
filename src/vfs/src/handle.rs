@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use juice_meta::api::{Attr, Entry, Ino, InoExt, Meta, OFlag};
+use juice_meta::api::{Attr, Entry, Ino, InoExt, OFlag};
 use tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{

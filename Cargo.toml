@@ -1,7 +1,7 @@
 cargo-features = ["edition2024"]
 
 [workspace]
-members = ["src/test", "src/vfs", "src/meta", "src/storage", "src/utils"]
+members = ["src/test", "src/vfs", "src/meta", "src/storage", "src/utils", "src/fuse"]
 resolver = "2"
 
 [workspace.package]
@@ -63,3 +63,5 @@ futures-async-stream = "0.2.9"
 scopeguard = "1.2"
 async-channel = "2.3"
 console-subscriber = "0.4"
+fuse3 = { version = "0.8", features = ["tokio-runtime"] }
+trait-make = "0.1"

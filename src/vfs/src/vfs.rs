@@ -8,25 +8,26 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures::TryFutureExt;
-use futures_async_stream::{stream, try_stream};
+use futures_async_stream::try_stream;
 
 use juice_meta::{
     api::{
-        Attr, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, StatFs, MAX_FILE_LEN,
-        MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
+        Attr, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, SetAttrMask, StatFs,
+        MAX_FILE_LEN, MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
     },
     context::{FsContext, Gid, Uid, WithContext},
 };
 use juice_storage::api::CachedStore;
+use juice_utils::fs::{self, task_local};
 use nix::errno::Errno;
 use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::{
     config::Config,
     frange::Frange,
-    handle::{Fh, Handle, HandleInner, HandleType},
+    handle::{Fh, Handle, HandleInner},
     internal::{CONTROL_INODE, LOG_INODE},
     reader::DataReader,
     writer::DataWriter,
@@ -72,7 +73,7 @@ pub struct VfsInner {
     pub(crate) last_modified: RwLock<HashMap<Ino, DateTime<Utc>>>,
 }
 
-/// Here's the function of vfs:
+/// Here's the [`FileSystem`] function of vfs:
 /// 1. Interface calls that wrap metadata and data
 /// 2. Handle different inode:
 ///     - special control inode
@@ -107,11 +108,21 @@ impl Vfs {
         }
     }
 
-    pub async fn get_attr(&self, ino: Ino, opened: u8) -> Result<Entry, Errno> {
+    pub fn with_cancel(&self, token: CancellationToken) -> Self {
+        self.clone()
+    }
+
+    pub async fn get_attr(&self, ino: Ino) -> Result<Entry, Errno> {
         todo!()
     }
 
-    pub async fn set_attr(&self, ino: Ino, set: isize, fh: Fh, attr: Attr) -> Result<Entry, Errno> {
+    pub async fn set_attr(
+        &self,
+        ino: Ino,
+        mask: SetAttrMask,
+        fh: Option<Fh>,
+        attr: Attr,
+    ) -> Result<Entry, Errno> {
         todo!()
     }
 
@@ -131,7 +142,6 @@ impl Vfs {
         mode: u16,
         cumask: u16,
         rdev: u32,
-        path: &str,
     ) -> Result<Entry, Errno> {
         if parent == ROOT_INODE && self.is_special_node(name) {
             return Err(Errno::EEXIST);
@@ -141,9 +151,13 @@ impl Vfs {
             return Err(Errno::ENAMETOOLONG);
         }
 
+        if r#type == INodeType::Symlink {
+            return Err(Errno::EINVAL);
+        }
+
         let (ino, attr) = self
             .meta
-            .mknod(parent, name, r#type, mode, cumask, rdev, path)
+            .mknod(parent, name, r#type, mode, cumask, rdev, "")
             .await
             .map_err(|e| {
                 error!("mknod failed: {:?}", e);
@@ -159,7 +173,7 @@ impl Vfs {
     }
 
     pub async fn truncate(&self, ino: Ino, fh: Fh, size: u64) -> Result<Attr, Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             return Err(Errno::EPERM);
         }
         if size >= MAX_FILE_LEN {
@@ -203,9 +217,9 @@ impl Vfs {
         fh: Fh,
         mode: Falloc,
         off: u64,
-        size: u64
+        size: u64,
     ) -> Result<(), Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             return Err(Errno::EPERM);
         }
         if off >= MAX_FILE_LEN || off + size >= MAX_FILE_LEN {
@@ -259,10 +273,10 @@ impl Vfs {
         size: u64,
         flags: u32,
     ) -> Result<u64, Errno> {
-        if VfsInner::is_special_inode(ino_in) {
+        if self.is_special_inode(ino_in) {
             return Err(Errno::ENOTSUP);
         }
-        if VfsInner::is_special_inode(ino_out) {
+        if self.is_special_inode(ino_out) {
             return Err(Errno::EPERM);
         }
 
@@ -424,7 +438,7 @@ impl Vfs {
     }
 
     pub async fn open(&self, ino: Ino, flags: OFlag) -> Result<(Fh, Attr), Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             if ino != CONTROL_INODE && (flags & O_ACCMODE) != OFlag::O_RDONLY {
                 return Err(Errno::EACCES);
             }
@@ -478,7 +492,7 @@ impl Vfs {
 
     // force close handle
     pub async fn release(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             if ino == LOG_INODE {
                 // close access log
             }
@@ -499,8 +513,10 @@ impl Vfs {
                         e.fs_err()
                     })?;
                 }
-                let mut last_modified = self.last_modified.write();
-                last_modified.insert(ino, Utc::now());
+                {
+                    let mut last_modified = self.last_modified.write();
+                    last_modified.insert(ino, Utc::now());
+                }
                 if let Some(owner) = &h.posix_lock_owner() {
                     let _ = self
                         .meta
@@ -517,7 +533,7 @@ impl Vfs {
     }
 
     pub async fn flush(&self, ino: Ino, fh: Fh, lock_owner: u64) -> Result<(), Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             if ino == CONTROL_INODE {
                 // cancel all operations
             }
@@ -562,7 +578,7 @@ impl Vfs {
     }
 
     pub async fn fsync(&self, ino: Ino, fh: Fh) -> Result<(), Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             return Ok(());
         }
         let h = match self.find_handle(ino, fh) {
@@ -590,9 +606,10 @@ impl Vfs {
         Ok(())
     }
 
+    // returns `(offset, dir entry)`
     #[try_stream(boxed, ok = Entry, error = Errno)]
-    pub async fn readdir(&self, ino: Ino, fh: Fh, off: u64) {
-        let h = match self.find_handle(ino, fh) {
+    pub async fn readdir(&self, parent: Ino, fh: Fh, off: u64) {
+        let h = match self.find_handle(parent, fh) {
             Some(h) => h,
             None => return Err(Errno::EBADF),
         };
@@ -626,7 +643,7 @@ impl Vfs {
     }
 
     pub async fn read(&self, ino: Ino, fh: Fh, off: u64, size: u64) -> Result<Bytes, Errno> {
-        if VfsInner::is_special_inode(ino) {
+        if self.is_special_inode(ino) {
             todo!()
         }
         let h = match self.find_handle(ino, fh) {
@@ -700,10 +717,25 @@ impl Vfs {
     }
 }
 
-impl VfsInner {
+/// other functions
+impl Vfs {
+    pub fn config(&self) -> &Config {
+        &self.vfs.conf
+    }
+
+    pub fn modified_since(&self, ino: &Ino) -> bool {
+        match fs::task_local::start() {
+            Some(start) => match self.last_modified.read().get(ino) {
+                Some(modified) => *modified > start,
+                None => false,
+            },
+            None => return false,
+        }
+    }
+
     /// When the attr obtained from the metadata, it may not be the latest,
     /// and there is still unrefreshed data in memory.
-    fn update_len(&self, ino: Ino, attr: &mut Attr) {
+    pub fn update_len(&self, ino: Ino, attr: &mut Attr) {
         if attr.full && attr.typ == INodeType::File {
             let length = self.writer.len(ino);
             if length > attr.length {

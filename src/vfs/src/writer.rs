@@ -505,6 +505,7 @@ impl ChunkWriter {
                 match sw {
                     Some(mut sw) => match sw.finish().await {
                         Ok(_) => {
+                            info!("chunk slice {idx} commit write");
                             let _ = dw_ctx
                                 .meta
                                 .write(

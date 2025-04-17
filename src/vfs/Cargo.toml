@@ -12,6 +12,7 @@ repository = { workspace = true }
 [dependencies]
 juice-meta = { path = "../meta" }
 juice-storage = { path = "../storage" }
+juice-utils = { path = "../utils" }
 chrono = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }

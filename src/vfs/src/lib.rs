@@ -17,5 +17,7 @@ mod vfs;
 mod handle;
 mod internal;
 
+pub use vfs::Vfs;
+
 #[cfg(test)]
 mod vfs_test;

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +22,7 @@ pub struct FsContext {
     gids: Vec<Gid>,
     token: CancellationToken,
     check_permission: bool,
+    start: DateTime<Utc>,
 }
 
 pub trait WithContext: DynClone {
@@ -48,7 +50,7 @@ pub trait WithContext: DynClone {
 
 impl<T> WithContext for T
 where
-    T: AsMut<FsContext> + AsRef<FsContext> + DynClone,
+    T: AsMut<FsContext> + AsRef<FsContext> + Clone,
 {
     fn with_login(&mut self, uid: u32, gids: Vec<u32>) {
         assert!(gids.len() > 0);

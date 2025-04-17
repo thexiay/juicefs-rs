@@ -11,3 +11,5 @@ repository = { workspace = true }
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }

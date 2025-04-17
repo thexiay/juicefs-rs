@@ -90,6 +90,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-notify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db96c36382f56ea91e5d012c4c7170046c7731449daa46655cbcabc594c8bee6"
+dependencies = [
+ "event-listener 4.0.3",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -662,6 +673,17 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67b215c49b2b248c855fb73579eb1f4f26c38ffdc12973e20e07b91d78d5646e"
+dependencies = [
+ "concurrent-queue",
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener"
 version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3492acde4c3fc54c845eaab3eed8bd00c7a7d881f78bfc801e43a93dec1331ae"
@@ -677,7 +699,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c3e4e0dd3673c1139bf041f3008816d9cf2946bbfac2945c09e523b8d7b05b2"
 dependencies = [
- "event-listener",
+ "event-listener 5.4.0",
  "pin-project-lite",
 ]
 
@@ -716,6 +738,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13624c2627564efccf4934284bdd98cbaa14e79b0b5a141218e507b3a823456"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fuse3"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "335dd07e2826edad49c2599ed8151c394d39d2f8efd62c07183816904414ac5c"
+dependencies = [
+ "async-notify",
+ "bincode",
+ "bytes",
+ "futures-channel",
+ "futures-util",
+ "libc",
+ "nix",
+ "serde",
+ "slab",
+ "tokio",
+ "tracing",
+ "trait-make",
 ]
 
 [[package]]
@@ -1249,6 +1291,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "juice-fuse"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "dashmap 6.1.0",
+ "fuse3",
+ "futures",
+ "futures-async-stream",
+ "juice-meta",
+ "juice-utils",
+ "juice-vfs",
+ "libc",
+ "nix",
+ "tokio",
+ "tokio-util",
+ "trait-make",
+]
+
+[[package]]
 name = "juice-meta"
 version = "0.1.0"
 dependencies = [
@@ -1333,7 +1394,9 @@ dependencies = [
 name = "juice-utils"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1352,6 +1415,7 @@ dependencies = [
  "futures-async-stream",
  "juice-meta",
  "juice-storage",
+ "juice-utils",
  "nix",
  "opendal",
  "parking_lot",
@@ -2740,6 +2804,17 @@ version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
 dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "trait-make"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cbd06a7b648f1603e60d75d9ed295d096b340d30e9f9324f4b512b5d40cd92"
+dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]

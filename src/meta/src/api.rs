@@ -66,6 +66,7 @@ pub enum INodeType {
     #[default]
     File = 1, // type for regular file
     Directory = 2, // type for directory
+    // TODO: Symlink bind with path, mode is ignored
     Symlink = 3,   // type for symlink
     FIFO = 4,      // type for FIFO node
     BlockDev = 5,  // type for block device
@@ -785,7 +786,7 @@ pub async fn new_client(uri: &str, conf: Config) -> Arc<dyn Meta> {
                 .expect(&format!("Meta {uri} is not available")),
         ),
         "mem" => Arc::new(
-            MemEngine::new(conf),
+            MemEngine::new(conf)
         ),
         _ => panic!("unknown driver {driver}"),
     }

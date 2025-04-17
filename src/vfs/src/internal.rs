@@ -18,7 +18,7 @@ impl VfsInner {
         }
     }
 
-    pub fn is_special_inode(ino: Ino) -> bool {
+    pub fn is_special_inode(&self, ino: Ino) -> bool {
         ino >= MIN_INTERNAL_NODE
     }
 }
