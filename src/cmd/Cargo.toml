@@ -1,0 +1,33 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "juice-cmd"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+juice-fuse = { path = "../fuse"}
+juice-vfs = { path = "../vfs" }
+juice-meta = { path = "../meta" }
+juice-storage = { path = "../storage" }
+juice-utils = { path = "../utils" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+humantime = { workspace = true }
+humansize = { workspace = true }
+nix = { workspace = true }
+dirs = { workspace = true }
+regex = { workspace = true }
+snafu = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opendal = { workspace = true }
+bytes = { workspace = true }
+fuse3 = { workspace = true }

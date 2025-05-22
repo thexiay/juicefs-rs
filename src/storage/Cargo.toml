@@ -1,0 +1,46 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "juice-storage"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+juice-utils = { path = "../utils" }
+snafu = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+opendal = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+governor = { workspace = true }
+hashring = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+either = { workspace = true }
+crc32fast = { workspace = true }
+nix = { workspace = true }
+walkdir = { workspace = true }
+uuid = { workspace = true }
+humansize = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+assert_matches = { workspace = true }
+tracing-test = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "bench_cache_store_read"
+harness = false

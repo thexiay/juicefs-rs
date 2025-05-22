@@ -1,17 +1,20 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::{
     align_4k,
     api::{
         Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice,
-        Summary, XattrF, ROOT_INODE,
+        Summary, XattrF, CHUNK_SIZE, ROOT_INODE,
     },
     base::{CommonMeta, Engine},
     config::Format,
     quota::{MetaQuota, QuotaView},
 };
-use std::time::UNIX_EPOCH;
-use tokio::time::{self, sleep};
+use chrono::Utc;
+use tokio::{
+    task::JoinSet,
+    time::{self, sleep},
+};
 use tracing::info;
 
 pub fn test_format() -> Format {
@@ -282,17 +285,17 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .await;
     assert!(rs.unwrap_err().is_entry_exists(&ROOT_INODE, "f"));
     // test rename with replace
-    let before_stat = m.stat_fs(ROOT_INODE).await.unwrap();
+    let before_stat_fs = m.stat_fs(ROOT_INODE).await.unwrap();
     let renamed_entry = m
         .rename(ROOT_INODE, "f2", ROOT_INODE, "f", RenameMask::empty())
         .await
         .expect("rename f2 -> f: ");
     assert!(renamed_entry.is_some());
-    let after_stat = m.stat_fs(ROOT_INODE).await.unwrap();
-    assert_eq!(before_stat.2 - after_stat.2, 1); // used inode decr 1
+    let after_stat_fs = m.stat_fs(ROOT_INODE).await.unwrap();
+    assert_eq!(before_stat_fs.i_used - after_stat_fs.i_used, 1); // used inode decr 1
     assert_eq!(
         // avaiable space incr attr length
-        (after_stat.1 - before_stat.1) as i64,
+        (after_stat_fs.space_avail - before_stat_fs.space_avail) as i64,
         align_4k(renamed_entry.unwrap().1.length)
     );
     // test rename with exchange
@@ -393,7 +396,6 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     assert!(err.is_no_entry_found2(&99999), "got {:?}", err);
 
     let _ = m.open(inode, OFlag::O_RDWR).await.expect("open f: ");
-    m.close(inode).await.expect("close f: ");
     let slice_id = m.new_slice().await.expect("new slice: ");
     m.write(
         inode,
@@ -405,9 +407,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             off: 0,
             len: 100,
         },
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards"),
+        Utc::now(),
     )
     .await
     .expect("write f: ");
@@ -451,6 +451,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .fallocate(inode, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 0, 0)
         .await;
     assert!(rs.as_ref().unwrap_err().is_invalid_arg(), "got {:?}", rs);
+    let _ = m.open(parent, OFlag::O_RDWR).await.expect("open f: ");
     let rs = m
         .fallocate(parent, Falloc::PUNCH_HOLE.union(Falloc::KEEP_SIZE), 100, 50)
         .await;
@@ -459,6 +460,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         "got {:?}",
         rs
     );
+    m.close(parent).await.expect("close f: ");
 
     let slices = m.read(inode, 0).await.expect("read chunk: ");
     assert_eq!(slices.len(), 3);
@@ -466,6 +468,7 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     assert_eq!(slices[1].len, 50);
     assert_eq!(slices[2].id, slice_id);
     assert_eq!(slices[2].len, 50);
+    m.close(inode).await.expect("close f: ");
 
     // xattr
     m.set_xattr(
@@ -517,21 +520,21 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .expect("setxattr: ");
 
     // ----------------------------------------- test quota -----------------------------------------
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 50);
-    assert_eq!(iavail, 10 << 20);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 50);
+    assert_eq!(stat_fs.i_avail, 10 << 20);
     let mut new_format = format.as_ref().clone();
     new_format.capacity = 1 << 20;
     new_format.inodes = 100;
     m.init(new_format, false).await.expect("set quota failed");
     // test async flush quota task
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    if totalspace != 1 << 20 || iavail != 97 {
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    if stat_fs.space_total != 1 << 20 || stat_fs.i_avail != 97 {
         // only tree inodes are used
         time::sleep(Duration::from_millis(100)).await;
-        let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-        assert_eq!(totalspace, 1 << 20);
-        assert_eq!(iavail, 97);
+        let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+        assert_eq!(stat_fs.space_total, 1 << 20);
+        assert_eq!(stat_fs.i_avail, 97);
     }
     // test StatFS with subdir and quota
     let (sub_ino, sub_attr) = m
@@ -540,16 +543,16 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .expect("mkdir subdir: ");
     info!("sub_no {sub_ino}");
     m.chroot("subdir").await.expect("chroot: ");
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 20);
-    assert_eq!(iavail, 96); // used 4 inodes
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 20);
+    assert_eq!(stat_fs.i_avail, 96); // used 4 inodes
 
     m.handle_quota(QuotaOp::Set(QuotaView::default()), ".", false, false)
         .await
         .expect("set quota: ");
-    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, (1 << 20) - 4 * align_4k(0) as u64);
-    assert_eq!(i_avail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, (1 << 20) - 4 * align_4k(0) as u64);
+    assert_eq!(stat_fs.i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -563,9 +566,9 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, i_avail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(i_avail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 96);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -579,9 +582,12 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, (1 << 20) as u64 - 4 * align_4k(0) as u64);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(
+        stat_fs.space_total,
+        (1 << 20) as u64 - 4 * align_4k(0) as u64
+    );
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.handle_quota(
         QuotaOp::Set(QuotaView {
@@ -595,18 +601,18 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     )
     .await
     .expect("set quota: ");
-    let (total_space, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.get_base().chroot(ROOT_INODE);
-    let (totalspace, _, _, iavail) = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 20);
-    assert_eq!(iavail, 96);
+    let stat_fs = m.stat_fs(ROOT_INODE).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 20);
+    assert_eq!(stat_fs.i_avail, 96);
     // statfs subdir directly
-    let (totalspace, _, _, iavail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(totalspace, 1 << 10);
-    assert_eq!(iavail, 10);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.i_avail, 10);
 
     // mock flush quota cache into persist layer
     m.load_quotas().await;
@@ -614,14 +620,14 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         let mut dir_quotas = m.as_ref().dir_quotas.write();
         dir_quotas
             .entry(sub_ino)
-            .and_modify(|quota| quota.update(4 << 10, 15));  // test used space > total space
+            .and_modify(|quota| quota.update(4 << 10, 15)); // test used space > total space
     }
     m.flush_quotas().await;
-    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(total_space, 4 << 10);
-    assert_eq!(avail_space, 0);
-    assert_eq!(i_used, 15);
-    assert_eq!(i_avail, 0);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 4 << 10);
+    assert_eq!(stat_fs.space_avail, 0);
+    assert_eq!(stat_fs.i_used, 15);
+    assert_eq!(stat_fs.i_avail, 0);
     {
         let mut dir_quotas = m.as_ref().dir_quotas.write();
         dir_quotas
@@ -629,11 +635,11 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             .and_modify(|quota| quota.update(-8 << 10, -20)); // invalid used space
     }
     m.flush_quotas().await;
-    let (total_space, avail_space, i_used, i_avail) = m.stat_fs(sub_ino).await.expect("statfs: ");
-    assert_eq!(total_space, 1 << 10);
-    assert_eq!(avail_space, 1 << 10);
-    assert_eq!(i_used, 0);
-    assert_eq!(i_avail, 10);
+    let stat_fs = m.stat_fs(sub_ino).await.expect("statfs: ");
+    assert_eq!(stat_fs.space_total, 1 << 10);
+    assert_eq!(stat_fs.space_avail, 1 << 10);
+    assert_eq!(stat_fs.i_used, 0);
+    assert_eq!(stat_fs.i_avail, 10);
 
     m.rmdir(ROOT_INODE, "subdir", false)
         .await
@@ -677,32 +683,40 @@ pub async fn test_meta_client(m: &mut (impl Engine + AsRef<CommonMeta>)) {
             dirs: 0
         }
     );
-    m.unlink(ROOT_INODE, "f", false)
-        .await
-        .expect("unlink f3: ");
+    m.unlink(ROOT_INODE, "f", false).await.expect("unlink f3: ");
     m.unlink(ROOT_INODE, "f3", false)
         .await
         .expect("unlink f3: ");
-    
-    sleep(Duration::from_millis(100)).await;  // wait for delete
-    
-    let rs = m.read(inode, 0).await;
-    assert!(rs.as_ref().unwrap_err().is_no_entry_found2(&inode), "got {:?}", rs);
 
-    info!("4444");
+    sleep(Duration::from_millis(100)).await; // wait for delete
+
+    // 这里unlink后ROOT/f理论上不应该存在这个了，但是读取到缓存数据了，从而导致错误的信息
+    let rs = m.read(inode, 0).await;
+    assert!(
+        rs.as_ref().unwrap_err().is_no_entry_found2(&inode),
+        "got {:?}",
+        rs
+    );
+
     // release resource
     m.rmdir(ROOT_INODE, "d", false).await.expect("rmdir d: ");
-
 }
 
 pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>)) {
-    let mut format = m.load(false).await.unwrap().as_ref().clone();
+    let mut format = test_format();
     format.capacity = 0;
     m.init(format, false).await.unwrap();
 
-    m.unlink(1, "f", false).await.expect("unlink f: ");
-    let (inode, attr) = m
-        .create(1, "f", 0650, 022, OFlag::empty())
+    let _ = m.open(ROOT_INODE, OFlag::O_RDONLY).await.expect("open /: ");
+    let res = m.truncate(ROOT_INODE, 0, 4 << 10, false).await;
+    m.close(ROOT_INODE).await.expect("close /: ");
+    assert!(
+        res.as_ref().unwrap_err().is_op_not_permitted(),
+        "got {:?}",
+        res
+    );
+    let (inode, _) = m
+        .create(ROOT_INODE, "f", 0650, 022, OFlag::empty())
         .await
         .expect("create file: {}");
     let slice_id = m.new_slice().await.expect("new chunk: ");
@@ -716,9 +730,7 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
             off: 0,
             len: 100,
         },
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards"),
+        Utc::now(),
     )
     .await
     .expect("write file: ");
@@ -728,7 +740,7 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
     m.truncate(inode, 0, (10 << 40) + 10, false)
         .await
         .expect("truncate file: ");
-    let attr = m
+    let _attr = m
         .truncate(inode, 0, (300 << 20) + 10, false)
         .await
         .expect("truncate file: ");
@@ -755,8 +767,6 @@ pub async fn test_truncate_and_delete(m: &mut (impl Engine + AsRef<CommonMeta>))
     if total_slices > 1 {
         panic!("number of slices: {} > 0, {:?}", total_slices, slices);
     }
-
-    m.unlink(1, "f", false).await.expect("unlink f:")
 }
 
 pub async fn test_trash(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
@@ -775,7 +785,7 @@ pub async fn test_remove(m: &mut (impl Engine + AsRef<CommonMeta>)) {
         .mkdir(parent, "d2", 0755, 0, 0)
         .await
         .expect("create d/d2: ");
-    let (inode, attr) = m
+    let (inode, _) = m
         .create(parent, "f", 0644, 0, OFlag::empty())
         .await
         .expect("create d/f: ");
@@ -810,15 +820,257 @@ async fn test_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
 async fn test_list_locks(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_concurrent_write(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
+    let (inode, _) = m
+        .create(ROOT_INODE, "f", 0o644, 0o22, OFlag::empty())
+        .await
+        .expect("create file");
+    let mut task_set = JoinSet::new();
+    for indx in 0..=10 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            for _ in 0..100 {
+                let slice_id = m.new_slice().await.expect("new slice");
+                m.write(
+                    inode,
+                    indx,
+                    0,
+                    Slice {
+                        id: slice_id,
+                        size: 100,
+                        off: 0,
+                        len: 100,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .expect("write file");
+            }
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("write file");
+    }
+
+    for indx in 0..=10 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            for j in 0..1000 {
+                let slice_id = m.new_slice().await.expect("new slice");
+                m.write(
+                    inode,
+                    indx,
+                    200 * j,
+                    Slice {
+                        id: slice_id,
+                        size: 100,
+                        off: 0,
+                        len: 100,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .expect("write file");
+            }
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("write file");
+    }
+}
 
 async fn test_compaction<M: Meta>(m: M, flag: bool) {}
 
-async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
+    let (src_ino, _) = m
+        .create(ROOT_INODE, "fin", 0o644, 0o22, OFlag::empty())
+        .await
+        .expect("create file");
+    let (dst_ino, _) = m
+        .create(ROOT_INODE, "fout", 0o644, 0o22, OFlag::empty())
+        .await
+        .expect("create file");
+    m.write(
+        src_ino,
+        0,
+        100,
+        Slice {
+            id: 10,
+            size: 200,
+            off: 0,
+            len: 100,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        src_ino,
+        1,
+        100 << 10,
+        Slice {
+            id: 11,
+            size: 40 << 20,
+            off: 0,
+            len: 40 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        src_ino,
+        3,
+        0,
+        Slice {
+            id: 12,
+            size: 63 << 20,
+            off: 10 << 20,
+            len: 30 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    m.write(
+        dst_ino,
+        2,
+        10 << 20,
+        Slice {
+            id: 13,
+            size: 50 << 20,
+            off: 10 << 20,
+            len: 30 << 20,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("write file");
+    // cross three chunks
+    let (copied, _) = m
+        .copy_file_range(src_ino, 150, dst_ino, 30 << 20, 200 << 20, 0)
+        .await
+        .expect("copy file range")
+        .expect("copy happend");
+    assert_eq!(copied, 200 << 20);
 
-async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+    let expected_slices = vec![
+        vec![
+            (0, 30 << 20, 0, 30 << 20).into(),
+            (10, 200, 50, 50).into(),
+            (0, 0, 200, CHUNK_SIZE as u32 - (30 << 20) - 50).into(),
+        ],
+        vec![
+            (
+                0,
+                0,
+                150 + (CHUNK_SIZE as u32 - (30 << 20)),
+                (30 << 20) - 150,
+            )
+                .into(),
+            (0, 0, 0, 100 << 10).into(),
+            (11, 40 << 20, 0, (34 << 20) + 150 - (100 << 10)).into(),
+        ],
+        vec![
+            (
+                11,
+                40 << 20,
+                (34 << 20) + 150 - (100 << 10),
+                (6 << 20) - 150 + (100 << 10),
+            )
+                .into(),
+            (
+                0,
+                0,
+                (40 << 20) + (100 << 10),
+                CHUNK_SIZE as u32 - (40 << 20) - (100 << 10),
+            )
+                .into(),
+            (0, 0, 0, 150 + (CHUNK_SIZE as u32 - (30 << 20))).into(),
+        ],
+        vec![
+            (
+                0,
+                0,
+                150 + (CHUNK_SIZE as u32 - (30 << 20)),
+                (30 << 20) - 150,
+            )
+                .into(),
+            (12, 63 << 20, 10 << 20, (8 << 20) + 150).into(),
+        ],
+    ];
+    for i in 0..4_usize {
+        let slices = m.read(dst_ino, i as u32).await.expect("read chunk");
+        println!("slices: {:?}", slices);
+        assert_eq!(
+            slices.len(),
+            expected_slices[i].len(),
+            "expect slices len not equal in chunk {i}"
+        );
+        for j in 0..slices.len() {
+            assert_eq!(
+                slices[j], expected_slices[i][j],
+                "expect slice equal in chunk {i} slice {j}"
+            );
+        }
+    }
+}
 
-async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
+
+}
+
+pub async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
+    let mut task_set = JoinSet::new();
+    for i in 0..100 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            let (d1, _) = match m.mkdir(ROOT_INODE, "d1", 0o640, 0o22, 0).await {
+                Ok(res) => res,
+                Err(e) => {
+                    assert!(e.is_entry_exists(&ROOT_INODE, "d1"), "{e}");
+                    m.lookup(ROOT_INODE, "d1", true).await.expect("lookup d1")
+                }
+            };
+
+            let (d2, _) = match m.mkdir(ROOT_INODE, "d2", 0o640, 0o22, 0).await {
+                Ok(res) => res,
+                Err(e) => {
+                    assert!(e.is_entry_exists(&ROOT_INODE, "d2"), "e");
+                    m.lookup(ROOT_INODE, "d2", true).await.expect("lookup d2")
+                }
+            };
+            let name = format!("file{i}");
+            m.create(d1, &name, 0o644, 0, OFlag::empty())
+                .await
+                .expect(&format!("create d1/{name}"));
+            m.rename(d1, &name, d2, &name, RenameMask::empty())
+                .await
+                .expect(&format!("rename d1/{name} -> d2/{name}"));
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("concurrent dir");
+    }
+
+    for i in 0..100 {
+        let m = m.clone();
+        let _ = task_set.spawn(async move {
+            let (d2, _) = m.lookup(ROOT_INODE, "d2", true).await.expect("lookup d2");
+            let name = format!("file{i}");
+            m.unlink(d2, &name, false).await.expect(&format!("unlink d2/{name}"));
+            if let Err(e) = m.rmdir(ROOT_INODE, "d1", false).await {
+                assert!(e.is_dir_not_empty(&ROOT_INODE, "d1") || e.is_no_entry_found(&ROOT_INODE, "d1"));
+            }
+            if let Err(e) = m.rmdir(ROOT_INODE, "d2", false).await {
+                assert!(e.is_dir_not_empty(&ROOT_INODE, "d2") || e.is_no_entry_found(&ROOT_INODE, "d2"));
+            }
+        });
+    }
+    while let Some(res) = task_set.join_next().await {
+        res.expect("concurrent dir");
+    }
+}
 
 async fn test_attr_flags(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 

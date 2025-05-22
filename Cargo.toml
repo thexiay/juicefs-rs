@@ -1,16 +1,20 @@
+cargo-features = ["edition2024"]
+
 [workspace]
 members = [
-    "src/test",
+    "src/test", 
     "src/vfs",
     "src/meta", 
-    "src/object",
-    "src/utils",
+    "src/storage", 
+    "src/utils", 
+    "src/fuse",
+    "src/cmd",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/thexiay/juicefs-rs"
 keywords = ["filesystem", "cloud-storage", "object-storage"]
 license = "Apache-2.0"
@@ -18,16 +22,22 @@ repository = "https://github.com/thexiay/juicefs-rs"
 
 [workspace.dependencies]
 libc = "0.2"
-snafu = { version = "0.8.4", features = ["backtrace"]}
+snafu = { version = "0.8.4", features = ["backtrace"] }
 async-trait = "0.1"
 bytes = "1.7"
 chrono = "0.4"
-redis = { version = "0.27", features = ["script", "aio", "tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = [
+    "script",
+    "aio",
+    "tokio-comp",
+    "connection-manager",
+] }
 deadpool = { version = "0.12", features = ["rt_tokio_1", "managed"] }
 deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time"] }
+tracing-test = "0.2.5"
 tokio = { version = "1.40", features = ["full"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tokio-util = "0.7"
@@ -43,6 +53,33 @@ bitflags = "1.3"
 futures = "0.3"
 crc32fast = "1.4"
 rand = "0.8"
-uuid = "1.11"
+uuid = { version = "1.11", features = [ "serde", "v4" ] }
 dyn-clone = "1"
-nix = { version = "0.29", features = ["fs"] }
+nix = { version = "0.29", features = ["fs", "process", "user"] }
+opendal = { version = "0.50", features = ["default", "services-fs", "services-cos"] }
+governor = { version = "0.6.0", features = ["std"] }
+hashring = "0.3"
+dashmap = "6.1"
+either = "1.11"
+tempfile = "3"
+assert_matches = "1"
+walkdir = "2"
+criterion = { version = "0.5", features = ["async_futures", "async_tokio"] }
+humansize = "2"
+humantime = "2"
+async-stream = "0.3.5"
+futures-async-stream = "0.2.9"
+scopeguard = "1.2"
+async-channel = "2.3"
+console-subscriber = "0.4"
+console = { version = "0.15" }
+fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+trait-make = "0.1"
+clap = { version = "4", features = ["cargo", "derive", "env"] }
+dirs = "6"
+await-tree = "0.2.1"
+rlimit = "0.10"
+rustls = { version = "0.23.5", features = ["ring"] }
+thiserror-ext = { version = "0.2.1", features = ["backtrace"] }
+pprof = { version = "0.14", features = ["flamegraph"] }
+anyhow = "1"

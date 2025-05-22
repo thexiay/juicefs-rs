@@ -1,0 +1,25 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "juice-fuse"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+juice-vfs = { path = "../vfs" }
+juice-meta = { path = "../meta" }
+juice-utils = { path = "../utils" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+fuse3 = { workspace = true }
+trait-make = { workspace = true }
+libc = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+nix = { workspace = true }
+futures-async-stream = { workspace = true }

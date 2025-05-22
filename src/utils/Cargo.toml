@@ -1,3 +1,5 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "juice-utils"
 version = { workspace = true }
@@ -9,3 +11,23 @@ repository = { workspace = true }
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+either = { workspace = true }
+console-subscriber = { workspace = true }
+console = { workspace = true }
+nix = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+await-tree = { workspace = true }
+rlimit = { workspace = true }
+rustls = { workspace = true }
+parking_lot = { workspace = true }
+thiserror-ext = { workspace = true }
+pprof = { workspace = true }
+serde = { workspace = true }
+clap = { workspace = true }
+snafu = { workspace = true }

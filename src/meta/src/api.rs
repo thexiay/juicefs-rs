@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::ops::{Add, AddAssign, BitAnd};
-use std::sync::atomic::AtomicU64;
+use std::ops::AddAssign;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bitflags::bitflags;
+use chrono::{DateTime, Utc};
 use dyn_clone::clone_trait_object;
 use juice_utils::process::Bar;
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,9 @@ use crate::base::{
 };
 use crate::config::{Config, Format};
 use crate::context::{Gid, Uid, WithContext};
-use crate::error::{DriverSnafu, Result};
-use crate::quota::{Quota, QuotaView};
+use crate::error::Result;
+use crate::mem::MemEngine;
+use crate::quota::QuotaView;
 use crate::rds::RedisEngine;
 use crate::utils::{FLockItem, PLockItem, PlockRecord};
 
@@ -29,6 +31,7 @@ pub const TRASH_INODE: Ino = 0x7FFFFFFF10000000; // larger than vfs.minInternalN
 pub const TRASH_NAME: &str = ".Trash";
 // ChunkSize is size of a chunk
 pub const CHUNK_SIZE: u64 = 1 << 26; // ChunkSize is size of a chunk, default 64M
+pub const MAX_FILE_LEN: u64 = CHUNK_SIZE << 31; // MaxFileLength is the max length of a file.
 pub const MAX_VERSION: i32 = 1; // MaxVersion is the max of supported versions.
 pub const MAX_FILE_NAME_LEN: usize = 255; // MaxNameLen is the max length of a name.
 
@@ -64,6 +67,7 @@ pub enum INodeType {
     #[default]
     File = 1, // type for regular file
     Directory = 2, // type for directory
+    // TODO: Symlink bind with path, mode is ignored
     Symlink = 3,   // type for symlink
     FIFO = 4,      // type for FIFO node
     BlockDev = 5,  // type for block device
@@ -81,13 +85,35 @@ pub enum QuotaOp {
 }
 
 // Entry is an entry inside a directory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub inode: Ino,
     pub name: String,
     pub attr: Attr,
 }
 
+/* 
+   |----------------------chunk1---------------------|
+   |------|--refs slice--|---------------------------|
+   |------|--------------|---------------------------|
+   |	  ↑              ↑                           |
+   |     coff          cend                          |
+   |      ↑              ↑                           |
+   |      |<----len----->|                           |
+   |-------------------------------------------------|
+                ↘
+                  ↘
+                    ↘
+                    off           end
+                    ↑              ↑
+                    |<----len----->|
+   |----------------------chunk2---------------------|
+   |------|-----------raw slice-----------|----------|
+   |	  ↑                               ↑          |
+   |   slice_coff                       slice_cend   |
+   |      |<----------------size--------->|          |
+   |-------------------------------------------------|
+*/
 /// Slice is a continuous write in a chunk
 /// Multiple slices could be combined together as a chunk.
 /// One slice can only in one chunk.
@@ -95,13 +121,26 @@ pub struct Entry {
 pub struct Slice {
     // slice id
     pub id: u64,
-    // slice total length
+    // slice total length, do not know the start position in chunk
     pub size: u32,
-    // valid data offsite
+    // valid data offset in slice(not in chunk)
     pub off: u32,
     // valid data length
-    // actually not all data in slice is valid, not [off, off+len] is valid data
+    // actually not all data in slice is valid, only `slice_array[off:off+len]` is valid data
     pub len: u32,
+}
+
+impl Slice {
+    pub fn is_hole(&self) -> bool {
+        self.id == 0
+    }
+}
+
+#[cfg(test)]
+impl From<(u64, u32, u32, u32)> for Slice {
+    fn from((id, size, off, len): (u64, u32, u32, u32)) -> Self {
+        Slice { id, size, off, len }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -140,7 +179,7 @@ pub struct SessionInfo {
     pub version: String,
     pub host_name: String,
     pub ip_addrs: Vec<IpAddr>,
-    pub mount_point: String,
+    pub mount_point: PathBuf,
     pub mount_time: SystemTime,
     pub process_id: u32,
 }
@@ -218,6 +257,7 @@ bitflags! {
     }
 
     pub struct Falloc: u8 {
+        const NONE = 0;
         const KEEP_SIZE = 1 << 0;
         const PUNCH_HOLE = 1 << 1;
         // const NO_HODE_STALE = 1 << 2;  RESERVED
@@ -231,7 +271,15 @@ bitflags! {
         const CREATE = 1 << 0;
         const REPLACE = 1 << 1;
     }
+
+    pub struct Fcntl: u8 {
+        const F_RDLCK = 0 << 0;
+        const F_WRLCK = 1 << 0;
+        const F_UNLCK = 1 << 1;
+    }
 }
+
+pub const O_ACCMODE: OFlag = OFlag::O_WRONLY.union(OFlag::O_RDWR);
 
 // Attr represents attributes of a node.
 #[derive(Default, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -254,6 +302,14 @@ pub struct Attr {
     pub default_acl: AclId, // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
+#[derive(Default, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatFs {
+    pub space_total: u64,
+    pub space_avail: u64,
+    pub i_used: u64,
+    pub i_avail: u64,
+}
+
 // Meta is a interface for a meta service for file system.
 #[async_trait]
 pub trait Meta: WithContext + Send + Sync + 'static {
@@ -273,10 +329,12 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// use juice_meta::api::Meta;
     /// use juice_meta::api::new_client;
     /// use juice_meta::config::Config;
-    ///
-    /// let meta = new_client("redis://localhost:6379".to_string(), Config::default()).unwrap();
-    /// let format = Format::default();
-    /// meta.init(format, false).await;
+    /// use juice_meta::format::Format;
+    /// 
+    /// if let Ok(meta) = new_client("redis://localhost:6379".to_string(), Config::default()) {
+    ///     let format = Format::default();    
+    ///     meta.init(format, false).await;
+    /// }
     /// ```
     async fn init(&self, format: Format, force: bool) -> Result<()>;
 
@@ -381,7 +439,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ///
     /// * `(u64, u64, u64, u64)` - total space, available space, used inodes, available inodes
     ///    total space is the total size of the inode.
-    async fn stat_fs(&self, inode: Ino) -> Result<(u64, u64, u64, u64)>;
+    async fn stat_fs(&self, inode: Ino) -> Result<StatFs>;
 
     // Access checks the current user can access (mode)permission on given inode.
     async fn access(&self, inode: Ino, mode_mask: ModeMask, attr: &Attr) -> Result<()>;
@@ -565,6 +623,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     async fn close(&self, inode: Ino) -> Result<()>;
 
     // Read returns the list of slices on the given chunk.
+    // All returned slices valid range continuously fills the entire chunk range
     async fn read(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>>;
 
     // NewSlice returns an id for new slice.
@@ -576,22 +635,26 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ///
     /// * `inode` - inode of the file
     /// * `indx` - index of the chunk
-    /// * `off` - offset of the chunk
+    /// * `coff` - offset of the chunk
     /// * `slice` - slice description
     /// * `mtime` - modified time
     async fn write(
         &self,
         inode: Ino,
         indx: u32,
-        off: u32,
+        coff: u32,
         slice: Slice,
-        mtime: Duration,
+        mtime: DateTime<Utc>,
     ) -> Result<()>;
 
     // InvalidateChunkCache invalidate chunk cache
     async fn invalidate_chunk_cache(&self, inode: Ino, indx: u32) -> Result<()>;
 
-    // CopyFileRange copies part of a file to another one.
+    /// CopyFileRange copies part of a file to another one.
+    ///
+    /// # Returns
+    /// 
+    /// return copied size and dst final length
     async fn copy_file_range(
         &self,
         fin: Ino,
@@ -600,9 +663,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         off_out: u64,
         size: u64,
         flags: u32,
-        copied: &u64,
-        out_length: &u64,
-    ) -> Result<()>;
+    ) -> Result<Option<(u64, u64)>>;
 
     // GetDirStat returns the space and inodes usage of a directory.
     async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat>;
@@ -639,7 +700,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         inode: Ino,
         owner: u64,
         block: bool,
-        ltype: u32,
+        ltype: Fcntl,
         start: u64,
         end: u64,
         pid: u32,
@@ -657,7 +718,11 @@ pub trait Meta: WithContext + Send + Sync + 'static {
         post_func: Box<dyn Fn() + Send>,
     ) -> Result<()>;
 
-    // ListSlices returns all slices used by all files.
+    /// ListSlices returns all slices used by all files.
+    ///
+    /// # Arguments
+    /// * `delete` - if true, it will clean useless slices
+    /// * `show_progress` - show progress
     async fn list_slices(
         &self,
         delete: bool,
@@ -707,21 +772,24 @@ pub trait Meta: WithContext + Send + Sync + 'static {
 clone_trait_object!(Meta);
 
 // NewClient creates a Meta client for given uri.
-pub async fn new_client(uri: String, conf: Config) -> Box<dyn Meta> {
+pub async fn new_client(uri: &str, conf: Config) -> Arc<dyn Meta> {
     let uri = if !uri.contains("://") {
         format!("redis://{}", uri)
     } else {
-        uri
+        uri.to_string()
     };
     let (driver, addr) = match uri.find("://") {
         Some(p) => (&uri[..p], &uri[p + 3..]),
         None => panic!("invalid uri {}", uri),
     };
     match driver {
-        "redis" => Box::new(
+        "redis" => Arc::new(
             RedisEngine::new(driver, addr, conf)
                 .await
                 .expect(&format!("Meta {uri} is not available")),
+        ),
+        "mem" => Arc::new(
+            MemEngine::new(conf)
         ),
         _ => panic!("unknown driver {driver}"),
     }

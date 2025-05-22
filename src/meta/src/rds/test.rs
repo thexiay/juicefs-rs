@@ -2,13 +2,13 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock,
+        Arc,
     },
     time::Duration,
 };
 
 use crate::{
-    api::{new_client, Meta},
+    api::Meta,
     config::Config,
     rds::RedisEngine,
 };
@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_test::traced_test;
 
 use crate::test as base_test;
 
@@ -28,6 +29,7 @@ fn before_all() {
     let mut guard = REDIS_DB_HOLDER.write();
     *guard = Some(RedisDbOffer::new(16));
     // init logger
+    /*
     let default_timer = OffsetTime::local_rfc_3339().unwrap_or_else(|e| {
         println!(
             "failed to get local time offset, falling back to UTC: {}",
@@ -45,6 +47,7 @@ fn before_all() {
         .with_file(true)
         .with_line_number(true);
     tracing_subscriber::registry().with(fmt_layer).init();
+     */
 }
 
 #[dtor]
@@ -84,30 +87,32 @@ impl RedisDbOffer {
         }
     }
 
-    async fn take(&self, config: Config) -> (RedisEngine, RedisDbHodler) {
+    async fn take(&self, config: Config) -> RedisDbHodler {
         loop {
             for i in 0..self.db_nums {
-                let client = RedisEngine::new(&self.driver, &self.addr, config.clone())
+                let db_addr = format!("{}/{}", self.addr, i);
+                let client = RedisEngine::new(&self.driver, &db_addr, config.clone())
                     .await
                     .unwrap();
                 let (refs, inited) = &self.db_used[&i];
-                if inited
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
+                if let Ok(false) =
+                    refs.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 {
-                    // only init once, first reset it.
-                    info!("Init redis db{i}: {}://{}", self.driver, self.addr);
-                    client.reset().await.expect("clean up db error");
-                    client.init(test_format(), true).await.unwrap();
-                }
+                    if let Ok(false) =
+                        inited.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    {
+                        // only init once, first reset it.
+                        info!("Init redis url: {}://{}", self.driver, db_addr);
+                        client.reset().await.expect("clean up db error");
+                        client.init(test_format(), true).await.unwrap();
+                    }
 
-                if refs
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    info!("Use redis db{i}: {}://{}", self.driver, self.addr);
+                    info!("Use redis url: {}://{}", self.driver, db_addr);
                     client.load(true).await.unwrap();
-                    return (client, RedisDbHodler(refs.clone()));
+                    return RedisDbHodler {
+                        engine: client,
+                        refs: refs.clone(),
+                    };
                 }
             }
             info!("could not find avaiable db, wait 2 seconds");
@@ -116,38 +121,43 @@ impl RedisDbOffer {
     }
 }
 
-struct RedisDbHodler(Arc<AtomicBool>);
+struct RedisDbHodler {
+    refs: Arc<AtomicBool>,
+    engine: RedisEngine,
+}
 
 impl Drop for RedisDbHodler {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.refs.store(false, Ordering::SeqCst);
     }
 }
 
+#[traced_test]
 #[tokio::test]
 async fn test_meta_client() {
     let guard = REDIS_DB_HOLDER.read();
-    let (mut meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
-    base_test::test_meta_client(&mut meta).await;
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_meta_client(&mut holder.engine).await;
 }
 
+#[traced_test]
 #[tokio::test]
 async fn test_truncate_and_delete() {
     let guard = REDIS_DB_HOLDER.read();
-    let (mut meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
-    base_test::test_truncate_and_delete(&mut meta).await;
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_truncate_and_delete(&mut holder.engine).await;
 }
 
 async fn test_trash() {}
 
 async fn test_parents() {}
 
-// TODO: wrap them with macro
+#[traced_test]
 #[tokio::test]
 async fn test_remove() {
     let guard = REDIS_DB_HOLDER.read();
-    let (mut meta, _) = guard.as_ref().unwrap().take(Config::default()).await;
-    base_test::test_remove(&mut meta).await;
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_remove(&mut holder.engine).await;
 }
 
 async fn test_resolve() {}
@@ -158,15 +168,33 @@ async fn test_locks() {}
 
 async fn test_list_locks() {}
 
-async fn test_concurrent_write() {}
+#[traced_test]
+#[tokio::test]
+async fn test_concurrent_write() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_concurrent_write(&mut holder.engine).await;
+}
 
 async fn test_compaction<M: Meta>(meta: M, flag: bool) {}
 
-async fn test_copy_file_range() {}
+#[traced_test]
+#[tokio::test]
+async fn test_copy_file_range() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_copy_file_range(&mut holder.engine).await;
+}
 
 async fn test_close_session() {}
 
-async fn test_concurrent_dir() {}
+#[traced_test]
+#[tokio::test]
+async fn test_concurrent_dir() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_concurrent_dir(&mut holder.engine).await;
+}
 
 async fn test_attr_flags() {}
 
