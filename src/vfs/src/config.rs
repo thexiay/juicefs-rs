@@ -49,11 +49,13 @@ pub struct BackupMeta {
     pub skip_trash: bool,
 }
 
+
 pub struct Config {
-    pub meta: Arc<MetaConfig>,
+    // TODO: meta, format, chunk is redundant, we can remove them late, we only use part of it.
+    pub meta: MetaConfig,
     pub format: MetaFormat,
-    pub chunk: Arc<ChunkConfig>,
-    pub port: Option<Arc<Port>>,
+    pub chunk: ChunkConfig,
+    pub port: Option<Port>,
     pub version: String,
     pub attr_timeout: Option<Duration>,
     pub dir_entry_timeout: Option<Duration>,

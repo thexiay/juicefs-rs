@@ -10,6 +10,7 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [dependencies]
+juice-utils = { path = "../utils" }
 snafu = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -31,6 +32,7 @@ nix = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }
 humansize = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

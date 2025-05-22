@@ -1,13 +1,14 @@
 use std::{future::Future, sync::Arc};
 
+use juice_utils::common::meta::StorageType;
+use opendal::services::{Cos, Fs, Memory};
 use opendal::{Buffer, Operator};
-use tracing::info;
 
 pub use crate::cached_store::CachedStore;
 pub use crate::cached_store::Config;
 pub use crate::cached_store::RSlice;
 pub use crate::cached_store::WSlice;
-use crate::{error::Result, uploader::NormalUploader};
+use crate::error::Result;
 
 pub trait SliceWriter: Send + Sync {
     fn id(&self) -> u64;
@@ -20,7 +21,7 @@ pub trait SliceWriter: Send + Sync {
     fn write_all_at(&mut self, buffer: Buffer, off: usize) -> Result<()>;
 
     /// Flush data from `0..offset`(Relative to slice writen before) in slice into storage
-    /// 
+    ///
     /// [`offset`]: offset in slice
     fn spawn_flush_until(&mut self, offset: usize) -> Result<()>;
 
@@ -94,9 +95,33 @@ pub trait ChunkStore: Send + Sync {
     fn config(&self) -> &Config;
 }
 
-pub fn new_chunk_store(config: Config, operator: Operator) -> Result<CachedStore> {
+pub fn new_chunk_store(
+    config: Config,
+    operator: Operator,
+) -> Result<CachedStore> {
     let operator = Arc::new(operator);
     let cache_store = CachedStore::new(operator, config)?;
     Ok(cache_store)
     // todo: add switch disk cache manager to mem cache manager
+}
+
+pub fn new_operator(
+    storage: StorageType,
+    bucket: &str,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<Operator> {
+    match storage {
+        StorageType::Mem => Ok(Operator::new(Memory::default())?.finish()),
+        StorageType::File => Ok(Operator::new(Fs::default())?.finish()),
+        StorageType::Cos => Ok(Operator::new(
+            Cos::default()
+                .bucket(bucket)
+                .endpoint(endpoint)
+                .secret_id(access_key)
+                .secret_key(secret_key),
+        )?
+        .finish()),
+    }
 }

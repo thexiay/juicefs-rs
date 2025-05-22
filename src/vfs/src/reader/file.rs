@@ -490,7 +490,8 @@ mod test {
         api::new_client,
         config::{Config as MetaConfig, Format as MetaFormat},
     };
-    use juice_storage::api::{new_chunk_store, Config as ChunkConfig};
+    use juice_storage::{api::{new_chunk_store, Config as ChunkConfig}, CacheType};
+    use juice_utils::common::meta::StorageType;
     use nix::unistd::{getpid, getppid};
     use opendal::{services::Memory, Operator};
     use tracing_test::traced_test;
@@ -548,8 +549,8 @@ mod test {
         let meta = new_client("redis://:mypassword@127.0.0.1:6379", meta_conf.clone()).await;
         let format = MetaFormat {
             name: "test".to_string(),
-            storage: "redis".to_string(),
-            page_size: 4096,
+            storage: StorageType::default(),
+            block_size_kb: 4096,
             enable_dir_stats: true,
             ..Default::default()
         };
@@ -558,8 +559,8 @@ mod test {
 
         // chunk
         let chunk_conf = ChunkConfig {
-            cache_type: "mem".to_string(),
-            max_block_size: format.page_size as usize * 1024,
+            cache_type: CacheType::Memory,
+            max_block_size: format.block_size_kb as usize * 1024,
             max_upload: 2,
             buffer_size: 30 << 20,
             cache_size: 10 << 20,
@@ -571,8 +572,8 @@ mod test {
             .finish();
         let store = Arc::new(new_chunk_store(chunk_conf.clone(), operator).expect("store init: "));
         let config = Config {
-            meta: Arc::new(meta_conf),
-            chunk: Arc::new(chunk_conf),
+            meta: meta_conf,
+            chunk: chunk_conf,
             format,
             version: "Juicefs".to_string(),
             pid: getpid().as_raw(),

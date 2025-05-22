@@ -21,6 +21,7 @@ use either::Either;
 use futures::{stream, StreamExt, TryFutureExt};
 use hashring::HashRing;
 use humansize::{format_size, format_size_i};
+use juice_utils::common::storage::ChecksumLevel;
 use nix::sys::stat::stat;
 use opendal::{Buffer, Operator};
 use parking_lot::{Mutex, RwLock};
@@ -40,7 +41,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    buffer::{checksum, ChecksumLevel, FileBuffer},
+    buffer::{checksum, FileBuffer},
     cache::{CacheCntAndSize, CacheKey},
     cached_store::Config,
     error::{Result, StorageErrorEnum},

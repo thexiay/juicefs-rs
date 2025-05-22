@@ -16,3 +16,6 @@ mod pre_fetcher;
 mod single_flight;
 mod uploader;
 mod utils;
+
+pub use cached_store::CacheType;
+pub use cached_store::Config;

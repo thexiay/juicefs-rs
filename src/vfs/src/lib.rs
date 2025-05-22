@@ -11,11 +11,11 @@ mod reader;
 mod writer;
 mod error;
 mod arena;
-mod config;
 mod frange;
 mod vfs;
 mod handle;
 mod internal;
+pub mod config;
 
 pub use vfs::Vfs;
 

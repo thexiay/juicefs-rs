@@ -4,3 +4,5 @@
 
 mod fs;
 mod fuse_kernel;
+
+pub use fs::JuiceFs;

@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use juice_utils::common::storage::ChecksumLevel;
 use opendal::Buffer;
 use snafu::{whatever, ResultExt};
 use tokio::{
@@ -21,25 +22,6 @@ use crate::{
 };
 
 const CHECKSUM_BLOCK: u64 = 32 << 10; // 32KB
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChecksumLevel {
-    /// Disable checksum verification, if local cache data is tampered, bad data will be read
-    None,
-    /// Perform verification when reading the full block, use this for sequential read scenarios
-    Full,
-    /// Perform verification on parts that's fully included within the read range, use this for random read scenarios
-    Shrink,
-    /// Perform verification on parts that fully include the read range, this causes read amplifications and is only
-    /// used for random read scenarios demanding absolute data integrity.
-    Extend,
-}
-
-impl Default for ChecksumLevel {
-    fn default() -> Self {
-        ChecksumLevel::Full
-    }
-}
 
 // Calculate 32-bits checksum for every 32 KiB data, so 512 Bytes for 4 MiB in total
 pub fn checksum(buffer: &Buffer) -> Bytes {

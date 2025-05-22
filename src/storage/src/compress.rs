@@ -1,10 +1,3 @@
-#[derive(Clone)]
-pub enum CompressArgo {
-    ZSTD,
-    Snappy,
-    LZ4,
-}
-
 pub trait Compressor: Send + Sync + 'static {
     fn name(&self) -> String;
 

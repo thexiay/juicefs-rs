@@ -188,19 +188,20 @@ impl Drop for InvalidAttrGuard {
 }
 
 pub struct OpenFiles2 {
-    expire: Arc<Duration>,
+    expire: Option<Duration>,
     limit: u64,
     files: Mutex<HashMap<Ino, OpenFile2>>,
 }
 
 impl OpenFiles2 {
-    pub fn new(expire: Duration, limit: u64) -> Arc<Self> {
+    pub fn new(expire: Option<Duration>, limit: u64) -> Arc<Self> {
         let of = Arc::new(OpenFiles2 {
-            expire: Arc::new(expire),
+            expire,
             limit,
             files: Mutex::new(HashMap::new()),
         });
         let of_clone = of.clone();
+        // TODO: release thread
         tokio::spawn(async move {});
         of
     }
@@ -221,21 +222,26 @@ impl OpenFiles2 {
         }
     }
 
-    pub fn attr(&self, ino: Ino) -> Option<Attr> {
-        let mut ofs = self.files.lock();
-        if let Some(of) = ofs.get_mut(&ino) {
-            if let Some(attr) = &of.attr {
-                if SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    - of.last_attr_valid_time
-                    < *self.expire
-                {
-                    return Some(attr.clone());
+    pub fn get_attr(&self, ino: Ino) -> Option<Attr> {
+        match self.expire {
+            Some(expire) => {
+                let mut ofs = self.files.lock();
+                if let Some(of) = ofs.get_mut(&ino) {
+                    if let Some(attr) = &of.attr {
+                        if SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            - of.last_attr_valid_time
+                            < expire
+                        {
+                            return Some(attr.clone());
+                        }
+                    }
                 }
-            }
+                None
+            },
+            None => None,
         }
-        None
     }
 
     // Cache attr and return if need to keep cache
@@ -270,7 +276,6 @@ impl OpenFiles2 {
                 of.refs += 1;
             })
             .or_insert_with(|| OpenFile2 {
-                expire: self.expire.clone(),
                 attr: None,
                 refs: 1,
                 last_attr_valid_time: Duration::ZERO,
@@ -295,8 +300,6 @@ impl OpenFiles2 {
 }
 
 pub struct OpenFile2 {
-    expire: Arc<Duration>,
-
     attr: Option<Attr>,
     refs: i32, // refs is the number of open fileholders.
     last_attr_valid_time: Duration,

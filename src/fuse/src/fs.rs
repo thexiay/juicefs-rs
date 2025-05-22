@@ -31,6 +31,13 @@ pub struct JuiceFs {
 }
 
 impl JuiceFs {
+    pub fn new(vfs: Vfs) -> Self {
+        Self {
+            vfs,
+            ops: DashMap::new(),
+        }
+    }
+
     fn login(req: Request) -> FsContext {
         FsContext::new(req.uid, req.gid, req.pid, true)
     }

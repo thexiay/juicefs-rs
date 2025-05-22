@@ -263,9 +263,11 @@ impl MetaError {
     pub fn is_no_such_attr(&self) -> bool {
         matches!(self.inner(), MetaErrorEnum::NoSuchAttr)
     }
+
+    pub fn is_not_init(&self) -> bool {
+        matches!(self.inner(), MetaErrorEnum::NotInitializedError)
+    }
 }
-
-
 
 impl<E> From<E> for MetaError
 where

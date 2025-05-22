@@ -1,6 +1,7 @@
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use juice_utils::common::meta::AtimeMode;
 use juice_utils::process::Bar;
 use parking_lot::{Mutex, RwLock};
 use scopeguard::defer;
@@ -537,7 +538,7 @@ where
 
     async fn check_trash(&self, parent: Ino) -> Result<Option<Ino>> {
         let no_need_trash = parent.is_trash();
-        let trash_enable = self.as_ref().get_format().trash_days > 0;
+        let trash_enable = self.as_ref().get_format().trash_days.is_some();
         if no_need_trash || !trash_enable {
             return Ok(None);
         }
@@ -882,14 +883,14 @@ where
 
     async fn update_attr_atime(&self, ino: Ino) {
         let base = self.as_ref();
-        if base.conf.atime_mode == "NoAtime" || base.conf.read_only {
+        if base.conf.atime_mode != AtimeMode::NoAtime || base.conf.read_only {
             return;
         }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
-        if let Some(attr) = base.open_files.attr(ino)
+        if let Some(attr) = base.open_files.get_attr(ino)
             && attr.full
             && !self.is_atime_need_update(&attr, now)
         {
@@ -910,8 +911,8 @@ where
     fn is_atime_need_update(&self, attr: &Attr, now: Duration) -> bool {
         let base = self.as_ref();
         // update atime only for > 1 second accesses
-        (base.conf.atime_mode != "NoAtime" && relation_need_update(attr, now))
-            || (base.conf.atime_mode == "StrictAtime"
+        (base.conf.atime_mode != AtimeMode::NoAtime && relation_need_update(attr, now))
+            || (base.conf.atime_mode == AtimeMode::StrictAtime
                 && now.as_nanos() - attr.atime > Duration::from_secs(1).as_nanos())
     }
 
@@ -1384,34 +1385,35 @@ where
                 }
             });
             // cleanup trash
-            let mut meta = dyn_clone::clone_box(self);
-            meta.with_cancel(self.token().child_token());
-            tokio::spawn(async move {
-                loop {
-                    sleep_with_jitter(Duration::from_hours(1)).await;
-                    if let Err(e) = meta.do_get_attr(TRASH_INODE).await {
-                        if matches!(e.inner(), MetaErrorEnum::NoEntryFound { .. }) {
-                            warn!("get trash attr inode error {e}");
+            if let Some(days) = self.get_format().trash_days {
+                let mut meta = dyn_clone::clone_box(self);
+                meta.with_cancel(self.token().child_token());
+                tokio::spawn(async move {
+                    loop {
+                        sleep_with_jitter(Duration::from_hours(1)).await;
+                        if let Err(e) = meta.do_get_attr(TRASH_INODE).await {
+                            if matches!(e.inner(), MetaErrorEnum::NoEntryFound { .. }) {
+                                warn!("get trash attr inode error {e}");
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards");
-                    match meta
-                        .set_if_small("lastCleanupTrash", now, Duration::from_mins(54))
-                        .await
-                    {
-                        Ok(true) => {
-                            let days = meta.get_format().trash_days;
-                            meta.cleanup_trash(days, false).await;
-                            meta.cleanup_trash_slices(days).await;
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards");
+                        match meta
+                            .set_if_small("lastCleanupTrash", now, Duration::from_mins(54))
+                            .await
+                        {
+                            Ok(true) => {
+                                meta.cleanup_trash(days, false).await;
+                                meta.cleanup_trash_slices(days).await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => warn!("checking counter lastCleanupTrash: {}", e),
                         }
-                        Ok(false) => {}
-                        Err(e) => warn!("checking counter lastCleanupTrash: {}", e),
                     }
-                }
-            });
+                });
+            }
         }
         Ok(())
     }
@@ -1948,7 +1950,7 @@ where
     async fn get_attr(&self, inode: Ino) -> Result<Attr> {
         let base = self.as_ref();
         let inode = base.check_root(inode);
-        if let Some(attr) = base.open_files.attr(inode) {
+        if let Some(attr) = base.open_files.get_attr(inode) {
             return Ok(attr);
         }
         // for root and trash, maybe the attr is not persist, but we need it always return ok
@@ -2000,7 +2002,7 @@ where
         let inode = base.check_root(inode);
         defer! {
             base.open_files.remove_attr(inode);
-            if let Some(mut attr) = base.open_files.attr(inode)
+            if let Some(mut attr) = base.open_files.get_attr(inode)
                 && set.intersects(SetAttrMask::SET_ATIME | SetAttrMask::SET_ATIME_NOW)
             {
                 attr.full = false;
@@ -2107,7 +2109,7 @@ where
     // ReadLink returns the target of a symlink.
     async fn read_symlink(&self, inode: Ino) -> Result<String> {
         let base = self.as_ref();
-        let no_atime = self.as_ref().conf.atime_mode == "NoAtime" || self.as_ref().conf.read_only;
+        let no_atime = self.as_ref().conf.atime_mode == AtimeMode::NoAtime || self.as_ref().conf.read_only;
 
         {
             let symlinks = base.symlinks.lock();
@@ -2660,7 +2662,7 @@ where
             return ReadFSSnafu.fail()?;
         }
         let base = self.as_ref();
-        let mut attr = match base.open_files.attr(inode) {
+        let mut attr = match base.open_files.get_attr(inode) {
             Some(attr) => attr,
             None => {
                 let attr = self.get_attr(inode).await?;
@@ -3092,16 +3094,9 @@ where
 
     // Change root to a directory specified by subdir
     async fn chroot(&self, subdir: &str) -> Result<Ino> {
-        let level_subdir = subdir.split("/").collect::<Vec<&str>>();
+        let level_subdir = subdir.split("/").filter(|s| !s.is_empty()).collect::<Vec<&str>>();
         let mut tmp_root = self.as_ref().root();
         for subdir in level_subdir {
-            ensure!(
-                !subdir.is_empty(),
-                NoEntryFoundSnafu {
-                    parent: tmp_root,
-                    name: subdir.to_string()
-                }
-            );
             let (inode, attr) = match self.lookup(tmp_root, subdir, false).await {
                 Ok((inode, attr)) => (inode, attr),
                 Err(e) => {

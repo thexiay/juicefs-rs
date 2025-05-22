@@ -11,6 +11,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{Duration, Utc};
 use either::Either;
 use futures::future::FutureExt;
+use juice_utils::common::storage::{ChecksumLevel, CompressArgo};
 use opendal::{Buffer, Operator};
 use regex::Regex;
 use snafu::whatever;
@@ -18,9 +19,8 @@ use tokio::task::JoinSet;
 use tracing::{error, warn};
 
 use crate::api::{ChunkStore, SliceWriter};
-use crate::buffer::{ChecksumLevel, FileBuffer};
-use crate::cache::{CacheKey, CacheManagerImpl};
-use crate::compress::CompressArgo;
+use crate::{cache::{CacheKey, CacheManagerImpl}};
+use crate::buffer::FileBuffer;
 use crate::error::Result;
 use crate::uploader::{NormalUploader, Uploader};
 use crate::{
@@ -35,11 +35,18 @@ const PAGE_SIZE: usize = 64 << 10; // 64KB
 pub static BLOCK_FILE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^chunks/\d+/\d+/(\d+)_(\d+)_(\d+)$").unwrap());
 
+// CacheType is the type of cache
+#[derive(Clone)]
+pub enum CacheType {
+    Memory,
+    Disk,
+}
+
 // Config contains options for cachedStore
 #[derive(Clone)]
 pub struct Config {
     // TODO: Optimize disk cache and memory cache config
-    pub cache_type: String,
+    pub cache_type: CacheType,
     pub cache_dirs: Vec<PathBuf>,
     pub cache_file_mode: Permissions,
     pub cache_size: u64,
@@ -79,7 +86,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            cache_type: "mem".to_string(),
+            cache_type: CacheType::Memory,
             cache_dirs: vec![env::temp_dir().join("cache")],
             cache_file_mode: Permissions::from_mode(0o600),
             cache_size: 10 << 20, // 10MB

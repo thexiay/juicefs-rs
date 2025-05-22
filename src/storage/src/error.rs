@@ -38,6 +38,10 @@ pub enum StorageErrorEnum {
     DiskUnstableError,
     #[snafu(display("Send error"))]
     SenderError,
+    #[snafu(display("Failed to initialize object: {}", source))]
+    ObjectInitError {
+        source: opendal::Error,
+    },
     #[snafu(whatever, display("{message}, cause: {source:?}"))]
     GenericError {
         message: String,

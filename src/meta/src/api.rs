@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::ops::AddAssign;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -178,7 +179,7 @@ pub struct SessionInfo {
     pub version: String,
     pub host_name: String,
     pub ip_addrs: Vec<IpAddr>,
-    pub mount_point: String,
+    pub mount_point: PathBuf,
     pub mount_time: SystemTime,
     pub process_id: u32,
 }
@@ -328,10 +329,12 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     /// use juice_meta::api::Meta;
     /// use juice_meta::api::new_client;
     /// use juice_meta::config::Config;
-    ///
-    /// let meta = new_client("redis://localhost:6379".to_string(), Config::default()).unwrap();
-    /// let format = Format::default();
-    /// meta.init(format, false).await;
+    /// use juice_meta::format::Format;
+    /// 
+    /// if let Ok(meta) = new_client("redis://localhost:6379".to_string(), Config::default()) {
+    ///     let format = Format::default();    
+    ///     meta.init(format, false).await;
+    /// }
     /// ```
     async fn init(&self, format: Format, force: bool) -> Result<()>;
 

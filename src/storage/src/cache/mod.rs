@@ -14,7 +14,7 @@ use crate::{
     buffer::FileBuffer,
     cached_store::Config,
     error::Result,
-    uploader::{NormalUploader, Uploader},
+    uploader::{NormalUploader, Uploader}, CacheType,
 };
 
 pub type CacheCntAndSize = (i64, i64);
@@ -122,12 +122,12 @@ pub enum CacheManagerImpl {
 
 impl CacheManagerImpl {
     pub fn new(config: &Config, operator: Arc<Operator>) -> Result<Self> {
-        match config.cache_type.to_lowercase().as_str() {
-            "mem" => {
+        match config.cache_type {
+            CacheType::Memory => {
                 let mem = MemCacheManager::new();
                 Ok(CacheManagerImpl::Mem(mem))
             },
-            "disk" => {
+            CacheType::Disk => {
                 if config.cache_size == 0 {
                     whatever!("cache_size must be set when cache_type is disk");
                 }

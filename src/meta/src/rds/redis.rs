@@ -1217,10 +1217,10 @@ impl Engine for RedisEngine {
             ctime: ts,
             nlink: 2,
             length: 4 << 10,
-            parent: 1,
+            parent: ROOT_INODE,
             ..Default::default()
         };
-        if format.trash_days > 0 {
+        if let Some(_) = format.trash_days {
             attr.mode = 0o555;
             conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)
                 .await?;
