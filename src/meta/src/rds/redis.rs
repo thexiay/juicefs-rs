@@ -695,9 +695,11 @@ impl RedisEngine {
         if !id.is_valid_acl() {
             return Ok(None);
         }
-        let mut cache = self.meta.acl_cache.lock().await;
-        if let Some(rule) = cache.get(id) {
-            return Ok(Some(rule));
+        {
+            let cache = self.meta.acl_cache.read().await;
+            if let Some(rule) = cache.get(id) {
+                return Ok(Some(rule));
+            }
         }
 
         let mut pipe = pipe();
@@ -718,6 +720,7 @@ impl RedisEngine {
                     }
                     Some(cmds) => {
                         let rule: Rule = bincode::deserialize(&cmds)?;
+                        let mut cache = self.meta.acl_cache.write().await;
                         cache.put(id, rule.clone());
                         Ok(Some(rule))
                     }
@@ -737,7 +740,7 @@ impl RedisEngine {
             .await
             .unwrap_or_else(|e| warn!("SetFacl: load miss acls error: {}", e));
         // set acl
-        let mut cache = self.meta.acl_cache.lock().await;
+        let mut cache = self.meta.acl_cache.write().await;
         match cache.get_id(&rule) {
             Some(acl_id) => Ok(acl_id),
             None => {
@@ -751,7 +754,7 @@ impl RedisEngine {
     }
 
     async fn load_miss_acls(&self, conn: &mut impl AsyncCommands) -> Result<()> {
-        let mut cache = self.meta.acl_cache.lock().await;
+        let mut cache = self.meta.acl_cache.write().await;
         let miss_ids = cache.get_miss_ids();
         match miss_ids.is_empty() {
             true => Ok(()),
@@ -1003,7 +1006,7 @@ impl Engine for RedisEngine {
             }
         })
     }
-    
+
     // redisMeta updates the usage in each transaction
     async fn flush_stats(&self) {}
 
@@ -1232,6 +1235,7 @@ impl Engine for RedisEngine {
             let mut lock = self.meta.fmt.write();
             *lock = Arc::new(format);
         }
+        // if inited, root inode ignored
         match body {
             Some(_) => Ok(()),
             None => {
@@ -3688,20 +3692,16 @@ impl Engine for RedisEngine {
         if !self.get_format().enable_acl {
             return Ok(());
         }
-        /*
-        vals, err := m.rdb.HGetAll(ctx, m.aclKey()).Result()
-        if err != nil {
-            return err
-        }
 
-        for k, v := range vals {
-            id, _ := strconv.ParseUint(k, 10, 32)
-            tmpRule := &aclAPI.Rule{}
-            tmpRule.Decode([]byte(v))
-            m.aclCache.Put(uint32(id), tmpRule)
+        let mut conn = self.share_conn();
+        let vals: Vec<Option<Vec<u8>>> = conn.hgetall(self.acl_key()).await?;
+        for (idx, val) in vals.iter().enumerate() {
+            if let Some(v) = val {
+                let acl_rule = bincode::deserialize::<Rule>(v)?;
+                let mut acl_cache = self.get_base().acl_cache.write().await;
+                acl_cache.put(idx as u32, acl_rule);
+            }
         }
-        return nil
-             */
-        unimplemented!()
+        Ok(())
     }
 }

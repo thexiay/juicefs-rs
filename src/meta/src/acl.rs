@@ -6,6 +6,7 @@ use crate::{api::ModeMask, context::{Gid, Uid}};
 pub const ACL_COUNTER: &str = "acl_counter";
 
 pub type AclId = u32;
+pub type Checksum = u32;
 pub trait AclExt {
     fn is_valid_acl(&self) -> bool;
     fn invalid_acl() -> AclId {
@@ -18,7 +19,7 @@ impl AclExt for AclId {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub id: AclId,
     pub perm: u16,
@@ -32,14 +33,14 @@ pub enum AclType {
     Default,
 }
 
-#[derive(Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rule {
-    owner: u16,
-    group: u16,
-    mask: u16,
-    other: u16,
-    named_users: Entries,
-    named_groups: Entries,
+    pub owner: u16,
+    pub group: u16,
+    pub mask: u16,
+    pub other: u16,
+    pub named_users: Entries,
+    pub named_groups: Entries,
 }
 
 impl Rule {
@@ -118,15 +119,14 @@ impl Rule {
     }
 
     pub fn child_access_acl(&self, mode: u16) -> Rule {
-        let mut c_rule = Rule::default();
-        c_rule.owner = (mode >> 6) & 7 & self.owner;
-        c_rule.mask = (mode >> 3) & 7 & self.mask;
-        c_rule.other = mode & 7 & self.other;
-
-        c_rule.group = self.group;
-        c_rule.named_users = self.named_users.clone();
-        c_rule.named_groups = self.named_groups.clone();
-        c_rule
+        Rule {
+            owner: (mode >> 6) & 7 & self.owner,
+            group: self.group,
+            mask: (mode >> 3) & 7 & self.mask,
+            other: mode & 7 & self.other,
+            named_users: self.named_users.clone(),
+            named_groups: self.named_groups.clone(),
+        }
     }
 
     pub fn checksum(&self) -> u32 {
@@ -144,7 +144,7 @@ impl Rule {
 pub struct AclCache {
     max_id: AclId,
     id_2_rule: HashMap<AclId, Rule>,
-    cksum_2_id: HashMap<AclId, Vec<AclId>>,
+    cksum_2_id: HashMap<Checksum, Vec<AclId>>,
 }
 
 impl AclCache {
@@ -201,4 +201,43 @@ impl AclCache {
     }
 
     pub fn clear(&self) {}
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acl() {
+        let rule = Rule {
+            owner: 6,
+            group: 4,
+            mask: 4,
+            other: 4,
+            named_users: vec![
+                Entry { id: 2, perm: 2 },
+                Entry { id: 1, perm: 1 },
+            ],
+            named_groups: vec![
+                Entry { id: 4, perm: 4 },
+                Entry { id: 3, perm: 3 },
+            ],
+        };
+        let mut c = AclCache::default();
+        c.put(1, rule.clone());
+        c.put(2, rule.clone());
+        assert_eq!(c.get(1), Some(rule.clone()));
+        assert_eq!(c.get(2), Some(rule.clone()));
+        assert_eq!(c.get_id(&rule), Some(1));
+        
+        let mut rule2 = rule.clone();
+        rule2.owner = 4;
+
+        c.put(3, rule2.clone());
+        assert_eq!(c.get_id(&rule2), Some(3));
+
+        c.put(8, rule2.clone());
+        assert_eq!(c.get_miss_ids(), vec![4, 5, 6, 7]);
+    }
 }

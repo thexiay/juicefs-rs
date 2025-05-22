@@ -1582,6 +1582,7 @@ mod tests {
     use assert_matches::assert_matches;
     use chrono::{Duration, Utc};
     use either::Either;
+    use juice_utils::common::storage::ChecksumLevel;
     use opendal::{services::Memory, Buffer, Operator};
     use tempfile::tempdir;
     use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Semaphore, time::sleep};
@@ -1589,7 +1590,6 @@ mod tests {
     use tracing_test::traced_test;
 
     use crate::{
-        buffer::ChecksumLevel,
         cache::{
             disk::cache::{
                 CacheStore, DiskState, CACHE_STAGE_DIR, MAX_CONCURRENCY_FOR_UNSTABLE,

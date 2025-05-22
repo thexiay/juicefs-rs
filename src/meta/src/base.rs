@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
@@ -401,7 +401,7 @@ pub struct CommonMeta {
     pub deleting_slice_ctx: Option<(Sender<(u64, u32)>, Receiver<(u64, u32)>)>,
     pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>, // ino -> (atime, path)
     pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
-    pub acl_cache: AsyncMutex<AclCache>,
+    pub acl_cache: AsyncRwLock<AclCache>,
     pub dir_stats_batch: Mutex<HashMap<Ino, DirStat>>,
     pub fs_stat: FsStat,
     pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
@@ -444,7 +444,7 @@ impl CommonMeta {
             symlinks: Mutex::new(HashMap::new()),
             reload_format_callbacks: Vec::new(),
             ses_umounting: AsyncMutex::new(false),
-            acl_cache: AsyncMutex::new(AclCache::default()),
+            acl_cache: AsyncRwLock::new(AclCache::default()),
             dir_stats_batch: Mutex::new(HashMap::new()),
             fs_stat: FsStat::default(),
             dir_parents: Mutex::new(HashMap::new()),

@@ -1,14 +1,10 @@
 use std::time::Duration;
 
 use crate::{
-    align_4k,
-    api::{
+    acl::{Entry, Rule}, align_4k, api::{
         Attr, Falloc, INodeType, Meta, ModeMask, OFlag, QuotaOp, RenameMask, SetAttrMask, Slice,
         Summary, XattrF, CHUNK_SIZE, ROOT_INODE,
-    },
-    base::{CommonMeta, Engine},
-    config::Format,
-    quota::{MetaQuota, QuotaView},
+    }, base::{CommonMeta, Engine}, config::Format, quota::{MetaQuota, QuotaView}
 };
 use chrono::Utc;
 use tokio::{
@@ -1016,9 +1012,7 @@ pub async fn test_copy_file_range(m: &mut (impl Engine + AsRef<CommonMeta>)) {
     }
 }
 
-pub async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
-
-}
+pub async fn test_close_session(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {}
 
 pub async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta> + Clone)) {
     let mut task_set = JoinSet::new();
@@ -1058,12 +1052,18 @@ pub async fn test_concurrent_dir(m: &mut (impl Engine + AsRef<CommonMeta> + Clon
         let _ = task_set.spawn(async move {
             let (d2, _) = m.lookup(ROOT_INODE, "d2", true).await.expect("lookup d2");
             let name = format!("file{i}");
-            m.unlink(d2, &name, false).await.expect(&format!("unlink d2/{name}"));
+            m.unlink(d2, &name, false)
+                .await
+                .expect(&format!("unlink d2/{name}"));
             if let Err(e) = m.rmdir(ROOT_INODE, "d1", false).await {
-                assert!(e.is_dir_not_empty(&ROOT_INODE, "d1") || e.is_no_entry_found(&ROOT_INODE, "d1"));
+                assert!(
+                    e.is_dir_not_empty(&ROOT_INODE, "d1") || e.is_no_entry_found(&ROOT_INODE, "d1")
+                );
             }
             if let Err(e) = m.rmdir(ROOT_INODE, "d2", false).await {
-                assert!(e.is_dir_not_empty(&ROOT_INODE, "d2") || e.is_no_entry_found(&ROOT_INODE, "d2"));
+                assert!(
+                    e.is_dir_not_empty(&ROOT_INODE, "d2") || e.is_no_entry_found(&ROOT_INODE, "d2")
+                );
             }
         });
     }
@@ -1090,6 +1090,176 @@ async fn test_dir_stat(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
 async fn test_clone(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
 
-async fn test_acl(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
+pub async fn test_acl(m: &mut (impl Engine + AsRef<CommonMeta>)) {
+    let mut format = test_format();
+    format.enable_acl = true;
+    m.init(format, false).await.unwrap();
+
+    let test_dir = "test_dir";
+    let (test_dir_ino, _) = m
+        .mkdir(ROOT_INODE, test_dir, 0o644, 0, 0)
+        .await
+        .expect("mkdir test_dir");
+    let rule = Rule {
+        owner: 7,
+        group: 7,
+        mask: 7,
+        other: 7,
+        named_users: vec![Entry {
+            id: 1001,
+            perm: 4,
+        }],
+        named_groups: vec![],
+    };
+
+    // case: setfacl
+    /*
+    // case: setfacl
+    if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule); st != 0 {
+        t.Fatalf("setfacl error: %s", st)
+    }
+
+    // case: getfacl
+    rule2 := &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule2); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    assert.True(t, rule.IsEqual(rule2))
+
+    // case: setfacl will sync mode (group class is mask)
+    attr2 := &Attr{}
+    if st := m.GetAttr(ctx, testDirIno, attr2); st != 0 {
+        t.Fatalf("getattr error: %s", st)
+    }
+    assert.Equal(t, uint16(0777), attr2.Mode)
+
+    // case: setattr will sync acl
+    set := uint16(0) | SetAttrMode
+    attr2 = &Attr{
+        Mode: 0555,
+    }
+    if st := m.SetAttr(ctx, testDirIno, set, 0, attr2); st != 0 {
+        t.Fatalf("setattr error: %s", st)
+    }
+
+    rule3 := &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    rule2.Owner = 5
+    rule2.Mask = 5
+    rule2.Other = 5
+    assert.True(t, rule3.IsEqual(rule2))
+
+    // case: remove acl
+    rule3.Mask = 0xFFFF
+    rule3.NamedUsers = nil
+    rule3.NamedGroups = nil
+    if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+        t.Fatalf("setattr error: %s", st)
+    }
+
+    st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, nil)
+    assert.Equal(t, ENOATTR, st)
+
+    attr2 = &Attr{}
+    if st := m.GetAttr(ctx, testDirIno, attr2); st != 0 {
+        t.Fatalf("getattr error: %s", st)
+    }
+    assert.Equal(t, uint16(0575), attr2.Mode)
+
+    // case: set normal default acl
+    if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule); st != 0 {
+        t.Fatalf("setfacl error: %s", st)
+    }
+
+    // case: get normal default acl
+    rule2 = &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule2); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    assert.True(t, rule2.IsEqual(rule))
+
+    // case: mk subdir with normal default acl
+    subDir := "sub_dir"
+    var subDirIno Ino
+    attr2 = &Attr{}
+
+    mode := uint16(0222)
+    // cumask will be ignored
+    if st := m.Mkdir(ctx, testDirIno, subDir, mode, 0022, 0, &subDirIno, attr2); st != 0 {
+        t.Fatalf("create %s: %s", subDir, st)
+    }
+    defer m.Rmdir(ctx, testDirIno, subDir)
+
+    // subdir inherit default acl
+    rule3 = &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeDefault, rule3); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    assert.True(t, rule3.IsEqual(rule2))
+
+    // subdir access acl
+    rule3 = &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    rule2.Owner &= (mode >> 6) & 7
+    rule2.Mask &= (mode >> 3) & 7
+    rule2.Other &= mode & 7
+    assert.True(t, rule3.IsEqual(rule2))
+
+    // case: set minimal default acl
+    rule = &aclAPI.Rule{
+        Owner:       5,
+        Group:       5,
+        Mask:        0xFFFF,
+        Other:       5,
+        NamedUsers:  nil,
+        NamedGroups: nil,
+    }
+    if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule); st != 0 {
+        t.Fatalf("setfacl error: %s", st)
+    }
+
+    // case: get minimal default acl
+    rule2 = &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule2); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    assert.True(t, rule2.IsEqual(rule))
+
+    // case: mk subdir with minimal default acl
+    subDir2 := "sub_dir2"
+    var subDirIno2 Ino
+    attr2 = &Attr{}
+
+    mode = uint16(0222)
+    if st := m.Mkdir(ctx, testDirIno, subDir2, mode, 0022, 0, &subDirIno2, attr2); st != 0 {
+        t.Fatalf("create %s: %s", subDir, st)
+    }
+    defer m.Rmdir(ctx, testDirIno, subDir2)
+    assert.Equal(t, uint16(0), attr2.Mode)
+
+    // subdir inherit default acl
+    rule3 = &aclAPI.Rule{}
+    if st := m.GetFacl(ctx, subDirIno2, aclAPI.TypeDefault, rule3); st != 0 {
+        t.Fatalf("getfacl error: %s", st)
+    }
+    assert.True(t, rule3.IsEqual(rule2))
+
+    // subdir have no access acl
+    rule3 = &aclAPI.Rule{}
+    st = m.GetFacl(ctx, subDirIno2, aclAPI.TypeAccess, rule3)
+    assert.Equal(t, ENOATTR, st)
+
+    // test cache all
+    sz := m.getBase().aclCache.Size()
+    err := m.getBase().en.cacheACLs(ctx)
+    assert.Nil(t, err)
+    assert.Equal(t, sz, m.getBase().aclCache.Size())
+
+     */
+}
 
 async fn test_read_only(m: &mut (impl Engine + AsRef<CommonMeta>)) {}
