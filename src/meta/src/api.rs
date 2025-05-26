@@ -84,6 +84,22 @@ pub enum QuotaOp {
     Check,
 }
 
+// AttrNode is an [`Entry`] with name
+#[derive(Debug, Clone)]
+pub struct AttrNode {
+    pub inode: Ino,
+    pub attr: Attr,
+}
+
+impl From<Entry> for AttrNode {
+    fn from(entry: Entry) -> Self {
+        AttrNode {
+            inode: entry.inode,
+            attr: entry.attr,
+        }
+    }
+}
+
 // Entry is an entry inside a directory.
 #[derive(Debug, Clone)]
 pub struct Entry {

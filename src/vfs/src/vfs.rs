@@ -2,7 +2,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     ops::Deref,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{Arc, atomic::AtomicU64},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -12,9 +12,10 @@ use futures_async_stream::try_stream;
 
 use juice_meta::{
     api::{
-        Attr, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, SetAttrMask, StatFs,
-        MAX_FILE_LEN, MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
-    }, config::Format, context::{FsContext, Gid, Uid, WithContext}
+        Attr, AttrNode, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, SetAttrMask, StatFs, MAX_FILE_LEN, MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE
+    },
+    config::Format,
+    context::{FsContext, Gid, Uid, WithContext},
 };
 use juice_storage::api::CachedStore;
 use juice_utils::fs::{self, task_local};
@@ -111,8 +112,19 @@ impl Vfs {
         self.clone()
     }
 
-    pub async fn get_attr(&self, ino: Ino) -> Result<Entry, Errno> {
-        todo!()
+    pub async fn get_attr(&self, ino: Ino) -> Result<AttrNode, Errno> {
+        if self.is_special_inode(ino) {
+            // TODO: support it
+            return Err(Errno::EPERM);
+        }
+        let attr = self.meta.get_attr(ino).await.map_err(|e| {
+            error!("get attr: {:?}", e);
+            e.fs_err()
+        })?;
+        Ok(AttrNode {
+            inode: ino,
+            attr,
+        })
     }
 
     pub async fn set_attr(
@@ -335,13 +347,10 @@ impl Vfs {
             })?
         {
             self.writer.truncate(ino_out, length);
-            self.reader.invalidate(
-                ino_out,
-                Frange {
-                    off: off_out,
-                    len: copied,
-                },
-            );
+            self.reader.invalidate(ino_out, Frange {
+                off: off_out,
+                len: copied,
+            });
             let mut last_modified = self.last_modified.write();
             last_modified.insert(ino_out, Utc::now());
             Ok(copied)
@@ -426,14 +435,11 @@ impl Vfs {
             })?;
         self.cache_dir_entry(parent, name, Some((ino, attr.clone())))
             .await;
-        Ok((
-            fh,
-            Entry {
-                inode: ino,
-                name: name.to_string(),
-                attr,
-            },
-        ))
+        Ok((fh, Entry {
+            inode: ino,
+            name: name.to_string(),
+            attr,
+        }))
     }
 
     pub async fn open(&self, ino: Ino, flags: OFlag) -> Result<(Fh, Attr), Errno> {
@@ -697,13 +703,10 @@ impl Vfs {
                         error!("write failed: {:?}", e);
                         e.fs_err()
                     })?;
-                    self.reader.invalidate(
-                        ino,
-                        Frange {
-                            off,
-                            len: data.len() as u64,
-                        },
-                    );
+                    self.reader.invalidate(ino, Frange {
+                        off,
+                        len: data.len() as u64,
+                    });
                     let mut modified = self.last_modified.write();
                     modified.insert(ino, Utc::now());
                     Ok(())
@@ -721,7 +724,7 @@ impl Vfs {
     pub fn config(&self) -> &Config {
         &self.vfs.conf
     }
-    
+
     pub fn meta_format(&self) -> Arc<Format> {
         self.vfs.meta.get_format()
     }

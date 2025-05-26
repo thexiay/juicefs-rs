@@ -17,7 +17,7 @@ use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use futures_async_stream::stream;
-use juice_meta::api::{Attr, Entry, Falloc, INodeType, OFlag, SetAttrMask};
+use juice_meta::api::{Attr, AttrNode, Entry, Falloc, INodeType, OFlag, SetAttrMask};
 use juice_utils::fs::{self, FsContext};
 use juice_vfs::Vfs;
 use nix::errno::Errno;
@@ -89,8 +89,9 @@ impl JuiceFs {
         fs::task_local::scope(ctx, f).await
     }
 
-    async fn reply_entry(vfs: &Vfs, entry: Entry) -> ReplyEntry {
+    async fn reply_entry(vfs: &Vfs, attr_node: impl Into<AttrNode>) -> ReplyEntry {
         // TODO: distinguish attr ttl and entry ttl
+        let entry: AttrNode = attr_node.into();
         let duration = match entry.attr.typ {
             INodeType::Directory => vfs.config().dir_entry_timeout,
             _ => vfs.config().entry_timeout,
@@ -105,9 +106,10 @@ impl JuiceFs {
         }
     }
 
-    async fn reply_attr(vfs: &Vfs, mut entry: Entry) -> ReplyAttr {
+    async fn reply_attr(vfs: &Vfs, attr_node: impl Into<AttrNode>) -> ReplyAttr {
         // Notice: There needs to be a mechanism here to prevent the problem that thread A changes Attr in
         // multi-threading situations, and thread B is not visible to Attr at this time.
+        let mut entry: AttrNode = attr_node.into();
         let attr_ttl = if vfs.is_special_inode(entry.inode) {
             Duration::from_hours(1)
         } else if entry.attr.typ == INodeType::File && vfs.modified_since(&entry.inode) {
