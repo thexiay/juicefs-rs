@@ -1,16 +1,43 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use dirs::home_dir;
 use either::Either;
-use nix::unistd::getuid;
 use tracing::level_filters::LevelFilter as Level;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter};
 
 use crate::env_var::env_var_is_true;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LogTarget {
+    /// The target name for the log.
+    pub target: String,
+    /// The level filter for the target.
+    pub level: tracing::metadata::LevelFilter,
+}
+
+impl FromStr for LogTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(2, '=');
+        let target = parts
+            .next()
+            .ok_or("missing target name")?
+            .trim()
+            .to_string();
+        let level = parts
+            .next()
+            .ok_or("missing target level")?
+            .trim()
+            .parse::<tracing::metadata::LevelFilter>()
+            .map_err(|_| format!("invalid level filter for target `{}`", target))?;
+        Ok(LogTarget { target, level })
+    }
+}
 
 pub struct LoggerSettings {
     /// The name of the service. Used to identify the service in distributed tracing.
@@ -28,7 +55,6 @@ pub struct LoggerSettings {
     /// Override the default level.
     default_level: Option<tracing::metadata::LevelFilter>,
 }
-
 
 impl Default for LoggerSettings {
     fn default() -> Self {
@@ -57,7 +83,7 @@ impl LoggerSettings {
     }
 
     /// Enable write into stdout.
-    pub fn with_log(&mut self, log: PathBuf) -> &mut Self {
+    pub fn with_log(mut self, log: PathBuf) -> Self {
         self.log = Some(log);
         self
     }
@@ -135,26 +161,25 @@ pub fn init_juicefs_logger(settings: LoggerSettings) {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_thread_names(settings.with_thread_name)
             .with_timer(default_timer.clone())
-            .with_ansi(settings.colorful && settings.log.is_none())
+            .with_ansi(settings.colorful)
             .with_writer(move || {
                 if let Some(ref log) = settings.log {
                     std::fs::create_dir_all(log.clone()).unwrap_or_else(|e| {
                         panic!(
                             "failed to create directory '{:?}' for query log: {}",
-                            log,
-                            e,
+                            log, e,
                         )
                     });
-                    
+
                     let path = log.join("juicefs-rs.log");
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
-                        .truncate(true)
+                        .append(true)
                         .open(&path)
-                        .unwrap_or_else(|e| {
-                            panic!("failed to create `{}`: {}", path.display(), e,)
-                        });
+                        .unwrap_or_else(
+                            |e| panic!("failed to create `{}`: {}", path.display(), e,),
+                        );
                     Either::Right(file)
                 } else {
                     Either::Left(std::io::stdout())

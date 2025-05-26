@@ -95,10 +95,7 @@ pub trait ChunkStore: Send + Sync {
     fn config(&self) -> &Config;
 }
 
-pub fn new_chunk_store(
-    config: Config,
-    operator: Operator,
-) -> Result<CachedStore> {
+pub fn new_chunk_store(config: Config, operator: Operator) -> Result<CachedStore> {
     let operator = Arc::new(operator);
     let cache_store = CachedStore::new(operator, config)?;
     Ok(cache_store)
@@ -113,10 +110,11 @@ pub fn new_operator(
     secret_key: &str,
 ) -> Result<Operator> {
     match storage {
-        StorageType::Mem => Ok(Operator::new(Memory::default())?.finish()),
-        StorageType::File => Ok(Operator::new(Fs::default())?.finish()),
+        StorageType::Mem => Ok(Operator::new(Memory::default().root("/"))?.finish()),
+        StorageType::File => Ok(Operator::new(Fs::default().root("/"))?.finish()),
         StorageType::Cos => Ok(Operator::new(
             Cos::default()
+                .root("/")
                 .bucket(bucket)
                 .endpoint(endpoint)
                 .secret_id(access_key)

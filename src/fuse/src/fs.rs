@@ -1,5 +1,6 @@
 use std::cmp::max;
 use std::ffi::{OsStr, OsString};
+use std::num::NonZeroU32;
 use std::result::Result as StdResult;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use fuse3::raw::reply::{
     ReplyOpen, ReplyPoll, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use fuse3::raw::{Filesystem, Request};
-use fuse3::{FileType, Inode, Result, SetAttr, Timestamp};
+use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use futures_async_stream::stream;
@@ -20,7 +21,9 @@ use juice_meta::api::{Attr, Entry, Falloc, INodeType, OFlag, SetAttrMask};
 use juice_utils::fs::{self, FsContext};
 use juice_vfs::Vfs;
 use nix::errno::Errno;
+use nix::unistd::{getuid, Uid};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::fuse_kernel;
 
@@ -35,6 +38,41 @@ impl JuiceFs {
         Self {
             vfs,
             ops: DashMap::new(),
+        }
+    }
+
+    /// Supportted mount options: https://www.man7.org/linux/man-pages/man8/fuse.8.html
+    pub fn mount_opts(&self) -> MountOptions {
+        let mut opts = MountOptions::default();
+        Self::prepare_mount();
+        let format = self.vfs.meta_format();
+        // Filesystem in `df -T`
+        opts.fs_name(format!("JuiceFS: {}", format.name));
+        opts.default_permissions(format.enable_acl);
+        opts.dont_mask(format.enable_acl);
+        opts.allow_other(getuid() == Uid::from_raw(0));
+        // Below is juice-go default configuration:
+        // 1. SingleThreaded: handle kernel fuse request in a single thread. go: fasle, rust: false
+        // 2. MaxBackground: The maximum number of in-flight asynchronous requests allowed by the kernel. 
+        //    go: 50, rust: 12.
+        // 3. MaxWrite: The maximum number of bytes allowed by a single write request (write) by the user space file 
+        //    system. go: 1 << 20, rust: 1 << 20.
+        // 4. MaxReadAhead: Shows the maximum number of bytes of kernel read-ahead. go: 1 << 20, rust: dependency on
+        //    kernel defautl value 1 << 20.
+        opts
+    }
+
+    fn prepare_mount() {
+        if cfg!(target_os = "linux") {
+            if let Err(e) = Self::set_priority() {
+                warn!("set priority failed: {}", e);
+            }
+            if let Err(e) = Self::grant_fuse_access() {
+                warn!("grant access failed: {}", e);
+            }
+            if let Err(e) = Self::ensure_fuse_dev() {
+                warn!("ensure fuse dev failed: {}", e);
+            }
         }
     }
 
@@ -200,7 +238,9 @@ impl JuiceFs {
 impl Filesystem for JuiceFs {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit> {
-        todo!()
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(1 << 20).unwrap(),
+        })
     }
 
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,

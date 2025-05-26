@@ -14,8 +14,7 @@ use juice_meta::{
     api::{
         Attr, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, SetAttrMask, StatFs,
         MAX_FILE_LEN, MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE,
-    },
-    context::{FsContext, Gid, Uid, WithContext},
+    }, config::Format, context::{FsContext, Gid, Uid, WithContext}
 };
 use juice_storage::api::CachedStore;
 use juice_utils::fs::{self, task_local};
@@ -721,6 +720,10 @@ impl Vfs {
 impl Vfs {
     pub fn config(&self) -> &Config {
         &self.vfs.conf
+    }
+    
+    pub fn meta_format(&self) -> Arc<Format> {
+        self.vfs.meta.get_format()
     }
 
     pub fn modified_since(&self, ino: &Ino) -> bool {

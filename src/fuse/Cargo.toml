@@ -22,4 +22,10 @@ futures = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 nix = { workspace = true }
+tracing = { workspace = true }
+snafu = { workspace = true }
 futures-async-stream = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cgroups-rs = { version = "0.3" }
+procfs = { version = "0.17", default-features = false}
