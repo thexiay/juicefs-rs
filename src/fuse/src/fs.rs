@@ -253,7 +253,12 @@ impl Filesystem for JuiceFs {
 
     /// look up a directory entry by name and get its attributes.
     async fn lookup(&self, req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
-        todo!()
+        self.login_with_action(req, async {
+            match self.vfs.lookup(parent, &name.to_string_lossy()).await {
+                Ok(entry) => Ok(Self::reply_entry(&self.vfs, entry).await),
+                Err(e) => Err((e as i32).into()),
+            }
+        }).await
     }
 
     /// forget an inode. The nlookup parameter indicates the number of lookups previously

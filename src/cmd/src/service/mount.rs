@@ -8,8 +8,8 @@ use std::str::FromStr;
 use chrono::Duration;
 use clap::{Parser, ValueEnum};
 use dirs::home_dir;
-use fuse3::raw::Session;
 use fuse3::MountOptions;
+use fuse3::raw::Session;
 use juice_fuse::JuiceFs;
 use juice_meta::api::new_client;
 use juice_meta::config::{Config as MetaConfig, Format as MetaFormat};
@@ -18,8 +18,8 @@ use juice_storage::{CacheType, Config as ChunkConfig};
 use juice_utils::common::meta::{AtimeMode, StorageType};
 use juice_utils::common::storage::{CacheEviction, ChecksumLevel, UploadHourRange};
 use juice_utils::runtime::LogTarget;
-use juice_vfs::config::Config as VfsConfig;
 use juice_vfs::Vfs;
+use juice_vfs::config::Config as VfsConfig;
 use nix::unistd::{getgid, getpid, getppid, getuid};
 use snafu::ResultExt;
 use tokio_util::sync::CancellationToken;
@@ -29,18 +29,24 @@ use crate::Result;
 
 #[derive(Parser, Debug)]
 pub struct MountOpts {
+    /// The database URL for metadata storage, detail to see [here](https://juicefs.com/docs/zh/community/databases_for_metadata)
     meta_url: String,
+    /// File system mount points, such as: `/mnt/jfs`, `Z:`.
     #[arg(value_parser = parse_mp)]
     mount_point: PathBuf,
+    /// Runs in the background, default is false.
     #[arg(short = 'd', long = "background", default_value_t = false)]
     background: bool,
+    /// Disable system logs, default to false.
     #[arg(long = "no-syslog", default_value_t = false)]
     no_syslog: bool,
+    /// Force mount even if the mount point has been mounted by the same file system (default: false)
     #[arg(long = "force", default_value_t = false)]
     force: bool,
+    /// Location of log files during background runtime (default: $HOME/.juicefs/juicefs.log or /var/log/juicefs.log)
     #[arg(long = "log", env = "JUICEFS_LOG_PATH", default_value_t = default_log_path())]
     pub log_path: String,
-    #[arg(env = "_JFS_META_SID", default_value = None)]
+    #[arg(required = false, env = "_JFS_META_SID", default_value = None)]
     sid: Option<u64>,
     #[command(flatten)]
     fuse_opts: FuseOpts,
@@ -414,17 +420,25 @@ pub async fn juice_mount(shutdown: CancellationToken, opts: &MountOpts) -> Resul
         .expect(format!("chroot {} err", opts.meta_opts.subdir).as_str());
     meta.new_session(true).await.expect("new session err");
     let chunk_config = into_chunk_config(&opts);
+    let vfs_config = into_vfs_config(&meta_config, &format, &chunk_config, &opts);
     let operator = new_operator(
-        opts.data_opts.storage.clone(),
-        &format.bucket,
-        &format.endpoint,
-        &format.access_key.clone().unwrap_or(String::new()),
-        &format.secret_key.clone().unwrap_or(String::new()),
+        vfs_config.format.storage.clone(),
+        &vfs_config.format.bucket,
+        &vfs_config.format.endpoint,
+        &vfs_config
+            .format
+            .access_key
+            .clone()
+            .unwrap_or(String::new()),
+        &vfs_config
+            .format
+            .secret_key
+            .clone()
+            .unwrap_or(String::new()),
     )
     .whatever_context("operator init err:")?;
     info!("Data use {:?}", operator.info());
     let store = new_chunk_store(chunk_config.clone(), operator).whatever_context("store init: ")?;
-    let vfs_config = into_vfs_config(&meta_config, &format, &chunk_config, &opts);
     let vfs = Vfs::new(vfs_config, meta.clone(), store);
     // TODO: update format
 
@@ -433,9 +447,7 @@ pub async fn juice_mount(shutdown: CancellationToken, opts: &MountOpts) -> Resul
     let fs = JuiceFs::new(vfs);
     let not_unprivileged = env::var("NOT_UNPRIVILEGED").ok().as_deref() == Some("1");
     let mut mount_options = fs.mount_opts();
-    mount_options
-        .uid(getuid().as_raw())
-        .gid(getgid().as_raw());
+    mount_options.uid(getuid().as_raw()).gid(getgid().as_raw());
 
     info!(
         "Mounting volumn {} at {}",

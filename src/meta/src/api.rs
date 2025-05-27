@@ -495,7 +495,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()>;
+    async fn check_set_attr(&self, inode: Ino, set: SetAttrMask, attr: &Attr) -> Result<()>;
 
     // Truncate changes the length for given file.
     async fn truncate(

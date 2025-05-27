@@ -478,7 +478,7 @@ where
         })
         .await;
         let mut used_space = match err {
-            Ok(Ok(space)) => space,
+            Ok(Ok(space)) => space.unwrap_or(0),
             other => {
                 warn!("Get used space failed: {:?}. Use cache instead.", other);
                 self.as_ref().fs_stat.used_space.load(Ordering::SeqCst)
@@ -491,7 +491,7 @@ where
         })
         .await;
         let mut used_inodes: i64 = match err {
-            Ok(Ok(inodes)) => inodes,
+            Ok(Ok(inodes)) => inodes.unwrap_or(0),
             other => {
                 warn!("Get used inodes failed: {:?}. Use cache instead.", other);
                 self.as_ref().fs_stat.used_inodes.load(Ordering::SeqCst)

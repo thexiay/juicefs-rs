@@ -957,7 +957,7 @@ impl RedisEngine {
 
 #[async_trait]
 impl Engine for RedisEngine {
-    async fn get_counter(&self, name: &str) -> Result<i64> {
+    async fn get_counter(&self, name: &str) -> Result<Option<i64>> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let key = format!("{}{}", self.prefix, name);

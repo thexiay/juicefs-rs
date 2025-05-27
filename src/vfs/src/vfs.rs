@@ -132,9 +132,44 @@ impl Vfs {
         ino: Ino,
         mask: SetAttrMask,
         fh: Option<Fh>,
-        attr: Attr,
-    ) -> Result<Entry, Errno> {
-        todo!()
+        mut attr: Attr,
+    ) -> Result<AttrNode, Errno> {
+        if self.is_special_inode(ino) {
+            // TODO: support special inode
+            return Err(Errno::EPERM);
+        }
+        
+        if mask.contains(SetAttrMask::SET_SIZE) {
+            self.truncate(ino, fh, attr.length).await?;
+        }
+        if mask.contains(SetAttrMask::SET_MTIME_NOW) || mask.contains(SetAttrMask::SET_MTIME) {
+            if self.check_permission() {
+                self.meta.check_set_attr(
+                    ino,
+                    mask,
+                    &attr,
+                ).await.map_err(|e| {
+                    error!("check set_attr failed: {:?}", e);
+                    e.fs_err()
+                })?;
+            }
+
+            if mask.contains(SetAttrMask::SET_MTIME) {
+                self.writer.update_mtime(ino, DateTime::from_timestamp_nanos(attr.mtime as i64)).await;
+            }
+            if mask.contains(SetAttrMask::SET_MTIME_NOW) {
+                self.writer.update_mtime(ino, Utc::now()).await;
+            } 
+        }
+        self.meta.set_attr(ino, mask, 0, &attr).await.map_err(|e| {
+            error!("set_attr failed: {:?}", e);
+            e.fs_err()
+        })?;
+        self.update_len(ino, &mut attr);
+        Ok(AttrNode {
+            inode: ino,
+            attr: attr,
+        })
     }
 
     pub async fn stat_fs(&self, ino: Ino) -> Result<StatFs, Errno> {
@@ -183,7 +218,7 @@ impl Vfs {
         })
     }
 
-    pub async fn truncate(&self, ino: Ino, fh: Fh, size: u64) -> Result<Attr, Errno> {
+    pub async fn truncate(&self, ino: Ino, fh: Option<Fh>, size: u64) -> Result<Attr, Errno> {
         if self.is_special_inode(ino) {
             return Err(Errno::EPERM);
         }
@@ -202,17 +237,20 @@ impl Vfs {
             info!("flush writer {ino} failed: {:?}, ignore.", e);
         });
 
-        let attr = if fh == 0 {
-            self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
-                error!("truncate failed: {:?}", e);
-                e.fs_err()
-            })?
-        } else {
-            let _ = self.find_handle(ino, fh).ok_or(Errno::EBADF)?;
-            self.meta.truncate(ino, 0, size, true).await.map_err(|e| {
-                error!("truncate failed: {:?}", e);
-                e.fs_err()
-            })?
+        let attr = match fh {
+            Some(fh) => {
+                let _ = self.find_handle(ino, fh).ok_or(Errno::EBADF)?;
+                self.meta.truncate(ino, 0, size, true).await.map_err(|e| {
+                    error!("truncate failed: {:?}", e);
+                    e.fs_err()
+                })?
+            },
+            None => {
+                self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
+                    error!("truncate failed: {:?}", e);
+                    e.fs_err()
+                })?
+            }    
         };
 
         self.writer.truncate(ino, size);
@@ -716,6 +754,21 @@ impl Vfs {
             HandleInner::Dir(_) => Err(Errno::EISDIR),
             HandleInner::Control(_) => todo!(),
         }
+    }
+
+    pub async fn lookup(&self, parent: Ino, name: &str) -> Result<AttrNode, Errno> {
+        // TODO: handle internal node
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let (ino, attr)  = self.meta.lookup(parent, name, true).await.map_err(|e| {
+            error!("lookup failed: {:?}", e);
+            e.fs_err()
+        })?;
+        Ok(AttrNode {
+            inode: ino,
+            attr,
+        })
     }
 }
 
