@@ -58,7 +58,7 @@ pub struct LoggerSettings {
 
 impl Default for LoggerSettings {
     fn default() -> Self {
-        Self::new("risingwave")
+        Self::new("juicefs")
     }
 }
 

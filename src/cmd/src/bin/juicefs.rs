@@ -1,5 +1,5 @@
 use clap::Parser;
-use juice_cmd::{cmd, CliOpts};
+use juice_cmd::{CliOpts, cmd};
 
 fn main() {
     let cli = CliOpts::parse();

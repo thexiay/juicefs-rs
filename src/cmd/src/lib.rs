@@ -1,14 +1,21 @@
 #![feature(assert_matches)]
+#![feature(async_closure)]
+#![feature(unboxed_closures)]
+#![feature(async_fn_traits)]
+#![feature(let_chains)]
 mod admin;
-mod parser;
 mod service;
+mod tool;
 use std::path::PathBuf;
 
-use admin::{juice_format, AdminCommands};
+use admin::{AdminCommands, juice_format};
 use clap::Parser;
-use juice_utils::runtime::{init_juicefs_logger, main_okk, LogTarget, LoggerSettings};
-use service::{juice_mount, ServiceCommands};
+use dirs::home_dir;
+use juice_utils::runtime::{LogTarget, LoggerSettings, init_juicefs_logger, main_okk};
+use nix::unistd::getuid;
+use service::{ServiceCommands, juice_mount};
 use snafu::Whatever;
+use tool::{juice_obj_bench, ToolCommands};
 use tracing::error;
 
 type Result<T, E = Whatever> = std::result::Result<T, E>;
@@ -26,7 +33,8 @@ pub enum CliOpts {
     Inspector,
     #[command(flatten)]
     Service(ServiceCommands),
-    Tool,
+    #[command(flatten)]
+    Tool(ToolCommands),
 }
 
 pub fn cmd(opts: CliOpts) {
@@ -47,7 +55,7 @@ pub fn cmd(opts: CliOpts) {
         CliOpts::Inspector => todo!(),
         CliOpts::Service(service_commands) => match service_commands {
             ServiceCommands::Mount(mount_opts) => {
-                let settings =  {
+                let settings = {
                     let mut settings = LoggerSettings::new("mount")
                         .with_log(PathBuf::from(&mount_opts.log_path))
                         .with_thread_name(true);
@@ -66,7 +74,21 @@ pub fn cmd(opts: CliOpts) {
                 });
             }
         },
-        CliOpts::Tool => todo!(),
+        CliOpts::Tool(tool_commands) => match tool_commands {
+            ToolCommands::Bench(bench_opts) => {
+                init_juicefs_logger(LoggerSettings::new("bench"));
+            }
+            ToolCommands::ObjBench(obj_bench_opts) => {
+                init_juicefs_logger(LoggerSettings::new("obj-bench"));
+                main_okk(|_| {
+                    Box::pin(async move {
+                        if let Err(e) = juice_obj_bench(obj_bench_opts).await {
+                            error!("ObjBench failed: {e}");
+                        }
+                    })
+                });
+            }
+        },
     }
 }
 
@@ -76,7 +98,7 @@ mod tests {
 
     use clap::Parser;
 
-    use crate::{admin::AdminCommands, service::ServiceCommands, CliOpts};
+    use crate::{CliOpts, admin::AdminCommands, service::ServiceCommands};
 
     #[test]
     fn test_mount() {
@@ -98,9 +120,6 @@ mod tests {
             "redis://:mypassword@127.0.1:11000",
         ];
         let opts = CliOpts::try_parse_from(args).unwrap();
-        assert_matches!(
-            opts,
-            CliOpts::Admin(AdminCommands::Format(_))
-        );
+        assert_matches!(opts, CliOpts::Admin(AdminCommands::Format(_)));
     }
 }

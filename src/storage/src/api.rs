@@ -108,13 +108,15 @@ pub fn new_operator(
     endpoint: &str,
     access_key: &str,
     secret_key: &str,
+    root_path: Option<&str>, 
 ) -> Result<Operator> {
+    let root = root_path.unwrap_or("/");
     match storage {
-        StorageType::Mem => Ok(Operator::new(Memory::default().root("/"))?.finish()),
-        StorageType::File => Ok(Operator::new(Fs::default().root("/"))?.finish()),
+        StorageType::Mem => Ok(Operator::new(Memory::default().root(root))?.finish()),
+        StorageType::File => Ok(Operator::new(Fs::default().root(root))?.finish()),
         StorageType::Cos => Ok(Operator::new(
             Cos::default()
-                .root("/")
+                .root(root)
                 .bucket(bucket)
                 .endpoint(endpoint)
                 .secret_id(access_key)

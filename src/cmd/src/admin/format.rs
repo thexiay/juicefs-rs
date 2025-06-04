@@ -2,7 +2,7 @@ use std::{io::Read, path::PathBuf, sync::LazyLock};
 
 use clap::Parser;
 use juice_meta::{
-    api::{new_client, MAX_VERSION},
+    api::{MAX_VERSION, new_client},
     config::Format,
 };
 use juice_storage::api::new_operator;
@@ -12,7 +12,7 @@ use juice_utils::common::{
 };
 use opendal::Operator;
 use regex::Regex;
-use snafu::{whatever, ResultExt};
+use snafu::{ResultExt, whatever};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -245,6 +245,7 @@ pub async fn juice_format(opts: FormatOpts) -> Result<()> {
         &format.endpoint,
         &format.access_key.clone().unwrap_or(String::new()),
         &format.secret_key.clone().unwrap_or(String::new()),
+        None
     )
     .whatever_context("Fail to init operator")?;
     check_blob_connection(&blob, format.uuid.clone()).await?;

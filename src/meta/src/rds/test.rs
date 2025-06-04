@@ -1,17 +1,13 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use crate::{
-    api::Meta,
-    config::Config,
-    rds::RedisEngine,
-};
+use crate::{api::Meta, config::Config, rds::RedisEngine};
 use base_test::test_format;
 use ctor::{ctor, dtor};
 use parking_lot::RwLock;

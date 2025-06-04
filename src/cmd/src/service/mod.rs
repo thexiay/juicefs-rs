@@ -1,4 +1,4 @@
-use clap::{arg, Parser};
+use clap::{Parser, arg};
 use mount::MountOpts;
 
 mod mount;

@@ -6,9 +6,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono::Duration;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dirs::home_dir;
-use fuse3::MountOptions;
 use fuse3::raw::Session;
 use juice_fuse::JuiceFs;
 use juice_meta::api::new_client;
@@ -274,6 +273,19 @@ impl fmt::Display for CacheDir {
     }
 }
 
+fn default_cache_dir() -> CacheDir {
+    if getuid().is_root() {
+        CacheDir(vec![PathBuf::from("/var/jfsCache")])
+    } else {
+        home_dir()
+            .map(|home| {
+                let cache_dir = format!("{}/.juicefs/cache", home.display());
+                CacheDir(vec![PathBuf::from(cache_dir)])
+            })
+            .expect("Failed to get home directory")
+    }
+}
+
 fn default_log_path() -> String {
     let uid = getuid();
     if uid.is_root() {
@@ -285,19 +297,6 @@ fn default_log_path() -> String {
             .join("log")
             .to_string_lossy()
             .into_owned()
-    }
-}
-
-fn default_cache_dir() -> CacheDir {
-    if getuid().is_root() {
-        CacheDir(vec![PathBuf::from("/var/jfsCache")])
-    } else {
-        home_dir()
-            .map(|home| {
-                let cache_dir = format!("{}/.juicefs/cache", home.display());
-                CacheDir(vec![PathBuf::from(cache_dir)])
-            })
-            .expect("Failed to get home directory")
     }
 }
 
@@ -435,6 +434,7 @@ pub async fn juice_mount(shutdown: CancellationToken, opts: &MountOpts) -> Resul
             .secret_key
             .clone()
             .unwrap_or(String::new()),
+        None,
     )
     .whatever_context("operator init err:")?;
     info!("Data use {:?}", operator.info());
