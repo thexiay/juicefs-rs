@@ -3,20 +3,23 @@
 #![feature(unboxed_closures)]
 #![feature(async_fn_traits)]
 #![feature(let_chains)]
+#![feature(exit_status_error)]
 mod admin;
 mod service;
 mod tool;
+pub mod utils;
+
 use std::path::PathBuf;
 
 use admin::{AdminCommands, juice_format};
 use clap::Parser;
-use dirs::home_dir;
 use juice_utils::runtime::{LogTarget, LoggerSettings, init_juicefs_logger, main_okk};
-use nix::unistd::getuid;
 use service::{ServiceCommands, juice_mount};
 use snafu::Whatever;
 use tool::{juice_obj_bench, ToolCommands};
 use tracing::error;
+
+use crate::tool::juice_bench;
 
 type Result<T, E = Whatever> = std::result::Result<T, E>;
 
@@ -77,6 +80,13 @@ pub fn cmd(opts: CliOpts) {
         CliOpts::Tool(tool_commands) => match tool_commands {
             ToolCommands::Bench(bench_opts) => {
                 init_juicefs_logger(LoggerSettings::new("bench"));
+                main_okk(|_| {
+                    Box::pin(async move {
+                        if let Err(e) = juice_bench(bench_opts).await {
+                            error!("Bench failed: {e}");
+                        }
+                    })
+                })
             }
             ToolCommands::ObjBench(obj_bench_opts) => {
                 init_juicefs_logger(LoggerSettings::new("obj-bench"));

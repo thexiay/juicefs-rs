@@ -6,6 +6,7 @@ mod bench;
 mod obj_bench;
 
 pub use obj_bench::juice_obj_bench;
+pub use bench::juice_bench;
 
 #[derive(Parser, Debug)]
 #[command(rename_all = "lower")]
