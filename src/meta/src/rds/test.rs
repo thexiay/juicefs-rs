@@ -1,17 +1,13 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use crate::{
-    api::Meta,
-    config::Config,
-    rds::RedisEngine,
-};
+use crate::{api::Meta, config::Config, rds::RedisEngine};
 use base_test::test_format;
 use ctor::{ctor, dtor};
 use parking_lot::RwLock;
@@ -29,7 +25,6 @@ fn before_all() {
     let mut guard = REDIS_DB_HOLDER.write();
     *guard = Some(RedisDbOffer::new(16));
     // init logger
-    /*
     let default_timer = OffsetTime::local_rfc_3339().unwrap_or_else(|e| {
         println!(
             "failed to get local time offset, falling back to UTC: {}",
@@ -47,7 +42,6 @@ fn before_all() {
         .with_file(true)
         .with_line_number(true);
     tracing_subscriber::registry().with(fmt_layer).init();
-     */
 }
 
 #[dtor]
@@ -214,6 +208,12 @@ async fn test_dir_stat() {}
 
 async fn test_clone() {}
 
-async fn test_acl() {}
+#[traced_test]
+#[tokio::test]
+async fn test_acl() {
+    let guard = REDIS_DB_HOLDER.read();
+    let mut holder = guard.as_ref().unwrap().take(Config::default()).await;
+    base_test::test_acl(&mut holder.engine).await;
+}
 
 async fn test_read_only() {}

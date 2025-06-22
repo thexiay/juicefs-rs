@@ -9,20 +9,20 @@ use snafu::{ensure, ensure_whatever, whatever};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sysinfo::{get_current_pid, PidExt};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use sysinfo::{PidExt, get_current_pid};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::acl::{AclCache, AclExt, AclType, Rule};
 use crate::api::{
-    Attr, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, Meta, ModeMask, OFlag, QuotaOp,
-    RenameMask, Session, SessionInfo, SetAttrMask, Slice, StatFs, Summary, TreeSummary, XattrF,
-    CHUNK_SIZE, MAX_VERSION, RESERVED_INODE, ROOT_INODE, TRASH_INODE, TRASH_NAME,
+    Attr, CHUNK_SIZE, Entry, Falloc, Fcntl, Flag, INodeType, Ino, InoExt, MAX_VERSION, Meta,
+    ModeMask, OFlag, QuotaOp, RESERVED_INODE, ROOT_INODE, RenameMask, Session, SessionInfo,
+    SetAttrMask, Slice, StatFs, Summary, TRASH_INODE, TRASH_NAME, TreeSummary, XattrF,
 };
 use crate::config::{Config, Format};
 use crate::context::{UserExt, WithContext};
@@ -36,8 +36,8 @@ use crate::openfile::OpenFiles2;
 use crate::quota::{MetaQuota, Quota, QuotaView};
 use crate::slice::{MetaCompact, PSlices};
 use crate::utils::{
-    access_mode, align_4k, relation_need_update, sleep_with_jitter, DeleteFileOption, FLockItem,
-    FreeID, PLockItem,
+    DeleteFileOption, FLockItem, FreeID, PLockItem, access_mode, align_4k, relation_need_update,
+    sleep_with_jitter,
 };
 
 pub const INODE_BATCH: i64 = 1 << 10;
@@ -125,7 +125,7 @@ pub enum SetQuota {
 #[async_trait]
 pub trait Engine: WithContext + Send + Sync + 'static {
     // Get the value of counter name.
-    async fn get_counter(&self, name: &str) -> Result<i64>;
+    async fn get_counter(&self, name: &str) -> Result<Option<i64>>;
     // Increase counter name by value. Do not use this if value is 0, use getCounter instead.
     async fn incr_counter(&self, name: &str, value: i64) -> Result<i64>;
     // Set counter name to value if old <= value - diff.
@@ -401,7 +401,7 @@ pub struct CommonMeta {
     pub deleting_slice_ctx: Option<(Sender<(u64, u32)>, Receiver<(u64, u32)>)>,
     pub symlinks: Mutex<HashMap<Ino, (Option<u128>, String)>>, // ino -> (atime, path)
     pub reload_format_callbacks: Vec<Box<dyn Fn(Arc<Format>) + Send + Sync>>,
-    pub acl_cache: AsyncMutex<AclCache>,
+    pub acl_cache: AsyncRwLock<AclCache>,
     pub dir_stats_batch: Mutex<HashMap<Ino, DirStat>>,
     pub fs_stat: FsStat,
     pub dir_parents: Mutex<HashMap<Ino, Ino>>, // directory inode -> parent inode
@@ -444,7 +444,7 @@ impl CommonMeta {
             symlinks: Mutex::new(HashMap::new()),
             reload_format_callbacks: Vec::new(),
             ses_umounting: AsyncMutex::new(false),
-            acl_cache: AsyncMutex::new(AclCache::default()),
+            acl_cache: AsyncRwLock::new(AclCache::default()),
             dir_stats_batch: Mutex::new(HashMap::new()),
             fs_stat: FsStat::default(),
             dir_parents: Mutex::new(HashMap::new()),
@@ -572,22 +572,15 @@ where
                     }
 
                     match self
-                        .do_mknod(
-                            TRASH_INODE,
-                            &name,
-                            0,
-                            "",
-                            trash_ino,
-                            Attr {
-                                typ: INodeType::Directory,
-                                nlink: 2,
-                                length: 4 << 10,
-                                mode: 0o555,
-                                parent: TRASH_INODE,
-                                full: true,
-                                ..Attr::default()
-                            },
-                        )
+                        .do_mknod(TRASH_INODE, &name, 0, "", trash_ino, Attr {
+                            typ: INodeType::Directory,
+                            nlink: 2,
+                            length: 4 << 10,
+                            mode: 0o555,
+                            parent: TRASH_INODE,
+                            full: true,
+                            ..Attr::default()
+                        })
                         .await
                     {
                         Ok(_) => {
@@ -1149,11 +1142,17 @@ where
             }
 
             match self.get_counter(USED_SPACE).await {
-                Ok(v) => base.fs_stat.used_space.store(v, Ordering::SeqCst),
+                Ok(v) => base
+                    .fs_stat
+                    .used_space
+                    .store(v.unwrap_or(0), Ordering::SeqCst),
                 Err(e) => warn!("Get counter {}: {}", USED_SPACE, e),
             }
             match self.get_counter(USED_INODES).await {
-                Ok(v) => base.fs_stat.used_inodes.store(v, Ordering::SeqCst),
+                Ok(v) => base
+                    .fs_stat
+                    .used_inodes
+                    .store(v.unwrap_or(0), Ordering::SeqCst),
                 Err(e) => warn!("Get counter {}: {}", USED_INODES, e),
             }
             self.load_quotas().await;
@@ -1636,13 +1635,10 @@ where
                     self.do_init(format, false).await?;
                 }
                 let origin_capacity = self
-                    .do_set_quota(
-                        inode,
-                        SetQuota::Capacity {
-                            space: quota.max_space,
-                            inodes: quota.max_inodes,
-                        },
-                    )
+                    .do_set_quota(inode, SetQuota::Capacity {
+                        space: quota.max_space,
+                        inodes: quota.max_inodes,
+                    })
                     .await?;
                 if origin_capacity.is_none() {
                     // new quota need to update used space and used inodes
@@ -1656,13 +1652,10 @@ where
                         }
                         .build()
                     })?;
-                    self.do_set_quota(
-                        inode,
-                        SetQuota::Repair {
-                            space: sum.size - align_4k(0) as u64,
-                            inodes: sum.dirs + sum.files - 1,
-                        },
-                    )
+                    self.do_set_quota(inode, SetQuota::Repair {
+                        space: sum.size - align_4k(0) as u64,
+                        inodes: sum.dirs + sum.files - 1,
+                    })
                     .await
                     .map_err(|err| {
                         error!(
@@ -1731,13 +1724,10 @@ where
                     quota.used_space = used_space;
                     quotas.insert(dpath.to_string(), quota.clone());
                     info!("repairing...");
-                    self.do_set_quota(
-                        ino,
-                        SetQuota::Repair {
-                            space: used_space,
-                            inodes: used_inodes,
-                        },
-                    )
+                    self.do_set_quota(ino, SetQuota::Repair {
+                        space: used_space,
+                        inodes: used_inodes,
+                    })
                     .await?;
                     Ok(quotas)
                 } else {
@@ -1925,12 +1915,9 @@ where
             Err(e) => {
                 if e.is_op_not_supported() && fallback {
                     let level_path = path.split("/").collect::<Vec<&str>>();
-                    ensure!(
-                        level_path.iter().any(|p| !p.is_empty()),
-                        InvalidArgSnafu {
-                            arg: format!("resolve: path: {path}")
-                        }
-                    );
+                    ensure!(level_path.iter().any(|p| !p.is_empty()), InvalidArgSnafu {
+                        arg: format!("resolve: path: {path}")
+                    });
                     let mut p = parent;
                     let mut ino_attr = None;
                     for path in level_path.iter().filter(|p| !p.is_empty()) {
@@ -2013,8 +2000,21 @@ where
     }
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()> {
-        todo!()
+    async fn check_set_attr(&self, inode: Ino, set: SetAttrMask, attr: &Attr) -> Result<()> {
+        let inode = self.as_ref().check_root(inode);
+        let cur = self.do_get_attr(inode).await?;
+        self.merge_attr(
+            inode,
+            set,
+            &cur,
+            &attr,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards"),
+            &mut None,
+        )
+        .await?;
+        Ok(())
     }
 
     // Truncate changes the length for given file.
@@ -2061,30 +2061,21 @@ where
             }
             .fail()?;
         }
-        ensure!(
-            flag != Falloc::INSERT_RANGE,
-            OpNotSupportedSnafu {
-                op: "not support op: INSERT RANGE. "
-            }
-        );
-        ensure!(
-            flag != Falloc::COLLAPES_RANGE,
-            OpNotSupportedSnafu {
-                op: "not support op: INSERT RANGE. "
-            }
-        );
+        ensure!(flag != Falloc::INSERT_RANGE, OpNotSupportedSnafu {
+            op: "not support op: INSERT RANGE. "
+        });
+        ensure!(flag != Falloc::COLLAPES_RANGE, OpNotSupportedSnafu {
+            op: "not support op: INSERT RANGE. "
+        });
         if flag.intersects(Falloc::PUNCH_HOLE) && !flag.intersects(Falloc::KEEP_SIZE) {
             return InvalidArgSnafu {
                 arg: format!("fallocate: KEEP_SIZE with size 0"),
             }
             .fail()?;
         }
-        ensure!(
-            size != 0,
-            InvalidArgSnafu {
-                arg: "fallocate: size 0"
-            }
-        );
+        ensure!(size != 0, InvalidArgSnafu {
+            arg: "fallocate: size 0"
+        });
 
         let chunks = match self.as_ref().open_files.chunks(inode) {
             Some(chunks) => chunks,
@@ -2109,7 +2100,8 @@ where
     // ReadLink returns the target of a symlink.
     async fn read_symlink(&self, inode: Ino) -> Result<String> {
         let base = self.as_ref();
-        let no_atime = self.as_ref().conf.atime_mode == AtimeMode::NoAtime || self.as_ref().conf.read_only;
+        let no_atime =
+            self.as_ref().conf.atime_mode == AtimeMode::NoAtime || self.as_ref().conf.read_only;
 
         {
             let symlinks = base.symlinks.lock();
@@ -2285,14 +2277,14 @@ where
                 return InvalidArgSnafu {
                     arg: format!("rmdir: invalid name: {name}"),
                 }
-                .fail()?
+                .fail()?;
             }
             ".." => {
                 return DirNotEmptySnafu {
                     parent,
                     name: name.to_string(),
                 }
-                .fail()?
+                .fail()?;
             }
             _ => {}
         }
@@ -2391,7 +2383,7 @@ where
                 return InvalidArgSnafu {
                     arg: "rename flags",
                 }
-                .fail()?
+                .fail()?;
             }
         }
 
@@ -2895,7 +2887,7 @@ where
             .await?
         {
             self.update_parent_stats(fout, delta_ino, delta_stat.length, delta_stat.space)
-            .await;
+                .await;
             Ok(Some((copy_size, dst_length)))
         } else {
             Ok(None)
@@ -2929,24 +2921,18 @@ where
     // SetXattr update the extended attribute of a node.
     async fn set_xattr(&self, inode: Ino, name: &str, value: Vec<u8>, flag: XattrF) -> Result<()> {
         ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
-        ensure!(
-            !name.is_empty(),
-            InvalidArgSnafu {
-                arg: "set xattr empty name"
-            }
-        );
+        ensure!(!name.is_empty(), InvalidArgSnafu {
+            arg: "set xattr empty name"
+        });
         self.do_set_xattr(inode, name, value, flag).await
     }
 
     // RemoveXattr removes the extended attribute of a node.
     async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<()> {
         ensure!(!self.as_ref().conf.read_only, ReadFSSnafu);
-        ensure!(
-            !name.is_empty(),
-            InvalidArgSnafu {
-                arg: "remove xattr empty name"
-            }
-        );
+        ensure!(!name.is_empty(), InvalidArgSnafu {
+            arg: "remove xattr empty name"
+        });
 
         self.do_remove_xattr(self.as_ref().check_root(inode), name)
             .await
@@ -3094,7 +3080,10 @@ where
 
     // Change root to a directory specified by subdir
     async fn chroot(&self, subdir: &str) -> Result<Ino> {
-        let level_subdir = subdir.split("/").filter(|s| !s.is_empty()).collect::<Vec<&str>>();
+        let level_subdir = subdir
+            .split("/")
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<&str>>();
         let mut tmp_root = self.as_ref().root();
         for subdir in level_subdir {
             let (inode, attr) = match self.lookup(tmp_root, subdir, false).await {
@@ -3107,10 +3096,9 @@ where
                     }
                 }
             };
-            ensure!(
-                attr.typ == INodeType::Directory,
-                NotDir2Snafu { ino: inode }
-            );
+            ensure!(attr.typ == INodeType::Directory, NotDir2Snafu {
+                ino: inode
+            });
             tmp_root = inode;
         }
         self.as_ref().chroot(tmp_root);

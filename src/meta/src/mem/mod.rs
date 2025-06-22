@@ -55,7 +55,7 @@ impl MemEngine {
 #[async_trait]
 impl Engine for MemEngine {
     // Get the value of counter name.
-    async fn get_counter(&self, name: &str) -> Result<i64> {
+    async fn get_counter(&self, name: &str) -> Result<Option<i64>> {
         todo!()
     }
     // Increase counter name by value. Do not use this if value is 0, use getCounter instead.

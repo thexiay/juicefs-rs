@@ -1,10 +1,10 @@
-use clap::{arg, Parser};
+use clap::{Parser, arg};
 use mount::MountOpts;
 
 mod mount;
 pub use mount::juice_mount;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub enum ServiceCommands {
     Mount(MountOpts),
 }

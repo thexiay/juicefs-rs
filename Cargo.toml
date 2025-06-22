@@ -83,3 +83,4 @@ rustls = { version = "0.23.5", features = ["ring"] }
 thiserror-ext = { version = "0.2.1", features = ["backtrace"] }
 pprof = { version = "0.14", features = ["flamegraph"] }
 anyhow = "1"
+indicatif = "0.17"

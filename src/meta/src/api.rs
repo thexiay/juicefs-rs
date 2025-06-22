@@ -84,6 +84,22 @@ pub enum QuotaOp {
     Check,
 }
 
+// AttrNode is an [`Entry`] with name
+#[derive(Debug, Clone)]
+pub struct AttrNode {
+    pub inode: Ino,
+    pub attr: Attr,
+}
+
+impl From<Entry> for AttrNode {
+    fn from(entry: Entry) -> Self {
+        AttrNode {
+            inode: entry.inode,
+            attr: entry.attr,
+        }
+    }
+}
+
 // Entry is an entry inside a directory.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -479,7 +495,7 @@ pub trait Meta: WithContext + Send + Sync + 'static {
     ) -> Result<()>;
 
     // Check setting attr is allowed or not
-    async fn check_set_attr(&self, inode: Ino, set: u16, attr: &Attr) -> Result<()>;
+    async fn check_set_attr(&self, inode: Ino, set: SetAttrMask, attr: &Attr) -> Result<()>;
 
     // Truncate changes the length for given file.
     async fn truncate(

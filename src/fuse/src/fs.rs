@@ -1,5 +1,6 @@
 use std::cmp::max;
 use std::ffi::{OsStr, OsString};
+use std::num::NonZeroU32;
 use std::result::Result as StdResult;
 use std::time::Duration;
 
@@ -12,15 +13,17 @@ use fuse3::raw::reply::{
     ReplyOpen, ReplyPoll, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use fuse3::raw::{Filesystem, Request};
-use fuse3::{FileType, Inode, Result, SetAttr, Timestamp};
+use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use futures_async_stream::stream;
-use juice_meta::api::{Attr, Entry, Falloc, INodeType, OFlag, SetAttrMask};
+use juice_meta::api::{Attr, AttrNode, Entry, Falloc, INodeType, OFlag, SetAttrMask};
 use juice_utils::fs::{self, FsContext};
 use juice_vfs::Vfs;
 use nix::errno::Errno;
+use nix::unistd::{getuid, Uid};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::fuse_kernel;
 
@@ -38,6 +41,41 @@ impl JuiceFs {
         }
     }
 
+    /// Supportted mount options: https://www.man7.org/linux/man-pages/man8/fuse.8.html
+    pub fn mount_opts(&self) -> MountOptions {
+        let mut opts = MountOptions::default();
+        Self::prepare_mount();
+        let format = self.vfs.meta_format();
+        // Filesystem in `df -T`
+        opts.fs_name(format!("JuiceFS: {}", format.name));
+        opts.default_permissions(format.enable_acl);
+        opts.dont_mask(format.enable_acl);
+        opts.allow_other(getuid() == Uid::from_raw(0));
+        // Below is juice-go default configuration:
+        // 1. SingleThreaded: handle kernel fuse request in a single thread. go: fasle, rust: false
+        // 2. MaxBackground: The maximum number of in-flight asynchronous requests allowed by the kernel. 
+        //    go: 50, rust: 12.
+        // 3. MaxWrite: The maximum number of bytes allowed by a single write request (write) by the user space file 
+        //    system. go: 1 << 20, rust: 1 << 20.
+        // 4. MaxReadAhead: Shows the maximum number of bytes of kernel read-ahead. go: 1 << 20, rust: dependency on
+        //    kernel defautl value 1 << 20.
+        opts
+    }
+
+    fn prepare_mount() {
+        if cfg!(target_os = "linux") {
+            if let Err(e) = Self::set_priority() {
+                warn!("set priority failed: {}", e);
+            }
+            if let Err(e) = Self::grant_fuse_access() {
+                warn!("grant access failed: {}", e);
+            }
+            if let Err(e) = Self::ensure_fuse_dev() {
+                warn!("ensure fuse dev failed: {}", e);
+            }
+        }
+    }
+
     fn login(req: Request) -> FsContext {
         FsContext::new(req.uid, req.gid, req.pid, true)
     }
@@ -51,8 +89,9 @@ impl JuiceFs {
         fs::task_local::scope(ctx, f).await
     }
 
-    async fn reply_entry(vfs: &Vfs, entry: Entry) -> ReplyEntry {
+    async fn reply_entry(vfs: &Vfs, attr_node: impl Into<AttrNode>) -> ReplyEntry {
         // TODO: distinguish attr ttl and entry ttl
+        let entry: AttrNode = attr_node.into();
         let duration = match entry.attr.typ {
             INodeType::Directory => vfs.config().dir_entry_timeout,
             _ => vfs.config().entry_timeout,
@@ -67,9 +106,10 @@ impl JuiceFs {
         }
     }
 
-    async fn reply_attr(vfs: &Vfs, mut entry: Entry) -> ReplyAttr {
+    async fn reply_attr(vfs: &Vfs, attr_node: impl Into<AttrNode>) -> ReplyAttr {
         // Notice: There needs to be a mechanism here to prevent the problem that thread A changes Attr in
         // multi-threading situations, and thread B is not visible to Attr at this time.
+        let mut entry: AttrNode = attr_node.into();
         let attr_ttl = if vfs.is_special_inode(entry.inode) {
             Duration::from_hours(1)
         } else if entry.attr.typ == INodeType::File && vfs.modified_since(&entry.inode) {
@@ -200,7 +240,9 @@ impl JuiceFs {
 impl Filesystem for JuiceFs {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit> {
-        todo!()
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(1 << 20).unwrap(),
+        })
     }
 
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
@@ -211,7 +253,12 @@ impl Filesystem for JuiceFs {
 
     /// look up a directory entry by name and get its attributes.
     async fn lookup(&self, req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
-        todo!()
+        self.login_with_action(req, async {
+            match self.vfs.lookup(parent, &name.to_string_lossy()).await {
+                Ok(entry) => Ok(Self::reply_entry(&self.vfs, entry).await),
+                Err(e) => Err((e as i32).into()),
+            }
+        }).await
     }
 
     /// forget an inode. The nlookup parameter indicates the number of lookups previously

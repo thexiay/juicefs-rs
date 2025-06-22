@@ -2,7 +2,7 @@ use std::{io::Read, path::PathBuf, sync::LazyLock};
 
 use clap::Parser;
 use juice_meta::{
-    api::{new_client, MAX_VERSION},
+    api::{MAX_VERSION, new_client},
     config::Format,
 };
 use juice_storage::api::new_operator;
@@ -12,11 +12,11 @@ use juice_utils::common::{
 };
 use opendal::Operator;
 use regex::Regex;
-use snafu::{whatever, ResultExt};
+use snafu::{ResultExt, whatever};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::Result;
+use crate::{CliOpts, Result};
 
 const MIN_CLIENT_VERSION: &str = "1.1.0-A";
 const MAX_CLIENT_VERSION: &str = "1.2.0-A";
@@ -25,11 +25,11 @@ const STROAGE_IGNORED_ITEM: &str = "testing";
 const STROAGE_IGNORED_PREFIX: &str = "testing/";
 const STROAGE_TEST_ITEM: &str = "juicefs_uuid";
 
-
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub struct FormatOpts {
+    #[arg(name = "meta-url")]
     meta_url: String,
-    #[arg(value_parser = validate_name)]
+    #[arg(name = "name", value_parser = validate_name)]
     name: String,
     /// overwrite existing format
     #[arg(long = "force", default_value_t = false)]
@@ -45,7 +45,7 @@ pub struct FormatOpts {
     management_opts: ManagementOpts,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct DataStorageOpts {
     /// Object storage type (e.g. s3, gs, oss, cos) (default: file, refer to documentation for all supported object
     ///  storage types)
@@ -73,7 +73,7 @@ struct DataStorageOpts {
     storage_class: Option<String>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct DataFormatOpts {
     /// size of block in KiB (default: 4M). 4M is usually a better default value because many object storage
     /// services use 4M as their internal block size, thus using the same block size in JuiceFS usually yields better
@@ -116,7 +116,7 @@ struct DataFormatOpts {
     shards: Shards,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct ManagementOpts {
     /// storage space limit in GiB, default to 0 which means no limit. Capacity will include trash files, if trash is
     /// enabled.
@@ -133,7 +133,7 @@ struct ManagementOpts {
     trash_days: Option<u8>,
 
     /// enable POSIX ACL，it is irreversible.
-    #[arg(long = "enable-acl", default_value_t = true)]
+    #[arg(long = "enable-acl", default_value_t = true, action = clap::ArgAction::Set)]
     enable_acl: bool,
 }
 
@@ -203,11 +203,17 @@ async fn check_blob_connection(blob: &Operator, uuid: Uuid) -> Result<()> {
         if entry.metadata().is_dir() {
             continue;
         }
-        if entry.path() != STROAGE_IGNORED_ITEM && entry.path().starts_with(STROAGE_IGNORED_PREFIX) {
-            whatever!("Storage {blob:?} is not empty; please clean it up or pick another volume name");
+        if entry.path() != STROAGE_IGNORED_ITEM && entry.path().starts_with(STROAGE_IGNORED_PREFIX)
+        {
+            whatever!(
+                "Storage {blob:?} is not empty; please clean it up or pick another volume name"
+            );
         }
     }
-    if let Err(e) = blob.write(STROAGE_TEST_ITEM, uuid.into_bytes().to_vec()).await {
+    if let Err(e) = blob
+        .write(STROAGE_TEST_ITEM, uuid.into_bytes().to_vec())
+        .await
+    {
         warn!("Put uuid object: {}", e);
     }
     Ok(())
@@ -239,7 +245,9 @@ pub async fn juice_format(opts: FormatOpts) -> Result<()> {
         &format.endpoint,
         &format.access_key.clone().unwrap_or(String::new()),
         &format.secret_key.clone().unwrap_or(String::new()),
-    ).whatever_context("Fail to init operator")?;
+        None
+    )
+    .whatever_context("Fail to init operator")?;
     check_blob_connection(&blob, format.uuid.clone()).await?;
     info!("Volume is formatted as {:#?}", format);
     if let Err(e) = meta.init(format, opts.force).await {

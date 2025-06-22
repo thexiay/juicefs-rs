@@ -1,45 +1,51 @@
 use std::env;
-use std::fmt::{self, Formatter};
+use std::fmt::{self, Debug, Formatter};
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono::Duration;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dirs::home_dir;
 use fuse3::raw::Session;
-use fuse3::MountOptions;
 use juice_fuse::JuiceFs;
-use juice_meta::config::{Config as MetaConfig, Format as MetaFormat};
 use juice_meta::api::new_client;
+use juice_meta::config::{Config as MetaConfig, Format as MetaFormat};
 use juice_storage::api::{new_chunk_store, new_operator};
 use juice_storage::{CacheType, Config as ChunkConfig};
 use juice_utils::common::meta::{AtimeMode, StorageType};
 use juice_utils::common::storage::{CacheEviction, ChecksumLevel, UploadHourRange};
-use juice_vfs::config::Config as VfsConfig;
+use juice_utils::runtime::LogTarget;
 use juice_vfs::Vfs;
+use juice_vfs::config::Config as VfsConfig;
 use nix::unistd::{getgid, getpid, getppid, getuid};
-use snafu::{whatever, ResultExt, Whatever};
+use snafu::ResultExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::Result;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub struct MountOpts {
+    /// The database URL for metadata storage, detail to see [here](https://juicefs.com/docs/zh/community/databases_for_metadata)
     meta_url: String,
+    /// File system mount points, such as: `/mnt/jfs`, `Z:`.
     #[arg(value_parser = parse_mp)]
     mount_point: PathBuf,
+    /// Runs in the background, default is false.
     #[arg(short = 'd', long = "background", default_value_t = false)]
     background: bool,
+    /// Disable system logs, default to false.
     #[arg(long = "no-syslog", default_value_t = false)]
     no_syslog: bool,
+    /// Force mount even if the mount point has been mounted by the same file system (default: false)
     #[arg(long = "force", default_value_t = false)]
     force: bool,
+    /// Location of log files during background runtime (default: $HOME/.juicefs/juicefs.log or /var/log/juicefs.log)
     #[arg(long = "log", env = "JUICEFS_LOG_PATH", default_value_t = default_log_path())]
     pub log_path: String,
-    #[arg(env = "_JFS_META_SID", default_value = None)]
+    #[arg(required = false, env = "_JFS_META_SID", default_value = None)]
     sid: Option<u64>,
     #[command(flatten)]
     fuse_opts: FuseOpts,
@@ -51,12 +57,20 @@ pub struct MountOpts {
     data_opts: DataStorageOpts,
     #[command(flatten)]
     data_cache_ops: DataCacheOpts,
+    #[command(flatten)]
+    pub log_opts: LogOpts,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
+pub struct LogOpts {
+    #[arg(long = "log-targets")]
+    pub log_targets: Vec<LogTarget>,
+}
+
+#[derive(Parser, Debug)]
 struct FuseOpts {}
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct MetaOpts {
     /// Mount the specified subdirectory and mount the entire file system by default.
     #[arg(long = "subdir", default_value = "/")]
@@ -79,7 +93,7 @@ struct MetaOpts {
     skip_dir_mtime: Duration,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct MetaCacheOpts {
     #[arg(long = "attr-cache", default_value_t = 1)]
     attr_cache: u64,
@@ -99,7 +113,7 @@ struct MetaCacheOpts {
     negative_entry_cache: u64,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct DataStorageOpts {
     #[arg(long = "storage", value_enum, default_value_t = StorageType::File)]
     storage: StorageType,
@@ -148,7 +162,7 @@ struct DataStorageOpts {
     download_limit: u32,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct DataCacheOpts {
     /// Total size of read and write buffer; unit is MiB (default: 300)
     #[arg(long = "buffer-size", default_value_t = 300)]
@@ -201,13 +215,13 @@ struct DataCacheOpts {
     /// The following levels are supported:
     ///
     /// - none: Disable consistency checking, if local data is tampered with, wrong data will be read;
-    /// - full (default before 1.3): Check only when reading the complete data block, suitable for sequential reading 
+    /// - full (default before 1.3): Check only when reading the complete data block, suitable for sequential reading
     ///   scenarios;
     /// - shrink: Verify the slice data within the read range. The check range does not contain the slice where the read
     ///   boundary is located (can be understood as an open interval), which is suitable for random reading scenarios;
-    /// - extend (default after 1.3): Verify the slice data in the read range. The verification range also contains the 
-    ///   slice where the read boundary is located (which can be understood as a closed interval), so it will bring a 
-    ///   certain degree of read amplification, suitable for random reading scenarios with extreme requirements for 
+    /// - extend (default after 1.3): Verify the slice data in the read range. The verification range also contains the
+    ///   slice where the read boundary is located (which can be understood as a closed interval), so it will bring a
+    ///   certain degree of read amplification, suitable for random reading scenarios with extreme requirements for
     ///   accuracy.
     #[arg(long = "verify-cache-checksum", value_enum, default_value_t = ChecksumLevel::Extend)]
     verify_cache_checksum: ChecksumLevel,
@@ -259,6 +273,19 @@ impl fmt::Display for CacheDir {
     }
 }
 
+fn default_cache_dir() -> CacheDir {
+    if getuid().is_root() {
+        CacheDir(vec![PathBuf::from("/var/jfsCache")])
+    } else {
+        home_dir()
+            .map(|home| {
+                let cache_dir = format!("{}/.juicefs/cache", home.display());
+                CacheDir(vec![PathBuf::from(cache_dir)])
+            })
+            .expect("Failed to get home directory")
+    }
+}
+
 fn default_log_path() -> String {
     let uid = getuid();
     if uid.is_root() {
@@ -270,19 +297,6 @@ fn default_log_path() -> String {
             .join("log")
             .to_string_lossy()
             .into_owned()
-    }
-}
-
-fn default_cache_dir() -> CacheDir {
-    if getuid().is_root() {
-        CacheDir(vec![PathBuf::from("/var/jfsCache")])
-    } else {
-        home_dir()
-            .map(|home| {
-                let cache_dir = format!("{}/.juicefs/cache", home.display());
-                CacheDir(vec![PathBuf::from(cache_dir)])
-            })
-            .expect("Failed to get home directory")
     }
 }
 
@@ -389,7 +403,7 @@ async fn backgroup_tasks() {
     // metrics and backup meta
 }
 
-pub async fn juice_mount(shutdown: CancellationToken, opts: MountOpts) {
+pub async fn juice_mount(shutdown: CancellationToken, opts: &MountOpts) -> Result<()> {
     // 1. init vfs
     let meta_config = into_meta_config(&opts);
     let meta = new_client(&opts.meta_url, meta_config.clone()).await;
@@ -400,40 +414,54 @@ pub async fn juice_mount(shutdown: CancellationToken, opts: MountOpts) {
         }
     };
 
-    meta.chroot(&opts.meta_opts.subdir).await.expect(format!("chroot {} err", opts.meta_opts.subdir).as_str());
+    meta.chroot(&opts.meta_opts.subdir)
+        .await
+        .expect(format!("chroot {} err", opts.meta_opts.subdir).as_str());
     meta.new_session(true).await.expect("new session err");
     let chunk_config = into_chunk_config(&opts);
-    let operator = new_operator(
-        opts.data_opts.storage.clone(),
-        &format.bucket,
-        &format.endpoint,
-        &format.access_key.clone().unwrap_or(String::new()),
-        &format.secret_key.clone().unwrap_or(String::new()),
-    )
-    .expect("operator init err:");
-    let store = new_chunk_store(chunk_config.clone(), operator).expect("store init: ");
     let vfs_config = into_vfs_config(&meta_config, &format, &chunk_config, &opts);
+    let operator = new_operator(
+        vfs_config.format.storage.clone(),
+        &vfs_config.format.bucket,
+        &vfs_config.format.endpoint,
+        &vfs_config
+            .format
+            .access_key
+            .clone()
+            .unwrap_or(String::new()),
+        &vfs_config
+            .format
+            .secret_key
+            .clone()
+            .unwrap_or(String::new()),
+        None,
+    )
+    .whatever_context("operator init err:")?;
+    info!("Data use {:?}", operator.info());
+    let store = new_chunk_store(chunk_config.clone(), operator).whatever_context("store init: ")?;
     let vfs = Vfs::new(vfs_config, meta.clone(), store);
     // TODO: update format
 
     // 2. do mount
+    std::fs::create_dir_all(&opts.mount_point).whatever_context("create mount point fail")?;
+    let fs = JuiceFs::new(vfs);
     let not_unprivileged = env::var("NOT_UNPRIVILEGED").ok().as_deref() == Some("1");
-    let mut mount_options = MountOptions::default();
-    mount_options
-        .fs_name("juicefs")
-        .force_readdir_plus(true)
-        .uid(getuid().as_raw())
-        .gid(getgid().as_raw());
+    let mut mount_options = fs.mount_opts();
+    mount_options.uid(getuid().as_raw()).gid(getgid().as_raw());
 
-    info!("Mounting volumn {} at {}", format.name, opts.mount_point.display());
+    info!(
+        "Mounting volumn {} at {}",
+        format.name,
+        opts.mount_point.display()
+    );
     let mut mount_handle = if !not_unprivileged {
         Session::new(mount_options)
-            .mount_with_unprivileged(JuiceFs::new(vfs), &opts.mount_point)
+            .mount_with_unprivileged(fs, &opts.mount_point)
             .await
             .unwrap()
     } else {
         Session::new(mount_options)
-            .mount(JuiceFs::new(vfs), &opts.mount_point)
+            .mount(fs, &opts.mount_point)
             .await
             .unwrap()
     };
@@ -447,4 +475,5 @@ pub async fn juice_mount(shutdown: CancellationToken, opts: MountOpts) {
             info!("The juicefs mount process exit successfully, mountpoint: {}", opts.mount_point.display())
         }
     }
+    Ok(())
 }

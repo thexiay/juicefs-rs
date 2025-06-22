@@ -165,10 +165,10 @@ impl Display for LuaScriptArg {
 macro_rules! async_transaction {
     ($conn:expr, $keys:expr, $body:expr) => {
         loop {
-            cmd("WATCH").arg($keys).query_async($conn).await?;
+            cmd("WATCH").arg($keys).query_async::<()>($conn).await?;
             match $body {
                 Ok(Some(response)) => {
-                    cmd("UNWATCH").query_async($conn).await?;
+                    cmd("UNWATCH").query_async::<()>($conn).await?;
                     break Ok(response);
                 }
                 Ok(None) => continue,
@@ -695,9 +695,11 @@ impl RedisEngine {
         if !id.is_valid_acl() {
             return Ok(None);
         }
-        let mut cache = self.meta.acl_cache.lock().await;
-        if let Some(rule) = cache.get(id) {
-            return Ok(Some(rule));
+        {
+            let cache = self.meta.acl_cache.read().await;
+            if let Some(rule) = cache.get(id) {
+                return Ok(Some(rule));
+            }
         }
 
         let mut pipe = pipe();
@@ -718,6 +720,7 @@ impl RedisEngine {
                     }
                     Some(cmds) => {
                         let rule: Rule = bincode::deserialize(&cmds)?;
+                        let mut cache = self.meta.acl_cache.write().await;
                         cache.put(id, rule.clone());
                         Ok(Some(rule))
                     }
@@ -737,12 +740,12 @@ impl RedisEngine {
             .await
             .unwrap_or_else(|e| warn!("SetFacl: load miss acls error: {}", e));
         // set acl
-        let mut cache = self.meta.acl_cache.lock().await;
+        let mut cache = self.meta.acl_cache.write().await;
         match cache.get_id(&rule) {
             Some(acl_id) => Ok(acl_id),
             None => {
                 let new_id = self.incr_counter(acl::ACL_COUNTER, 1).await?;
-                conn.hset_nx(self.acl_key(), new_id, bincode::serialize(&rule)?)
+                conn.hset_nx::<_, _, _, ()>(self.acl_key(), new_id, bincode::serialize(&rule)?)
                     .await?;
                 cache.put(new_id as u32, rule);
                 Ok(new_id as u32)
@@ -751,7 +754,7 @@ impl RedisEngine {
     }
 
     async fn load_miss_acls(&self, conn: &mut impl AsyncCommands) -> Result<()> {
-        let mut cache = self.meta.acl_cache.lock().await;
+        let mut cache = self.meta.acl_cache.write().await;
         let miss_ids = cache.get_miss_ids();
         match miss_ids.is_empty() {
             true => Ok(()),
@@ -954,7 +957,7 @@ impl RedisEngine {
 
 #[async_trait]
 impl Engine for RedisEngine {
-    async fn get_counter(&self, name: &str) -> Result<i64> {
+    async fn get_counter(&self, name: &str) -> Result<Option<i64>> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
         let key = format!("{}{}", self.prefix, name);
@@ -1003,7 +1006,7 @@ impl Engine for RedisEngine {
             }
         })
     }
-    
+
     // redisMeta updates the usage in each transaction
     async fn flush_stats(&self) {}
 
@@ -1020,12 +1023,12 @@ impl Engine for RedisEngine {
     async fn do_new_session(&self, sid: u64, sinfo: &[u8], update: bool) -> Result<()> {
         let mut pool_conn = self.exclusive_conn().await?;
         let conn = pool_conn.deref_mut();
-        conn.zadd(self.all_sessions(), &sid, self.expire_time())
+        conn.zadd::<_, _, _, ()>(self.all_sessions(), &sid, self.expire_time())
             .await
             .context(RedisDetailSnafu {
                 detail: format!("set session id {sid}"),
             })?;
-        conn.hset(self.session_infos(), &sid, sinfo)
+        conn.hset::<_, _, _, ()>(self.session_infos(), &sid, sinfo)
             .await
             .context(RedisDetailSnafu {
                 detail: "set session info err",
@@ -1048,7 +1051,7 @@ impl Engine for RedisEngine {
         match conn.hexists(self.session_infos(), &sid).await {
             Ok(false) => {
                 warn!("Session 0x{sid:16x} was stale and cleaned up, but now it comes back again");
-                conn.hset(
+                conn.hset::<_, _, _, ()>(
                     self.session_infos(),
                     &sid,
                     bincode::serialize(&self.meta.new_session_info()).unwrap(),
@@ -1197,7 +1200,7 @@ impl Engine for RedisEngine {
             let old: Format = serde_json::from_slice(body)?;
             if !old.enable_dir_stats && format.enable_dir_stats {
                 // remove dir stats as they are outdated
-                conn.del(&[self.dir_used_inodes_key(), self.dir_used_space_key()])
+                conn.del::<_, ()>(&[self.dir_used_inodes_key(), self.dir_used_space_key()])
                     .await
                     .context(RedisDetailSnafu {
                         detail: "remove dir stats",
@@ -1222,16 +1225,17 @@ impl Engine for RedisEngine {
         };
         if let Some(_) = format.trash_days {
             attr.mode = 0o555;
-            conn.set_nx(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)
+            conn.set_nx::<_, _, ()>(self.inode_key(TRASH_INODE), bincode::serialize(&attr)?)
                 .await?;
         }
 
-        conn.set(self.settings(), serde_json::to_vec(&format)?)
+        conn.set::<_, _, ()>(self.settings(), serde_json::to_vec(&format)?)
             .await?;
         {
             let mut lock = self.meta.fmt.write();
             *lock = Arc::new(format);
         }
+        // if inited, root inode ignored
         match body {
             Some(_) => Ok(()),
             None => {
@@ -1250,7 +1254,7 @@ impl Engine for RedisEngine {
             let mut conn2 = conn.clone();
             let mut iter = conn.scan_match::<&str, Vec<u8>>("*").await?.chunks(10000);
             while let Some(keys) = iter.next().await {
-                conn2.del(keys).await?;
+                conn2.del::<_, ()>(keys).await?;
             }
             Ok(())
         } else {
@@ -1410,7 +1414,7 @@ impl Engine for RedisEngine {
 
     async fn do_delete_slice(&self, id: u64, size: u32) -> Result<()> {
         let mut conn = self.share_conn();
-        conn.hdel(self.slice_refs(), RedisHandle::slice_key(id, size))
+        conn.hdel::<_, _, ()>(self.slice_refs(), RedisHandle::slice_key(id, size))
             .await
             .context(RedisDetailSnafu {
                 detail: format!("delete slice {} {}", id, size),
@@ -1525,7 +1529,7 @@ impl Engine for RedisEngine {
         pipe.hdel(self.dir_quota_key(), inode);
         pipe.hdel(self.dir_quota_used_space_key(), inode);
         pipe.hdel(self.dir_quota_used_inodes_key(), inode);
-        pipe.query_async(&mut conn).await?; // TODO: distinguish () and Nil
+        pipe.query_async::<()>(&mut conn).await?; // TODO: distinguish () and Nil
         Ok(())
     }
 
@@ -1577,7 +1581,7 @@ impl Engine for RedisEngine {
             pipe.hincr(self.dir_quota_used_space_key(), ino, new_space);
             pipe.hincr(self.dir_quota_used_inodes_key(), ino, new_inodes);
         }
-        pipe.query_async(conn).await?; // TODO: distinguish () and Nil
+        pipe.query_async::<()>(conn).await?; // TODO: distinguish () and Nil
         Ok(())
     }
 
@@ -2047,7 +2051,7 @@ impl Engine for RedisEngine {
                 // first find ino by parent ino and son name, then watch it
                 cmd("WATCH")
                     .arg(self.inode_key(ino))
-                    .query_async(conn)
+                    .query_async::<()>(conn)
                     .await?;
                 let (pattr_bytes, attr_bytes): (Vec<u8>, Option<Vec<u8>>) = conn
                     .mget((self.inode_key(parent), self.inode_key(ino)))
@@ -2255,7 +2259,7 @@ impl Engine for RedisEngine {
             // first find ino by parent ino and son name, then watch it
             cmd("WATCH")
                 .arg(&[self.inode_key(ino), self.entry_key(ino)])
-                .query_async(conn)
+                .query_async::<()>(conn)
                 .await?;
             let (pattr_bytes, attr_bytes): (Vec<u8>, Option<Vec<u8>>) = conn
                 .mget((self.inode_key(parent), self.inode_key(ino)))
@@ -2543,7 +2547,7 @@ impl Engine for RedisEngine {
                             .map(|t| trash.replace(t));
                     }
                 }
-                cmd("WATCH").arg(watch_keys).query_async(conn).await?;
+                cmd("WATCH").arg(watch_keys).query_async::<()>(conn).await?;
 
                 // data check
                 let inodes = {
@@ -2927,7 +2931,7 @@ impl Engine for RedisEngine {
                     ensure!(ok, NoSuchAttrSnafu);
                 }
                 _ => {
-                    conn.hset(key, name, &value).await?;
+                    conn.hset::<_, _, _, ()>(key, name, &value).await?;
                 }
             }
             Ok::<_, MetaError>(Some(()))
@@ -3688,20 +3692,16 @@ impl Engine for RedisEngine {
         if !self.get_format().enable_acl {
             return Ok(());
         }
-        /*
-        vals, err := m.rdb.HGetAll(ctx, m.aclKey()).Result()
-        if err != nil {
-            return err
-        }
 
-        for k, v := range vals {
-            id, _ := strconv.ParseUint(k, 10, 32)
-            tmpRule := &aclAPI.Rule{}
-            tmpRule.Decode([]byte(v))
-            m.aclCache.Put(uint32(id), tmpRule)
+        let mut conn = self.share_conn();
+        let vals: Vec<Option<Vec<u8>>> = conn.hgetall(self.acl_key()).await?;
+        for (idx, val) in vals.iter().enumerate() {
+            if let Some(v) = val {
+                let acl_rule = bincode::deserialize::<Rule>(v)?;
+                let mut acl_cache = self.get_base().acl_cache.write().await;
+                acl_cache.put(idx as u32, acl_rule);
+            }
         }
-        return nil
-             */
-        unimplemented!()
+        Ok(())
     }
 }

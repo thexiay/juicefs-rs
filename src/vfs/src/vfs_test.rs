@@ -94,7 +94,7 @@ async fn test_vfs_io() {
         .expect("write file:");
 
     let _ = vfs
-        .truncate(entry.inode, fh, (100 << 20) + 2)
+        .truncate(entry.inode, Some(fh), (100 << 20) + 2)
         .await
         .expect("truncate file:");
     let n = vfs
@@ -169,7 +169,7 @@ async fn test_vfs_io() {
     );
     // truncate
     assert_eq!(
-        vfs.truncate(entry.inode, fh2, 1 << 60).await.err(),
+        vfs.truncate(entry.inode, Some(fh2), 1 << 60).await.err(),
         Some(Errno::EFBIG),
         "should 'truncate overflow file len'"
     );

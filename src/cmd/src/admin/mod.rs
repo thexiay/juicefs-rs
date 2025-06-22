@@ -4,10 +4,8 @@ use clap::Parser;
 use format::FormatOpts;
 pub use format::juice_format;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub enum AdminCommands {
     Format(FormatOpts),
-    Config {
-        meta_url: String,
-    },
+    Config { meta_url: String },
 }

@@ -1,18 +1,29 @@
+#![feature(assert_matches)]
+#![feature(async_closure)]
+#![feature(unboxed_closures)]
+#![feature(async_fn_traits)]
+#![feature(let_chains)]
+#![feature(exit_status_error)]
 mod admin;
-mod parser;
 mod service;
+mod tool;
+pub mod utils;
+
 use std::path::PathBuf;
 
-use admin::{juice_format, AdminCommands};
+use admin::{AdminCommands, juice_format};
 use clap::Parser;
-use juice_utils::runtime::{init_juicefs_logger, main_okk, LoggerSettings};
-use service::{juice_mount, ServiceCommands};
+use juice_utils::runtime::{LogTarget, LoggerSettings, init_juicefs_logger, main_okk};
+use service::{ServiceCommands, juice_mount};
 use snafu::Whatever;
+use tool::{juice_obj_bench, ToolCommands};
 use tracing::error;
+
+use crate::tool::juice_bench;
 
 type Result<T, E = Whatever> = std::result::Result<T, E>;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(version,
     about = "The DevOps tool that provides internal access to the RisingWave cluster",
     long_about = None,
@@ -25,7 +36,8 @@ pub enum CliOpts {
     Inspector,
     #[command(flatten)]
     Service(ServiceCommands),
-    Tool,
+    #[command(flatten)]
+    Tool(ToolCommands),
 }
 
 pub fn cmd(opts: CliOpts) {
@@ -46,75 +58,78 @@ pub fn cmd(opts: CliOpts) {
         CliOpts::Inspector => todo!(),
         CliOpts::Service(service_commands) => match service_commands {
             ServiceCommands::Mount(mount_opts) => {
-                let mut settings = LoggerSettings::new("mount");
-                settings.with_log(PathBuf::from(&mount_opts.log_path));
+                let settings = {
+                    let mut settings = LoggerSettings::new("mount")
+                        .with_log(PathBuf::from(&mount_opts.log_path))
+                        .with_thread_name(true);
+                    for target in mount_opts.log_opts.log_targets.iter() {
+                        settings = settings.with_target(&target.target, target.level);
+                    }
+                    settings
+                };
                 init_juicefs_logger(settings);
                 main_okk(|shutdown| {
                     Box::pin(async move {
-                        juice_mount(shutdown, mount_opts).await;
+                        if let Err(e) = juice_mount(shutdown, &mount_opts).await {
+                            error!("Juice mount failed: {e}");
+                        }
                     })
                 });
             }
         },
-        CliOpts::Tool => todo!(),
+        CliOpts::Tool(tool_commands) => match tool_commands {
+            ToolCommands::Bench(bench_opts) => {
+                init_juicefs_logger(LoggerSettings::new("bench"));
+                main_okk(|_| {
+                    Box::pin(async move {
+                        if let Err(e) = juice_bench(bench_opts).await {
+                            error!("Bench failed: {e}");
+                        }
+                    })
+                })
+            }
+            ToolCommands::ObjBench(obj_bench_opts) => {
+                init_juicefs_logger(LoggerSettings::new("obj-bench"));
+                main_okk(|_| {
+                    Box::pin(async move {
+                        if let Err(e) = juice_obj_bench(obj_bench_opts).await {
+                            error!("ObjBench failed: {e}");
+                        }
+                    })
+                });
+            }
+        },
     }
 }
 
-// -------------------------- mount -----------------------------------
-fn prepare_mount_point() {
-    /*
-    var fi os.FileInfo
-        var ino uint64
-        err := utils.WithTimeout(func() error {
-            var err error
-            fi, err = os.Stat(mp)
-            return err
-        }, time.Second*3)
-        if !strings.Contains(mp, ":") && err != nil {
-            err2 := utils.WithTimeout(func() error {
-                return os.MkdirAll(mp, 0777)
-            }, time.Second*3)
-            if err2 != nil {
-                if os.IsExist(err2) || strings.Contains(err2.Error(), "timeout after 3s") {
-                    // a broken mount point, umount it
-                    logger.Infof("mountpoint %s is broken: %s, umount it", mp, err)
-                    _ = doUmount(mp, true)
-                } else {
-                    logger.Fatalf("create %s: %s", mp, err2)
-                }
-            }
-        } else if err == nil {
-            ino, _ = utils.GetFileInode(mp)
-            if ino <= uint64(meta.RootInode) && fi.Size() == 0 {
-                // a broken mount point, umount it
-                logger.Infof("mountpoint %s is broken (ino=%d, size=%d), umount it", mp, ino, fi.Size())
-                _ = doUmount(mp, true)
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use std::assert_matches::assert_matches;
 
-        if os.Getuid() == 0 {
-            return
-        }
-        if ino == uint64(meta.RootInode) {
-            return
-        }
-        switch runtime.GOOS {
-        case "darwin":
-            if fi, err := os.Stat(mp); err == nil {
-                if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-                    if st.Uid != uint32(os.Getuid()) {
-                        logger.Fatalf("current user should own %s", mp)
-                    }
-                }
-            }
-        case "linux":
-            f, err := os.CreateTemp(mp, ".test")
-            if err != nil && (os.IsPermission(err) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EROFS)) {
-                logger.Fatalf("Do not have write permission on %s", mp)
-            } else if f != nil {
-                _ = f.Close()
-                _ = os.Remove(f.Name())
-            }
-        }
-     */
+    use clap::Parser;
+
+    use crate::{CliOpts, admin::AdminCommands, service::ServiceCommands};
+
+    #[test]
+    fn test_mount() {
+        let args = [
+            "juice",
+            "test-juicefs-rs",
+            "--storage",
+            "cos",
+            "--bucket",
+            "test-bucket",
+            "--endpoint",
+            "https://cos.ap-guangzhou.myqcloud.com",
+            "--access-key",
+            "xxxxxxxxxxxxxx",
+            "--secret-key",
+            "xxxxxxxxxxxxxx",
+            "--enable-acl",
+            "format",
+            "redis://:mypassword@127.0.1:11000",
+        ];
+        let opts = CliOpts::try_parse_from(args).unwrap();
+        assert_matches!(opts, CliOpts::Admin(AdminCommands::Format(_)));
+    }
 }

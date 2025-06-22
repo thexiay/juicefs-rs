@@ -31,3 +31,8 @@ tracing-subscriber = { workspace = true }
 opendal = { workspace = true }
 bytes = { workspace = true }
 fuse3 = { workspace = true }
+indicatif = { workspace = true }
+colored = "3"
+comfy-table = "7"
+rand = { workspace = true }
+futures = { workspace = true }

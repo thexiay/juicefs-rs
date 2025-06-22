@@ -159,6 +159,14 @@ impl DataWriter {
         Ok(())
     }
 
+    // TODO: it may hold a big lock, it may cost a lots of time
+    pub async fn update_mtime(&self, ino: Ino, mtime: DateTime<Utc>) {
+        let writer = self.find(ino);
+        if let Some(writer) = writer {
+            writer.update_mtime(mtime).await;
+        }
+    }
+
     fn find(&self, ino: Ino) -> Option<FileWriter> {
         let files = self.files.lock();
         files.get(&ino).map(|f| f.clone())
@@ -355,6 +363,13 @@ impl FileWriter {
     pub fn len(&self) -> u64 {
         self.fw_ctx.length.load(Ordering::Relaxed)
     }
+
+    pub async fn update_mtime(&self, mtime: DateTime<Utc>) {
+        let writer = self.writer.lock().await;
+        for swriter in writer.chunks.values() {
+            swriter.update_mtime(mtime).await;
+        }
+    }
 }
 
 struct ChunkWriter {
@@ -466,6 +481,13 @@ impl ChunkWriter {
                     "Already finish, No commit task exist.",
                 );
             }
+        }
+    }
+
+    pub async fn update_mtime(&self, mtime: DateTime<Utc>) {
+        let mut slices = self.slices.lock();
+        for slice in slices.iter_mut() {
+            slice.last_modify = mtime;
         }
     }
 
