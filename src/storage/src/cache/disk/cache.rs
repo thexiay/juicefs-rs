@@ -1153,7 +1153,7 @@ impl CacheStore {
                     .mode(self.mode.mode())
                     .open(tmp_path.as_path())
                     .await?;
-                f.write_buf(&mut read_buf).await?;
+                f.write_all_buf(&mut read_buf).await?;
                 if self.checksum_level != ChecksumLevel::None {
                     let mut checksum = checksum(&page);
                     f.write_buf(&mut checksum).await?;
