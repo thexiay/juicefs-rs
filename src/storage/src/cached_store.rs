@@ -122,7 +122,7 @@ impl Config {
         // cache_full_block意味着永远cache
         // size <= max_block_size意味着小内存块cache
         // upload_delay不为0意味着，stage块不会立即上传远端存储
-        self.cache_full_block || size <= self.max_block_size || !self.upload_delay.is_none()
+        self.cache_full_block || size < self.max_block_size || !self.upload_delay.is_none()
     }
 }
 
