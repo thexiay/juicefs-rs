@@ -65,6 +65,8 @@ pub struct MountOpts {
 pub struct LogOpts {
     #[arg(long = "log-targets")]
     pub log_targets: Vec<LogTarget>,
+    #[arg(long = "tokio_console_enable", default_value_t = false)]
+    pub tokio_console_enable: bool,
 }
 
 #[derive(Parser, Debug)]

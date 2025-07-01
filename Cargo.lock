@@ -2022,9 +2022,13 @@ dependencies = [
 name = "juice-test"
 version = "0.1.0"
 dependencies = [
+ "console-subscriber",
  "libc",
+ "parking_lot",
  "redis",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

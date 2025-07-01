@@ -1,7 +1,6 @@
 use std::{collections::HashMap, ops::AsyncFnOnce, sync::Arc};
 
 use crate::{cache::CacheKey, error::Result};
-use bytes::Bytes;
 use opendal::Buffer;
 use parking_lot::{Mutex, RwLock};
 use snafu::whatever;

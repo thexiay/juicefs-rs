@@ -14,14 +14,14 @@ use fuse3::raw::reply::{
 };
 use fuse3::raw::{Filesystem, Request};
 use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use futures_async_stream::stream;
 use juice_meta::api::{Attr, AttrNode, Entry, Falloc, INodeType, OFlag, SetAttrMask};
 use juice_utils::fs::{self, FsContext};
 use juice_vfs::Vfs;
 use nix::errno::Errno;
-use nix::unistd::{getuid, Uid};
+use nix::unistd::{Uid, getuid};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -53,9 +53,9 @@ impl JuiceFs {
         opts.allow_other(getuid() == Uid::from_raw(0));
         // Below is juice-go default configuration:
         // 1. SingleThreaded: handle kernel fuse request in a single thread. go: fasle, rust: false
-        // 2. MaxBackground: The maximum number of in-flight asynchronous requests allowed by the kernel. 
+        // 2. MaxBackground: The maximum number of in-flight asynchronous requests allowed by the kernel.
         //    go: 50, rust: 12.
-        // 3. MaxWrite: The maximum number of bytes allowed by a single write request (write) by the user space file 
+        // 3. MaxWrite: The maximum number of bytes allowed by a single write request (write) by the user space file
         //    system. go: 1 << 20, rust: 1 << 20.
         // 4. MaxReadAhead: Shows the maximum number of bytes of kernel read-ahead. go: 1 << 20, rust: dependency on
         //    kernel defautl value 1 << 20.
@@ -258,7 +258,8 @@ impl Filesystem for JuiceFs {
                 Ok(entry) => Ok(Self::reply_entry(&self.vfs, entry).await),
                 Err(e) => Err((e as i32).into()),
             }
-        }).await
+        })
+        .await
     }
 
     /// forget an inode. The nlookup parameter indicates the number of lookups previously
@@ -412,12 +413,25 @@ impl Filesystem for JuiceFs {
 
     /// remove a file.
     async fn unlink(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()> {
-        Err(libc::ENOSYS.into())
+        self.login_with_action(req, async {
+            self.vfs
+                .unlink(parent, &name.to_string_lossy())
+                .await
+                .map_err(|e| (e as i32).into())
+        })
+        .await
     }
 
     /// remove a directory.
     async fn rmdir(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()> {
-        Err(libc::ENOSYS.into())
+        self.login_with_action(req, async {
+            // TODO: [`FileSystem`] mknod not support umasks
+            self.vfs
+                .rmdir(parent, &name.to_string_lossy())
+                .await
+                .map_err(|e| (e as i32).into())
+        })
+        .await
     }
 
     /// rename a file or directory.

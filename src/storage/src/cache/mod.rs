@@ -67,8 +67,9 @@ impl CacheKey {
 pub trait CacheManager: Send + Sync + 'static {
     // ----------------- Cache API -----------------
     /// Cache a page.
+    /// 
     /// Put a page don't mean to persist it immediately. It may be staged to disk first.
-    /// If `force` is true, it will make sure cache will be ok
+    /// If `force` is true, it will make sure cache request will be queued immediately and will be executed in the end
     fn put(
         &self,
         key: &CacheKey,

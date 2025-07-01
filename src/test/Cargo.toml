@@ -13,3 +13,7 @@ repository = { workspace = true }
 libc ={ workspace = true }
 redis = { workspace = true }
 tokio = { workspace = true }
+parking_lot = { workspace = true }
+console-subscriber = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -12,7 +12,8 @@ use futures_async_stream::try_stream;
 
 use juice_meta::{
     api::{
-        Attr, AttrNode, Entry, Falloc, Fcntl, INodeType, Ino, Meta, ModeMask, OFlag, SetAttrMask, StatFs, MAX_FILE_LEN, MAX_FILE_NAME_LEN, O_ACCMODE, ROOT_INODE
+        Attr, AttrNode, Entry, Falloc, Fcntl, INodeType, Ino, MAX_FILE_LEN, MAX_FILE_NAME_LEN,
+        Meta, ModeMask, O_ACCMODE, OFlag, ROOT_INODE, SetAttrMask, StatFs,
     },
     config::Format,
     context::{FsContext, Gid, Uid, WithContext},
@@ -121,10 +122,7 @@ impl Vfs {
             error!("get attr: {:?}", e);
             e.fs_err()
         })?;
-        Ok(AttrNode {
-            inode: ino,
-            attr,
-        })
+        Ok(AttrNode { inode: ino, attr })
     }
 
     pub async fn set_attr(
@@ -138,28 +136,29 @@ impl Vfs {
             // TODO: support special inode
             return Err(Errno::EPERM);
         }
-        
+
         if mask.contains(SetAttrMask::SET_SIZE) {
             self.truncate(ino, fh, attr.length).await?;
         }
         if mask.contains(SetAttrMask::SET_MTIME_NOW) || mask.contains(SetAttrMask::SET_MTIME) {
             if self.check_permission() {
-                self.meta.check_set_attr(
-                    ino,
-                    mask,
-                    &attr,
-                ).await.map_err(|e| {
-                    error!("check set_attr failed: {:?}", e);
-                    e.fs_err()
-                })?;
+                self.meta
+                    .check_set_attr(ino, mask, &attr)
+                    .await
+                    .map_err(|e| {
+                        error!("check set_attr failed: {:?}", e);
+                        e.fs_err()
+                    })?;
             }
 
             if mask.contains(SetAttrMask::SET_MTIME) {
-                self.writer.update_mtime(ino, DateTime::from_timestamp_nanos(attr.mtime as i64)).await;
+                self.writer
+                    .update_mtime(ino, DateTime::from_timestamp_nanos(attr.mtime as i64))
+                    .await;
             }
             if mask.contains(SetAttrMask::SET_MTIME_NOW) {
                 self.writer.update_mtime(ino, Utc::now()).await;
-            } 
+            }
         }
         self.meta.set_attr(ino, mask, 0, &attr).await.map_err(|e| {
             error!("set_attr failed: {:?}", e);
@@ -244,13 +243,11 @@ impl Vfs {
                     error!("truncate failed: {:?}", e);
                     e.fs_err()
                 })?
-            },
-            None => {
-                self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
-                    error!("truncate failed: {:?}", e);
-                    e.fs_err()
-                })?
-            }    
+            }
+            None => self.meta.truncate(ino, 0, size, false).await.map_err(|e| {
+                error!("truncate failed: {:?}", e);
+                e.fs_err()
+            })?,
         };
 
         self.writer.truncate(ino, size);
@@ -426,6 +423,22 @@ impl Vfs {
             name: name.to_string(),
             attr,
         })
+    }
+
+    pub async fn unlink(&self, parent: Ino, name: &str) -> Result<(), Errno> {
+        if parent == ROOT_INODE && self.is_special_node(name) {
+            return Err(Errno::EPERM);
+        }
+        if name.len() > MAX_FILE_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        self.meta.unlink(parent, name, false).await.map_err(|e| {
+            error!("unlink failed: {:?}", e);
+            e.fs_err()
+        })?;
+        self.cache_dir_entry(parent, name, None).await;
+        Ok(())
     }
 
     pub async fn rmdir(&self, parent: Ino, name: &str) -> Result<(), Errno> {
@@ -761,14 +774,11 @@ impl Vfs {
         if name.len() > MAX_FILE_NAME_LEN {
             return Err(Errno::ENAMETOOLONG);
         }
-        let (ino, attr)  = self.meta.lookup(parent, name, true).await.map_err(|e| {
+        let (ino, attr) = self.meta.lookup(parent, name, true).await.map_err(|e| {
             error!("lookup failed: {:?}", e);
             e.fs_err()
         })?;
-        Ok(AttrNode {
-            inode: ino,
-            attr,
-        })
+        Ok(AttrNode { inode: ino, attr })
     }
 }
 
