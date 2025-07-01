@@ -36,3 +36,7 @@ colored = "3"
 comfy-table = "7"
 rand = { workspace = true }
 futures = { workspace = true }
+
+[[bin]]
+name = "juicefs-rs"
+path = "src/bin/juicefs.rs"

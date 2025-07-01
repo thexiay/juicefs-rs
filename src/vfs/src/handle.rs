@@ -293,6 +293,10 @@ impl Vfs {
         Ok(fh)
     }
 
+    /// Cache dir entry.
+    /// 
+    /// If `entry` is `None`, it means the entry is deleted.
+    /// If `entry` is `Some`, it means the entry is created or updated.
     pub async fn cache_dir_entry(&self, parent: Ino, name: &str, entry: Option<(Ino, Attr)>) {
         let handles = self.find_all_handle(parent);
         for handle in handles {

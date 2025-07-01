@@ -195,6 +195,7 @@ impl Deref for FileWriterRef {
 impl Drop for FileWriterRef {
     fn drop(&mut self) {
         if self.refs.load(Ordering::Relaxed) == 0 {
+            info!("drop file write {}, remove from data writers", self.writer.ino);
             let mut files = self.dw.files.lock();
             files.remove(&self.writer.ino);
         }
@@ -269,7 +270,7 @@ impl FileWriter {
             fw_ctx,
             ino,
             writer,
-            refs: Arc::new(AtomicU32::new(0)),
+            refs: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -673,4 +674,9 @@ impl Drop for SliceWriter {
     fn drop(&mut self) {
         self.fw_ctx.slices_cnt.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+mod tests {
+
 }

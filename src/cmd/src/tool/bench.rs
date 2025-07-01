@@ -15,7 +15,7 @@ use comfy_table::{
     Cell, Cells, Color, ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS,
     presets::UTF8_FULL,
 };
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use nix::unistd::{Uid, getuid};
 use rand::RngCore;
 use snafu::{ResultExt, ensure_whatever, whatever};
@@ -28,7 +28,7 @@ use tracing::warn;
 
 use crate::{
     Result,
-    utils::{find_mount_point, get_value_color},
+    utils::{find_mount_point, get_cost_color, get_value_color},
 };
 
 #[derive(Parser, Debug)]
@@ -101,7 +101,11 @@ impl BenchCase {
     async fn run(self: Arc<Self>, api: Api, bars: &MultiProgress) -> TimeDelta {
         let mut task_group = JoinSet::new();
         let start = Local::now();
-        let bar = bars.add(ProgressBar::new(self.file_cnt * self.threads));
+        let bar = add_bar(
+            &bars,
+            &format!("{} {:?}", self.name, api),
+            self.file_cnt * self.block_cnt * self.threads,
+        );
         for i in 0..self.threads {
             let bench = self.clone();
             let api = api.clone();
@@ -166,6 +170,22 @@ impl BenchCase {
     }
 }
 
+fn add_bar(bars: &MultiProgress, title: &str, count: u64) -> ProgressBar {
+    let progress_style = ProgressStyle::with_template(
+        "{prefix:.bold} count: {pos}/{len} [{wide_bar}] {speed:>10} {eta:>10} {used:>10}",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to create progress style: {}", e);
+        ProgressStyle::default_bar()
+    })
+    .progress_chars("=> ");
+    let pb = ProgressBar::new(count)
+        .with_style(progress_style.clone())
+        .with_prefix(title.to_string())
+        .with_finish(ProgressFinish::WithMessage("done".into()));
+    bars.add(pb)
+}
+
 enum Action {
     Write,
     Read,
@@ -205,7 +225,7 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
         .whatever_context("create dir failed")?;
     fs::set_permissions(&tmpdir, Permissions::from_mode(0o777))
         .await
-        .whatever_context("set permissions failed")?;
+        .ok();
     // drop cache
     if !opts.skip_drop_caches {
         let status = Command::new(program)
@@ -237,10 +257,10 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
             "big file".to_string(),
             opts.big_file_size << 20, // convert MiB to bytes
             opts.block_size << 20,    // convert MiB to bytes
-            opts.big_file_size,
+            1,
         ));
         let write_elapse = case.clone().run(Api::Write, &bars).await;
-        let write_value = ((case.file_size << 20) * case.threads) as f64 * 1000.0
+        let write_value = ((case.file_size >> 20) * case.threads) as f64 * 1000.0
             / write_elapse.num_milliseconds() as f64;
         let write_cost = write_elapse.num_milliseconds() as f64 / case.file_cnt as f64 / 1000.0;
         table.add_row(vec![
@@ -248,18 +268,18 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
             Cell::new(format!("{write_value} MiB/s"))
                 .fg(get_value_color(write_value, 100_f64..200_f64)),
             Cell::new(format!("{write_cost} s/file"))
-                .fg(get_value_color(write_cost, 10_f64..50_f64)),
+                .fg(get_cost_color(write_cost, 10_f64..50_f64)),
         ]);
 
         let read_cost = case.clone().run(Api::Read, &bars).await;
-        let read_value = ((case.file_size << 20) * case.threads) as f64 * 1000.0
-            / read_cost.num_milliseconds() as f64;
+        let read_value =
+            ((case.file_size >> 20) * case.threads) as f64 * 1000.0 / read_cost.num_milliseconds() as f64;
         let read_cost = read_cost.num_milliseconds() as f64 / case.file_cnt as f64 / 1000.0;
         table.add_row(vec![
             Cell::new("Read big file"),
             Cell::new(format!("{read_value} MiB/s"))
                 .fg(get_value_color(read_value, 100_f64..200_f64)),
-            Cell::new(format!("{read_cost} s/file")).fg(get_value_color(read_cost, 10_f64..50_f64)),
+            Cell::new(format!("{read_cost} s/file")).fg(get_cost_color(read_cost, 10_f64..50_f64)),
         ]);
     }
     // run small object
@@ -280,9 +300,9 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
         table.add_row(vec![
             Cell::new("Write small file"),
             Cell::new(format!("{write_value} files/s"))
-                .fg(get_value_color(write_value, 100_f64..200_f64)),
+                .fg(get_value_color(write_value, 12.5_f64..20_f64)),
             Cell::new(format!("{write_cost} ms/file"))
-                .fg(get_value_color(write_cost, 10_f64..50_f64)),
+                .fg(get_cost_color(write_cost, 50_f64..80_f64)),
         ]);
 
         let read_cost = case.clone().run(Api::Read, &bars).await;
@@ -292,9 +312,8 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
         table.add_row(vec![
             Cell::new("Read small file"),
             Cell::new(format!("{read_value} files/s"))
-                .fg(get_value_color(read_value, 100_f64..200_f64)),
-            Cell::new(format!("{read_cost} ms/file"))
-                .fg(get_value_color(read_cost, 10_f64..50_f64)),
+                .fg(get_value_color(read_value, 50_f64..100_f64)),
+            Cell::new(format!("{read_cost} ms/file")).fg(get_cost_color(read_cost, 10_f64..20_f64)),
         ]);
 
         let stat_cost = case.clone().run(Api::Stats, &bars).await;
@@ -304,8 +323,8 @@ pub async fn juice_bench(opts: BenchOpts) -> Result<()> {
         table.add_row(vec![
             Cell::new("Stat small file"),
             Cell::new(format!("{stat_value} files/s"))
-                .fg(get_value_color(stat_value, 100_f64..200_f64)),
-            Cell::new(format!("{stat_cost} s/file")).fg(get_value_color(stat_cost, 10_f64..50_f64)),
+                .fg(get_value_color(stat_value, 20_f64..1000_f64)),
+            Cell::new(format!("{stat_cost} ms/file")).fg(get_cost_color(stat_cost, 1_f64..5_f64)),
         ]);
     }
 

@@ -17,7 +17,7 @@ use juice_utils::runtime::{LogTarget, LoggerSettings, init_juicefs_logger, main_
 use service::{ServiceCommands, juice_mount};
 use snafu::Whatever;
 use tool::{juice_obj_bench, ToolCommands};
-use tracing::error;
+use tracing::{error, instrument::WithSubscriber};
 
 use crate::tool::juice_bench;
 
@@ -61,7 +61,8 @@ pub fn cmd(opts: CliOpts) {
                 let settings = {
                     let mut settings = LoggerSettings::new("mount")
                         .with_log(PathBuf::from(&mount_opts.log_path))
-                        .with_thread_name(true);
+                        .with_thread_name(true)
+                        .tokio_console(mount_opts.log_opts.tokio_console_enable);
                     for target in mount_opts.log_opts.log_targets.iter() {
                         settings = settings.with_target(&target.target, target.level);
                     }
